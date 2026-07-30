@@ -14,17 +14,32 @@ from aiogram.types import (
     Message,
 )
 
-from tgclaude.approvals import ApprovalBroker, make_permission_callback
-from tgclaude.config import load_config
-from tgclaude.render import chunks, progress_text, to_html
-from tgclaude.rules import Decision, decide, describe, load_rules
-from tgclaude.runner import DoneEvent, Runner, TextEvent, ToolEvent
-from tgclaude.sessions import SessionManager
-from tgclaude.shell import run_shell
-from tgclaude.store import Store
+from tgclaude.config import Config, load_config
+from tgclaude.remote import (
+    LaunchError,
+    RemoteSession,
+    get_session,
+    kill_all,
+    kill_session,
+    launch,
+    list_sessions,
+    tmux_available,
+)
+from tgclaude.render import chunks
+from tgclaude.repos import discover, resolve
 
 log = logging.getLogger("tgclaude")
-PROGRESS_EDIT_INTERVAL_S = 3.0
+
+DISCOVERY_TTL_S = 60.0
+MAX_CHOICES = 8
+HELP = (
+    "Поднимаю сессии Claude Code с Remote Control — дальше работа в приложении Claude.\n\n"
+    "<b>/rc</b> &lt;репо&gt; — поднять сессию\n"
+    "<b>/rc</b> — живые сессии\n"
+    "<b>/repos</b> — доступные репозитории\n"
+    "<b>/rckill</b> &lt;имя&gt; — погасить сессию (без имени — все)\n\n"
+    "Сессии живут в tmux и переживают рестарт бота."
+)
 
 
 def _is_authorized(from_user, allowed_user_id: int) -> bool:
@@ -32,15 +47,71 @@ def _is_authorized(from_user, allowed_user_id: int) -> bool:
     return from_user is not None and from_user.id == allowed_user_id
 
 
-def _approval_keyboard(key: str) -> InlineKeyboardMarkup:
+def _open_keyboard(url: str) -> InlineKeyboardMarkup | None:
+    if not url:
+        return None
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Разрешить", callback_data=f"ok:{key}"),
-                InlineKeyboardButton(text="Запретить", callback_data=f"no:{key}"),
-            ]
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text="Открыть в Claude", url=url)]]
     )
+
+
+def _uptime(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "только что"
+    if minutes < 60:
+        return f"{minutes} мин"
+    return f"{minutes // 60} ч {minutes % 60} мин"
+
+
+def _label(path: Path, roots: tuple[Path, ...]) -> str:
+    """Короткое имя для списка: относительный путь от ближайшего корня."""
+    for root in roots:
+        if path == root:
+            return path.name
+        if path.is_relative_to(root):
+            return str(path.relative_to(root))
+    return str(path)
+
+
+def _link_line(session: RemoteSession) -> str:
+    if session.url:
+        return html.escape(session.url)
+    return f"ссылка неизвестна, подсядь: <code>{html.escape(session.attach_hint)}</code>"
+
+
+def _fresh_text(session: RemoteSession) -> str:
+    return (
+        f"✅ Сессия <b>{html.escape(session.name)}</b> поднята\n"
+        f"<code>{html.escape(session.cwd)}</code>\n"
+        f"{_link_line(session)}"
+    )
+
+
+def _list_item(session: RemoteSession) -> str:
+    return (
+        f"▸ <b>{html.escape(session.name)}</b> · {_uptime(session.uptime_s())}\n"
+        f"<code>{html.escape(session.cwd)}</code>\n"
+        f"{_link_line(session)}"
+    )
+
+
+class Discovery:
+    """Кэш обхода файловой системы: скан на глубину 3 не бесплатный."""
+
+    def __init__(self, config: Config, ttl_s: float = DISCOVERY_TTL_S) -> None:
+        self._config = config
+        self._ttl_s = ttl_s
+        self._cached: list[Path] = []
+        self._at = 0.0
+
+    async def paths(self, *, refresh: bool = False) -> list[Path]:
+        if refresh or not self._cached or time.monotonic() - self._at > self._ttl_s:
+            self._cached = await asyncio.to_thread(
+                discover, list(self._config.rc_roots), self._config.scan_depth
+            )
+            self._at = time.monotonic()
+        return self._cached
 
 
 async def main() -> None:
@@ -49,234 +120,131 @@ async def main() -> None:
     )
     root = Path(__file__).resolve().parent.parent
     config = load_config(root / "config.toml")
-    rules = load_rules(root / "rules.toml")
+    if not tmux_available():
+        raise SystemExit("tmux не найден в PATH — поставь через `brew install tmux`")
 
     bot = Bot(token=config.bot_token)
     dp = Dispatcher()
-    store = Store(config.db_path)
-    brokers: dict[int, ApprovalBroker] = {}
+    discovery = Discovery(config)
+    # Кандидаты для кнопок выбора при неоднозначном запросе. Токен короткий,
+    # потому что в callback_data влезает 64 байта — полный путь туда не поместится.
+    pending: dict[str, Path] = {}
 
-    def make_runner_factory(thread_id: int):
-        async def ask(key: str, description: str) -> None:
-            await bot.send_message(
-                config.chat_id,
-                f"❓ Подтверди:\n<code>{to_html(description)}</code>",
-                message_thread_id=thread_id,
+    async def start_session(message: Message, target: Path) -> None:
+        name = target.name
+        alive = await get_session(name)
+        if alive is not None:
+            await message.answer(
+                f"Уже поднята.\n{_list_item(alive)}",
                 parse_mode="HTML",
-                reply_markup=_approval_keyboard(key),
+                reply_markup=_open_keyboard(alive.url),
             )
+            return
 
-        async def on_denied(description: str) -> None:
-            await bot.send_message(
-                config.chat_id,
-                f"🚫 Заблокировано правилом:\n<code>{to_html(description)}</code>",
-                message_thread_id=thread_id,
+        notice = await message.answer(
+            f"⏳ Поднимаю сессию в <code>{html.escape(str(target))}</code>…",
+            parse_mode="HTML",
+        )
+        try:
+            session = await launch(name, str(target), timeout_s=config.launch_timeout_s)
+        except LaunchError as exc:
+            log.warning("launch failed for %s: %s", target, exc)
+            await notice.edit_text(
+                f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800],
                 parse_mode="HTML",
             )
+            return
 
-        # Брокер создаём только один раз на thread — иначе повторный вызов
-        # (например, из cmd_stop) пересобрал бы его посреди активного approval
-        # и осиротил бы pending future: тап по кнопке резолвил бы уже мёртвый брокер.
-        broker = brokers.get(thread_id)
-        if broker is None:
-            broker = ApprovalBroker(ask=ask, timeout_s=config.approval_timeout_s)
-            brokers[thread_id] = broker
-        callback = make_permission_callback(rules, broker, on_denied)
-
-        def factory(cwd: str, session_id: str | None) -> Runner:
-            return Runner(cwd=cwd, session_id=session_id, can_use_tool=callback)
-
-        return factory
-
-    class ThreadAwareManager(SessionManager):
-        def get_or_create(self, thread_id: int):
-            self._factory = make_runner_factory(thread_id)
-            return super().get_or_create(thread_id)
-
-    sessions = ThreadAwareManager(store=store, config=config, runner_factory=None)
-
-    def thread_of(message: Message) -> int:
-        return message.message_thread_id or 0
+        await notice.edit_text(
+            _fresh_text(session), parse_mode="HTML", reply_markup=_open_keyboard(session.url)
+        )
 
     @dp.message(lambda event: not _is_authorized(event.from_user, config.allowed_user_id))
     async def reject_strangers(message: Message) -> None:
         uid = message.from_user.id if message.from_user else None
         log.warning("dropped message from user_id=%s", uid)
 
-    @dp.message(Command("new"))
-    async def cmd_new(message: Message) -> None:
-        await sessions.reset(thread_of(message))
-        await message.reply("Сессия сброшена.")
+    @dp.message(Command("start", "help"))
+    async def cmd_help(message: Message) -> None:
+        await message.reply(HELP, parse_mode="HTML")
 
-    @dp.message(Command("pwd"))
-    async def cmd_pwd(message: Message) -> None:
-        row = store.ensure(thread_of(message), str(config.default_cwd))
-        await message.reply(f"cwd: {row.cwd}\nsession: {row.session_id or '—'}")
+    @dp.message(Command("repos"))
+    async def cmd_repos(message: Message) -> None:
+        paths = await discovery.paths(refresh=True)
+        if not paths:
+            await message.reply("Ничего не нашёл. Проверь rc_roots в config.toml.")
+            return
+        body = "\n".join(f"• <code>{html.escape(_label(p, config.rc_roots))}</code>" for p in paths)
+        for part in chunks(body):
+            await message.answer(part, parse_mode="HTML")
 
-    @dp.message(Command("cd"))
-    async def cmd_cd(message: Message) -> None:
+    @dp.message(Command("rc"))
+    async def cmd_rc(message: Message) -> None:
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) < 2:
-            await message.reply("Использование: /cd <путь>")
-            return
-        try:
-            new_cwd = await sessions.set_cwd(thread_of(message), parts[1])
-        except ValueError as exc:
-            await message.reply(str(exc))
-            return
-        await message.reply(f"cwd: {new_cwd}")
-
-    @dp.message(Command("stop"))
-    async def cmd_stop(message: Message) -> None:
-        thread_id = thread_of(message)
-        if not sessions.is_busy(thread_id):
-            await message.reply("Нечего прерывать.")
-            return
-        sessions.mark_interrupted(thread_id)
-        await sessions.get_or_create(thread_id).stop()
-        await message.reply("Прерываю.")
-
-    @dp.message(Command("status"))
-    async def cmd_status(message: Message) -> None:
-        lines = [
-            f"{r.thread_id}: {r.cwd} — {'занят' if sessions.is_busy(r.thread_id) else 'свободен'}"
-            for r in store.all()
-        ]
-        await message.reply("\n".join(lines) or "Сессий нет.")
-
-    @dp.callback_query(F.data.startswith(("ok:", "no:")))
-    async def on_approval(query: CallbackQuery) -> None:
-        if not _is_authorized(query.from_user, config.allowed_user_id):
-            return
-        if query.message is None:
-            await query.answer()
-            return
-        verdict, _, key = query.data.partition(":")
-        thread_id = query.message.message_thread_id or 0
-        broker = brokers.get(thread_id)
-        if broker is not None:
-            broker.resolve(key, verdict == "ok")
-        await query.answer("Разрешено" if verdict == "ok" else "Запрещено")
-        await query.message.edit_reply_markup(reply_markup=None)
-
-    # Регистрируется ДО on_prompt: иначе "!ls" ушло бы агенту как задача.
-    @dp.message(F.text.startswith("!"))
-    async def on_direct_shell(message: Message) -> None:
-        """`!cmd` — выполнить команду напрямую, минуя агента.
-
-        Агента минуем, гейт прав — нет: те же deny → whitelist → кнопки.
-        Иначе "!" стал бы обходом всей модели безопасности.
-        """
-        thread_id = thread_of(message)
-        command = message.text[1:].strip()
-        if not command:
-            await message.reply("Пустая команда. Пример: <code>!git status</code>", parse_mode="HTML")
-            return
-        if sessions.is_busy(thread_id):
-            await message.reply("Уже занят. /stop — прервать.")
-            return
-
-        row = store.ensure(thread_id, str(config.default_cwd))
-        sessions.get_or_create(thread_id)  # гарантирует брокер для этого топика
-        decision = decide("Bash", {"command": command}, rules)
-        shown = html.escape(describe("Bash", {"command": command}))
-
-        if decision is Decision.DENY:
-            await message.reply(f"🚫 Заблокировано правилом:\n<code>{shown}</code>", parse_mode="HTML")
-            return
-
-        if decision is Decision.ASK:
-            broker = brokers.get(thread_id)
-            if broker is None:
-                await message.reply("Нет брокера подтверждений для этого топика.")
+            sessions = await list_sessions()
+            if not sessions:
+                await message.reply("Живых сессий нет. <b>/rc</b> &lt;репо&gt;", parse_mode="HTML")
                 return
-            if not await broker.request(uuid.uuid4().hex, describe("Bash", {"command": command})):
-                await message.reply("Отклонено.")
-                return
-
-        sessions.mark_busy(thread_id, True)
-        try:
-            code, output = await run_shell(command, cwd=row.cwd)
-        except Exception as exc:
-            log.exception("shell failed in thread %s", thread_id)
-            await message.reply(f"❌ {type(exc).__name__}: {exc}"[:600])
-            return
-        finally:
-            sessions.mark_busy(thread_id, False)
-
-        head = "✅" if code == 0 else f"❌ exit {code}"
-        await message.reply(f"{head} <code>{shown}</code>", parse_mode="HTML")
-        for part in chunks(output):
-            await message.answer(f"<pre>{html.escape(part)}</pre>", parse_mode="HTML")
-
-    @dp.message(F.text)
-    async def on_prompt(message: Message) -> None:
-        thread_id = thread_of(message)
-        if sessions.is_busy(thread_id):
-            await message.reply("Уже занят. /stop — прервать.")
+            await message.reply("\n\n".join(_list_item(s) for s in sessions), parse_mode="HTML")
             return
 
-        runner = sessions.get_or_create(thread_id)
-        sessions.mark_busy(thread_id, True)
-        sessions.clear_interrupted(thread_id)
-        started = time.monotonic()
-        steps: list[str] = []
-        texts: list[str] = []
-        status = "ok"
-        failure = ""
+        query = parts[1]
+        matches = resolve(query, await discovery.paths())
+        if not matches:
+            await message.reply(
+                f"Не нашёл <code>{html.escape(query)}</code>. Список — /repos", parse_mode="HTML"
+            )
+            return
+        if len(matches) == 1:
+            await start_session(message, matches[0])
+            return
 
-        progress = await message.reply(progress_text(steps))
-        last_edit = 0.0
-
-        async def flush(force: bool = False) -> None:
-            nonlocal last_edit
-            now = time.monotonic()
-            if not force and now - last_edit < PROGRESS_EDIT_INTERVAL_S:
-                return
-            last_edit = now
-            try:
-                await progress.edit_text(progress_text(steps))
-            except Exception:  # редактирование тем же текстом даёт ошибку — она не важна
-                pass
-
-        try:
-            async for event in runner.run(message.text):
-                if isinstance(event, ToolEvent):
-                    steps.append(event.description)
-                    await flush()
-                elif isinstance(event, TextEvent):
-                    texts.append(event.text)
-                elif isinstance(event, DoneEvent):
-                    sessions.remember_session(thread_id, event.session_id)
-                    if event.is_error:
-                        status = "error"
-                    if event.result:
-                        texts.append(event.result)
-        except Exception as exc:
-            log.exception("run failed in thread %s", thread_id)
-            status = "error"
-            # Показываем причину в чат: иначе видно только "ошибка" без деталей,
-            # а логи с телефона не посмотришь.
-            failure = f"{type(exc).__name__}: {exc}"[:600]
-        finally:
-            sessions.mark_busy(thread_id, False)
-
-        if sessions.was_interrupted(thread_id):
-            status = "stopped"
-
-        elapsed = time.monotonic() - started
-        await progress.edit_text(
-            progress_text(steps, finished=True, elapsed_s=elapsed, status=status)
+        rows = []
+        for path in matches[:MAX_CHOICES]:
+            token = uuid.uuid4().hex[:8]
+            pending[token] = path
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=_label(path, config.rc_roots), callback_data=f"rc:{token}"
+                    )
+                ]
+            )
+        tail = "" if len(matches) <= MAX_CHOICES else f"\n(показал {MAX_CHOICES} из {len(matches)})"
+        await message.reply(
+            f"Несколько совпадений — выбери:{tail}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
 
-        if texts:
-            answer = texts[-1]
-        elif failure:
-            answer = f"{failure}\n\nЕсли повторяется — /new (сброс сессии)."
+    @dp.message(Command("rckill"))
+    async def cmd_rckill(message: Message) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            killed = await kill_all()
+            await message.reply(f"Погашено сессий: {killed}." if killed else "Гасить нечего.")
+            return
+        name = parts[1].strip()
+        if await kill_session(name):
+            await message.reply(f"Сессия <b>{html.escape(name)}</b> погашена.", parse_mode="HTML")
         else:
-            answer = "(пустой ответ)"
-        for part in chunks(to_html(answer)):
-            await message.answer(part, parse_mode="HTML")
+            await message.reply(
+                f"Нет живой сессии <code>{html.escape(name)}</code>.", parse_mode="HTML"
+            )
+
+    @dp.callback_query(F.data.startswith("rc:"))
+    async def on_pick(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        target = pending.pop(query.data[3:], None)
+        await query.answer()
+        if query.message is None:
+            return
+        await query.message.edit_reply_markup(reply_markup=None)
+        if target is None:
+            await query.message.answer("Выбор устарел, повтори /rc.")
+            return
+        await start_session(query.message, target)
 
     await dp.start_polling(bot)
 
