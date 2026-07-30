@@ -3,6 +3,7 @@ import html
 import logging
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -42,32 +43,32 @@ log = logging.getLogger("tgclaude")
 
 DISCOVERY_TTL_S = 60.0
 MAX_CHOICES = 8
+MAX_PROJECT_BUTTONS = 60
 HELP = (
     "Поднимаю сессии Claude Code с Remote Control — дальше работа в приложении Claude.\n\n"
-    "<b>Дойти ногами</b>\n"
-    "<b>/pwd</b> — где я сейчас, с кнопками по подкаталогам\n"
-    "<b>/cd</b> &lt;путь&gt; — перейти (<code>..</code>, <code>~</code>, относительный, абсолютный)\n"
-    "«▶️ Запустить здесь» — сессия в текущем каталоге.\n"
-    "«🌿 Новый worktree» — сессия в свежем worktree с веткой по времени, "
-    "чтобы работать параллельно с уже запущенной.\n\n"
-    "<b>По имени</b>\n"
-    "<b>/rc</b> &lt;репо&gt; — поднять сессию\n"
-    "<b>/rc</b> &lt;репо&gt; &lt;ветка&gt; — то же, но в отдельном worktree\n"
-    "<b>/repos</b> — доступные репозитории\n\n"
-    "<b>Хозяйство</b>\n"
-    "<b>/rc</b> — живые сессии\n"
-    "<b>/rckill</b> &lt;имя&gt; — погасить сессию (без имени — все)\n"
-    "<b>/wt</b> — созданные worktree\n"
-    "<b>/wtrm</b> &lt;имя&gt; — удалить worktree\n\n"
+    "<b>Куда идём</b>\n"
+    "<b>📁 PWD</b> (<code>/pwd</code>) — где я, с кнопками по подкаталогам\n"
+    "<b>📚 Projects</b> (<code>/repos</code>) — все git-репозитории, тап переносит внутрь\n"
+    "<code>/cd</code> &lt;путь&gt; — перейти (<code>..</code>, <code>~</code>, относительный, абсолютный)\n\n"
+    "<b>Запуск</b>\n"
+    "<b>▶️ Start Claude RC</b> — сессия в текущем каталоге\n"
+    "<b>🌿 New worktree</b> — сессия в свежем worktree, ветка по времени; "
+    "так работают параллельно с уже запущенной\n"
+    "<code>/rc</code> &lt;репо&gt; [ветка] — то же по имени, без хождения\n\n"
+    "<b>Что запущено</b>\n"
+    "<b>💬 Chats</b> (<code>/rc</code>) — живые сессии со ссылками\n"
+    "<b>🌿 Worktrees</b> (<code>/wt</code>) — созданные worktree и их состояние\n"
+    "<code>/rckill</code> &lt;имя&gt; — погасить сессию (без имени — все)\n"
+    "<code>/wtrm</code> &lt;имя&gt; — удалить worktree\n\n"
     "Сессии живут в tmux и переживают рестарт бота."
 )
 
 # Постоянная клавиатура: команд немного, и на телефоне они должны быть под пальцем.
-BTN_PWD = "📁 Где я"
-BTN_SESSIONS = "📋 Сессии"
-BTN_REPOS = "📦 Репозитории"
-BTN_WT = "🌿 Worktree"
-BTN_HELP = "❓ Помощь"
+BTN_PWD = "📁 PWD"
+BTN_SESSIONS = "💬 Chats"
+BTN_REPOS = "📚 Projects"
+BTN_WT = "🌿 Worktrees"
+BTN_HELP = "⌨️ Commands"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -89,7 +90,7 @@ def _open_keyboard(url: str) -> InlineKeyboardMarkup | None:
     if not url:
         return None
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Открыть в Claude", url=url)]]
+        inline_keyboard=[[InlineKeyboardButton(text="Open in Claude", url=url)]]
     )
 
 
@@ -161,11 +162,11 @@ def _browse_card(cwd: Path) -> tuple[str, InlineKeyboardMarkup]:
     if pair:
         rows.append(pair)
 
-    launch_row = [InlineKeyboardButton(text="▶️ Запустить здесь", callback_data="nav:here")]
+    launch_row = [InlineKeyboardButton(text="▶️ Start Claude RC", callback_data="nav:here")]
     # Вторая сессия в том же каталоге дралась бы за индекс и ветку — только через worktree.
     if browse.is_repo(cwd):
         launch_row.append(
-            InlineKeyboardButton(text="🌿 Новый worktree", callback_data="nav:newwt")
+            InlineKeyboardButton(text="🌿 New worktree", callback_data="nav:newwt")
         )
     rows.append(launch_row)
 
@@ -174,6 +175,32 @@ def _browse_card(cwd: Path) -> tuple[str, InlineKeyboardMarkup]:
         text += "\nПодкаталогов нет."
     elif total > len(children):
         text += f"\nПоказал {len(children)} из {total} — остальные через <b>/cd</b>."
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _projects_card(
+    paths: list[Path], roots: tuple[Path, ...], limit: int = MAX_PROJECT_BUTTONS
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Плоский список git-репозиториев кнопками: прыжок туда, куда ходить долго."""
+    shown = paths[:limit]
+    # Одно и то же имя встречается в дереве не раз (два клона репозитория) —
+    # одинаковые подписи на кнопках выбрать не дают, поэтому добавляем родителя.
+    seen = Counter(path.name for path in shown)
+
+    rows: list[list[InlineKeyboardButton]] = []
+    pair: list[InlineKeyboardButton] = []
+    for index, path in enumerate(shown):
+        title = path.name if seen[path.name] == 1 else f"{path.parent.name}/{path.name}"
+        pair.append(InlineKeyboardButton(text=title, callback_data=f"jump:{index}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+
+    text = "📚 Проекты — тап переносит в каталог."
+    if len(paths) > len(shown):
+        text += f"\nПоказал {len(shown)} из {len(paths)}, остальные через <b>/cd</b>."
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -253,11 +280,9 @@ async def main() -> None:
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
                         [
+                            InlineKeyboardButton(text="Trust", callback_data=f"trust:{token}"),
                             InlineKeyboardButton(
-                                text="Доверяю", callback_data=f"trust:{token}"
-                            ),
-                            InlineKeyboardButton(
-                                text="Отмена", callback_data=f"notrust:{token}"
+                                text="Cancel", callback_data=f"notrust:{token}"
                             ),
                         ]
                     ]
@@ -322,9 +347,8 @@ async def main() -> None:
         if not paths:
             await message.reply("Ничего не нашёл. Проверь rc_roots в config.toml.")
             return
-        body = "\n".join(f"• <code>{html.escape(_label(p, config.rc_roots))}</code>" for p in paths)
-        for part in chunks(body):
-            await message.answer(part, parse_mode="HTML")
+        text, keyboard = _projects_card(paths, config.rc_roots)
+        await message.reply(text, parse_mode="HTML", reply_markup=keyboard)
 
     @dp.message(Command("rc"))
     async def cmd_rc(message: Message) -> None:
@@ -439,6 +463,23 @@ async def main() -> None:
         await message.reply(
             f"Worktree <b>{html.escape(name)}</b> удалён.{note}", parse_mode="HTML"
         )
+
+    @dp.callback_query(F.data.startswith("jump:"))
+    async def on_jump(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        # Без refresh: список должен совпадать с тем, по которому только что тапнули.
+        paths = await discovery.paths()
+        await query.answer()
+        if query.message is None:
+            return
+        try:
+            state.set_cwd(paths[int(query.data[5:])])
+        except (ValueError, IndexError):
+            await query.message.answer("Список устарел, повтори /repos.")
+            return
+        text, keyboard = _browse_card(state.cwd)
+        await query.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
     @dp.callback_query(F.data.startswith("nav:"))
     async def on_nav(query: CallbackQuery) -> None:
