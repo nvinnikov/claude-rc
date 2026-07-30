@@ -1,34 +1,39 @@
 import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
+from clauderc import remote
+from clauderc.remote import LaunchError, session_name
 
-from tgclaude import remote
-from tgclaude.remote import LaunchError, session_name
+# Обработчик подменённого tmux: (команда, аргументы…) -> (код возврата, вывод)
+Handler = Callable[..., tuple[int, str]]
 
 _ROW = "rc-oms\t/repos/oms\t1700000000\thttps://claude.ai/code/session_A"
 
 
-def _stub(handler):
+def _stub(handler: Handler) -> Callable[..., Awaitable[tuple[int, str]]]:
     """Подменяет remote._run переданным обработчиком (cmd, *args) -> (code, text)."""
 
-    async def run(*args, check=True):
+    async def run(*args: str, check: bool = True) -> tuple[int, str]:
         return handler(*args)
 
     return run
 
 
-def test_session_name_prefixes_and_sanitizes():
+def test_session_name_prefixes_and_sanitizes() -> None:
     assert session_name("my-services-v2") == "rc-my-services-v2"
     # tmux не принимает `.` и `:` в имени сессии
     assert session_name("my.repo:1") == "rc-my-repo-1"
 
 
-def test_session_name_survives_garbage_input():
+def test_session_name_survives_garbage_input() -> None:
     assert session_name("...") == "rc-session"
 
 
-async def test_list_sessions_parses_rows_and_ignores_foreign(monkeypatch):
+async def test_list_sessions_parses_rows_and_ignores_foreign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     out = "\n".join(
         [
             _ROW,
@@ -46,14 +51,16 @@ async def test_list_sessions_parses_rows_and_ignores_foreign(monkeypatch):
     assert sessions[1].tmux_name == "rc-oms"
 
 
-async def test_list_sessions_empty_when_server_down(monkeypatch):
+async def test_list_sessions_empty_when_server_down(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(remote, "_run", _stub(lambda *a: (1, "no server running")))
 
     assert await remote.list_sessions() == []
 
 
-async def test_launch_returns_existing_instead_of_second_session(monkeypatch):
-    def handler(*args):
+async def test_launch_returns_existing_instead_of_second_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(*args: str) -> tuple[int, str]:
         assert args[0] != "new-session", "вторую сессию поднимать нельзя"
         return (0, _ROW) if args[0] == "list-sessions" else (0, "")
 
@@ -64,11 +71,11 @@ async def test_launch_returns_existing_instead_of_second_session(monkeypatch):
     assert session.url.endswith("session_A")
 
 
-async def test_launch_stores_url_in_tmux_option(monkeypatch):
+async def test_launch_stores_url_in_tmux_option(monkeypatch: pytest.MonkeyPatch) -> None:
     created = False
-    options: list[tuple] = []
+    options: list[tuple[str, ...]] = []
 
-    def handler(*args):
+    def handler(*args: str) -> tuple[int, str]:
         nonlocal created
         if args[0] == "list-sessions":
             return (0, _ROW) if created else (0, "")
@@ -92,10 +99,10 @@ async def test_launch_stores_url_in_tmux_option(monkeypatch):
     assert any("@rc_url" in args for args in options)
 
 
-async def test_launch_timeout_kills_session_and_shows_tail(monkeypatch):
+async def test_launch_timeout_kills_session_and_shows_tail(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
 
-    def handler(*args):
+    def handler(*args: str) -> tuple[int, str]:
         calls.append(args[0])
         if args[0] == "capture-pane":
             return 0, "claude: command not found"
@@ -111,8 +118,8 @@ async def test_launch_timeout_kills_session_and_shows_tail(monkeypatch):
     assert "kill-session" in calls
 
 
-async def test_launch_reports_dead_session(monkeypatch):
-    def handler(*args):
+async def test_launch_reports_dead_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(*args: str) -> tuple[int, str]:
         if args[0] == "capture-pane":
             return 1, "can't find pane"
         return 0, ""
@@ -125,7 +132,7 @@ async def test_launch_reports_dead_session(monkeypatch):
 
 
 @pytest.mark.skipif(not remote.tmux_available(), reason="нет tmux")
-async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch):
+async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Сквозная проверка: настоящий tmux, вместо claude — заглушка с tty."""
     url = "https://claude.ai/code/session_" + uuid.uuid4().hex[:16]
     stub = tmp_path / "fake-claude"
@@ -149,7 +156,7 @@ async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch):
         await remote._run("kill-session", "-t", f"=rc-{repo}", check=False)
 
 
-async def test_find_matches_by_directory_not_name(monkeypatch):
+async def test_find_matches_by_directory_not_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """Два клона с одинаковым basename — сессия ищется по каталогу."""
     rows = "\n".join(
         [
@@ -159,16 +166,20 @@ async def test_find_matches_by_directory_not_name(monkeypatch):
     )
     monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, rows)))
 
-    assert (await remote.find("/a/claude-rules")).url.endswith("session_A")
-    assert (await remote.find("/b/claude-rules")).url.endswith("session_B")
+    first = await remote.find("/a/claude-rules")
+    second = await remote.find("/b/claude-rules")
+    assert first is not None and first.url.endswith("session_A")
+    assert second is not None and second.url.endswith("session_B")
     assert await remote.find("/c/claude-rules") is None
 
 
-async def test_launch_does_not_reuse_session_from_another_directory(monkeypatch):
+async def test_launch_does_not_reuse_session_from_another_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Раньше второй клон молча получал ссылку на сессию первого."""
-    created: list[tuple] = []
+    created: list[tuple[str, ...]] = []
 
-    def handler(*args):
+    def handler(*args: str) -> tuple[int, str]:
         if args[0] == "list-sessions":
             return 0, _ROW  # живая сессия rc-oms, но в /repos/oms
         if args[0] == "new-session":
@@ -188,11 +199,13 @@ async def test_launch_does_not_reuse_session_from_another_directory(monkeypatch)
     assert name.startswith("rc-oms-") and name != "rc-oms"
 
 
-async def test_await_url_raises_trust_required_and_keeps_session(monkeypatch):
+async def test_await_url_raises_trust_required_and_keeps_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Диалог доверия — не ошибка: сессия жива и ждёт ответа человека."""
     calls: list[str] = []
 
-    def handler(*args):
+    def handler(*args: str) -> tuple[int, str]:
         calls.append(args[0])
         if args[0] == "capture-pane":
             return 0, "Quick safety check\n ❯ 1. Yes, I trust this folder\n   2. No, exit"
@@ -209,17 +222,16 @@ async def test_await_url_raises_trust_required_and_keeps_session(monkeypatch):
     assert "kill-session" not in calls, "сессию гасить нельзя — она держит вопрос"
 
 
-async def test_await_url_ignores_trust_prompt_after_confirmation(monkeypatch):
+async def test_await_url_ignores_trust_prompt_after_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """После Enter диалог ещё мгновение на экране — принимать его за новый нельзя."""
-    pane = (
-        "Quick safety check\n ❯ 1. Yes, I trust this folder\n"
-        "https://claude.ai/code/session_A\n"
+    pane = "Quick safety check\n ❯ 1. Yes, I trust this folder\nhttps://claude.ai/code/session_A\n"
+    monkeypatch.setattr(
+        remote, "_run", _stub(lambda *a: (0, pane if a[0] == "capture-pane" else _ROW))
     )
-    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, pane if a[0] == "capture-pane" else _ROW)))
     monkeypatch.setattr(remote, "_POLL_S", 0.0)
 
-    session = await remote.await_url(
-        "rc-oms", "/repos/oms", timeout_s=5.0, watch_trust=False
-    )
+    session = await remote.await_url("rc-oms", "/repos/oms", timeout_s=5.0, watch_trust=False)
 
     assert session.url.endswith("session_A")

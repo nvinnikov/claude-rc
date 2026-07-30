@@ -1,0 +1,18 @@
+# Конфиг для джобы Secret scan (gitleaks/gitleaks-action@v2 сам подхватывает
+# .gitleaks.toml из корня).
+#
+# Полный дефолтный набор правил на весь репозиторий плюс один узкий allowlist.
+#
+# config.example.toml — шаблон конфига с заглушкой `123456:REPLACE_ME` вместо
+# токена бота. Формат совпадает с настоящим telegram-токеном, поэтому дефолтное
+# правило его флагует. Настоящий config.toml в git не попадает (.gitignore) и
+# сканируется наравне со всем остальным, если вдруг окажется в индексе.
+
+title = "claude-rc gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "шаблон конфига: заглушка вместо токена бота"
+paths = ['''config\.example\.toml''']

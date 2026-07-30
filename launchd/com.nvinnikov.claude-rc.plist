@@ -3,17 +3,17 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.nvinnikov.tg-claude</string>
+    <string>com.nvinnikov.claude-rc</string>
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/uv</string>
         <string>run</string>
         <string>python</string>
         <string>-m</string>
-        <string>tgclaude.bot</string>
+        <string>clauderc.bot</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/YOUR_USERNAME/tg-claude</string>
+    <string>/Users/YOUR_USERNAME/claude-rc</string>
     <!-- launchd даёт голый PATH: без него бот не найдёт ни tmux, ни claude. -->
     <key>EnvironmentVariables</key>
     <dict>
@@ -25,8 +25,8 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/YOUR_USERNAME/tg-claude/tg-claude.log</string>
+    <string>/Users/YOUR_USERNAME/claude-rc/claude-rc.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/YOUR_USERNAME/tg-claude/tg-claude.log</string>
+    <string>/Users/YOUR_USERNAME/claude-rc/claude-rc.log</string>
 </dict>
 </plist>

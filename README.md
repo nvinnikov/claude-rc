@@ -1,4 +1,4 @@
-# tg-claude
+# claude-rc
 
 **Кнопка «начать сессию Claude Code на своей машине», которой не хватало.**
 
@@ -153,18 +153,18 @@ remote; перебить отказ можно явным `/wtrm <имя> force`
 
 ## Запуск
 
-Вручную: `uv run python -m tgclaude.bot`
+Вручную: `uv run python -m clauderc.bot`
 
-Автозапуск. Подставь в `launchd/com.nvinnikov.tg-claude.plist` свои пути вместо
-`/Users/YOUR_USERNAME/tg-claude` (`WorkingDirectory`, `PATH`, пути логов), при
+Автозапуск. Подставь в `launchd/com.nvinnikov.claude-rc.plist` свои пути вместо
+`/Users/YOUR_USERNAME/claude-rc` (`WorkingDirectory`, `PATH`, пути логов), при
 необходимости поправь путь к `uv` (`which uv`). Затем:
 
 ```bash
-ln -sf "$PWD/launchd/com.nvinnikov.tg-claude.plist" ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.nvinnikov.tg-claude.plist
+ln -sf "$PWD/launchd/com.nvinnikov.claude-rc.plist" ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.nvinnikov.claude-rc.plist
 ```
 
-Остановить: `launchctl unload ~/Library/LaunchAgents/com.nvinnikov.tg-claude.plist`
+Остановить: `launchctl unload ~/Library/LaunchAgents/com.nvinnikov.claude-rc.plist`
 
 Чтобы бот отвечал, мак не должен засыпать: `sudo pmset -c sleep 0`.
 
@@ -190,9 +190,19 @@ tmux-сессии `rc-<имя>`.
 `allowed_user_id`: кто её прошёл, получает на этой машине полноценный Claude Code
 со всеми токенами в `~`. Изоляции нет, это осознанный размен.
 
+## Разработка
+
+```bash
+make check       # зеркало CI: ruff format --check, ruff check, mypy --strict, pytest
+make format      # автоформат и автофиксы
+make run         # запустить бота вручную
+```
+
+CI (GitHub Actions) гоняет те же четыре шага плюс скан секретов gitleaks.
+
 ## Тесты
 
-`uv run pytest`
+`make test` или `uv run pytest`
 
 Сквозной тест поднимает настоящую tmux-сессию с заглушкой вместо `claude`;
 без tmux он пропускается.

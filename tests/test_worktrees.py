@@ -2,9 +2,8 @@ import asyncio
 from pathlib import Path
 
 import pytest
-
-from tgclaude import worktrees
-from tgclaude.worktrees import WorktreeError, slug
+from clauderc import worktrees
+from clauderc.worktrees import WorktreeError, slug
 
 
 async def _git(cwd: Path, *args: str) -> str:
@@ -34,12 +33,12 @@ async def repo(tmp_path: Path) -> Path:
     return path
 
 
-def test_slug_normalizes_branch_names():
+def test_slug_normalizes_branch_names() -> None:
     assert slug("feature/DEV-123_fix") == "feature-dev-123_fix"
     assert slug("///") == "wt"
 
 
-async def test_ensure_creates_worktree_on_new_branch(repo: Path, tmp_path: Path):
+async def test_ensure_creates_worktree_on_new_branch(repo: Path, tmp_path: Path) -> None:
     root = tmp_path / "wt"
 
     path = await worktrees.ensure(repo, "feature/DEV-1", root)
@@ -52,7 +51,7 @@ async def test_ensure_creates_worktree_on_new_branch(repo: Path, tmp_path: Path)
     assert info.repo == "demo"
 
 
-async def test_ensure_reuses_existing_worktree(repo: Path, tmp_path: Path):
+async def test_ensure_reuses_existing_worktree(repo: Path, tmp_path: Path) -> None:
     root = tmp_path / "wt"
     first = await worktrees.ensure(repo, "topic", root)
     (first / "scratch.txt").write_text("работа\n")
@@ -63,7 +62,7 @@ async def test_ensure_reuses_existing_worktree(repo: Path, tmp_path: Path):
     assert (second / "scratch.txt").exists()  # не пересоздали поверх
 
 
-async def test_ensure_checks_out_existing_branch(repo: Path, tmp_path: Path):
+async def test_ensure_checks_out_existing_branch(repo: Path, tmp_path: Path) -> None:
     await _git(repo, "branch", "already-here")
 
     path = await worktrees.ensure(repo, "already-here", tmp_path / "wt")
@@ -72,7 +71,7 @@ async def test_ensure_checks_out_existing_branch(repo: Path, tmp_path: Path):
     assert info is not None and info.branch == "already-here"
 
 
-async def test_ensure_rejects_non_repo(tmp_path: Path):
+async def test_ensure_rejects_non_repo(tmp_path: Path) -> None:
     plain = tmp_path / "plain"
     plain.mkdir()
 
@@ -80,13 +79,13 @@ async def test_ensure_rejects_non_repo(tmp_path: Path):
         await worktrees.ensure(plain, "any", tmp_path / "wt")
 
 
-async def test_ensure_surfaces_git_error_when_branch_busy(repo: Path, tmp_path: Path):
+async def test_ensure_surfaces_git_error_when_branch_busy(repo: Path, tmp_path: Path) -> None:
     # main уже занята основным рабочим каталогом — git откажет обоими способами
     with pytest.raises(WorktreeError):
         await worktrees.ensure(repo, "main", tmp_path / "wt")
 
 
-async def test_inspect_reports_dirty_and_unpushed(repo: Path, tmp_path: Path):
+async def test_inspect_reports_dirty_and_unpushed(repo: Path, tmp_path: Path) -> None:
     path = await worktrees.ensure(repo, "topic", tmp_path / "wt")
     (path / "new.txt").write_text("x\n")
 
@@ -97,7 +96,7 @@ async def test_inspect_reports_dirty_and_unpushed(repo: Path, tmp_path: Path):
     assert "есть незакоммиченные изменения" in info.blockers
 
 
-async def test_inspect_counts_unpushed_commits(repo: Path, tmp_path: Path):
+async def test_inspect_counts_unpushed_commits(repo: Path, tmp_path: Path) -> None:
     path = await worktrees.ensure(repo, "topic", tmp_path / "wt")
     (path / "new.txt").write_text("x\n")
     await _git(path, "add", "-A")
@@ -112,11 +111,11 @@ async def test_inspect_counts_unpushed_commits(repo: Path, tmp_path: Path):
     assert any("ни на одном remote" in b for b in info.blockers)
 
 
-async def test_list_all_empty_when_root_missing(tmp_path: Path):
+async def test_list_all_empty_when_root_missing(tmp_path: Path) -> None:
     assert await worktrees.list_all(tmp_path / "nope") == []
 
 
-async def test_remove_refuses_when_work_would_be_lost(repo: Path, tmp_path: Path):
+async def test_remove_refuses_when_work_would_be_lost(repo: Path, tmp_path: Path) -> None:
     root = tmp_path / "wt"
     path = await worktrees.ensure(repo, "topic", root)
     (path / "new.txt").write_text("x\n")
@@ -127,7 +126,7 @@ async def test_remove_refuses_when_work_would_be_lost(repo: Path, tmp_path: Path
     assert path.is_dir()  # ничего не тронули
 
 
-async def test_remove_force_deletes_anyway(repo: Path, tmp_path: Path):
+async def test_remove_force_deletes_anyway(repo: Path, tmp_path: Path) -> None:
     root = tmp_path / "wt"
     path = await worktrees.ensure(repo, "topic", root)
     (path / "new.txt").write_text("x\n")
@@ -138,14 +137,16 @@ async def test_remove_force_deletes_anyway(repo: Path, tmp_path: Path):
     assert not path.exists()
 
 
-async def test_remove_clean_worktree_without_force(repo: Path, tmp_path: Path):
+async def test_remove_clean_worktree_without_force(repo: Path, tmp_path: Path) -> None:
     root = tmp_path / "wt"
     # ветка существует и уже «на remote» её нет, но и своих коммитов нет —
     # HEAD совпадает с main, значит терять нечего
     await _git(repo, "branch", "clean-topic")
     path = await worktrees.ensure(repo, "clean-topic", root)
 
-    if (await worktrees.inspect(path)).blockers:
+    state = await worktrees.inspect(path)
+    assert state is not None
+    if state.blockers:
         pytest.skip("без настроенного remote git считает коммиты незапушенными")
 
     await worktrees.remove(root, path.name)
@@ -153,7 +154,7 @@ async def test_remove_clean_worktree_without_force(repo: Path, tmp_path: Path):
     assert not path.exists()
 
 
-async def test_list_all_reports_created_worktrees(repo: Path, tmp_path: Path):
+async def test_list_all_reports_created_worktrees(repo: Path, tmp_path: Path) -> None:
     root = tmp_path / "wt"
     await worktrees.ensure(repo, "one", root)
     await worktrees.ensure(repo, "two", root)
@@ -164,13 +165,13 @@ async def test_list_all_reports_created_worktrees(repo: Path, tmp_path: Path):
     assert {w.name for w in items} == {"demo-one", "demo-two"}
 
 
-def test_generate_branch_has_sortable_timestamp():
+def test_generate_branch_has_sortable_timestamp() -> None:
     import re
 
     assert re.fullmatch(r"wt/\d{8}-\d{6}", worktrees.generate_branch(1700000000.0))
 
 
-def test_generate_branch_differs_by_second():
+def test_generate_branch_differs_by_second() -> None:
     first = worktrees.generate_branch(1700000000.0)
     second = worktrees.generate_branch(1700000001.0)
 
@@ -178,7 +179,7 @@ def test_generate_branch_differs_by_second():
     assert first != second
 
 
-async def test_generated_branch_makes_usable_worktree(repo: Path, tmp_path: Path):
+async def test_generated_branch_makes_usable_worktree(repo: Path, tmp_path: Path) -> None:
     branch = worktrees.generate_branch(1700000000.0)
 
     path = await worktrees.ensure(repo, branch, tmp_path / "wt")

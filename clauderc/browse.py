@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from tgclaude.repos import SKIP_DIRS
+from clauderc.repos import SKIP_DIRS
 
 MAX_ENTRIES = 20
 

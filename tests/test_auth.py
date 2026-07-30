@@ -1,16 +1,19 @@
-from types import SimpleNamespace
-
-from tgclaude.bot import _is_authorized
-
-
-def test_authorized_owner():
-    assert _is_authorized(SimpleNamespace(id=42), 42) is True
+from aiogram.types import User
+from clauderc.bot import _is_authorized
 
 
-def test_rejects_other_user():
-    assert _is_authorized(SimpleNamespace(id=7), 42) is False
+def _user(user_id: int) -> User:
+    return User(id=user_id, is_bot=False, first_name="test")
 
 
-def test_rejects_none_user():
+def test_authorized_owner() -> None:
+    assert _is_authorized(_user(42), 42) is True
+
+
+def test_rejects_other_user() -> None:
+    assert _is_authorized(_user(7), 42) is False
+
+
+def test_rejects_none_user() -> None:
     # пост из привязанного канала / анонимный админ → from_user is None → отказ
     assert _is_authorized(None, 42) is False
