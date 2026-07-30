@@ -21,6 +21,7 @@ from tgclaude import browse, worktrees
 from tgclaude.browse import BrowseError
 from tgclaude.config import Config, load_config
 from tgclaude.remote import (
+    PREFIX as REMOTE_PREFIX,
     LaunchError,
     RemoteSession,
     TrustRequired,
@@ -56,7 +57,8 @@ HELP = (
     "так работают параллельно с уже запущенной\n"
     "<code>/rc</code> &lt;репо&gt; [ветка] — то же по имени, без хождения\n\n"
     "<b>Что запущено</b>\n"
-    "<b>💬 Chats</b> (<code>/rc</code>) — живые сессии со ссылками\n"
+    "<b>💬 Chats</b> (<code>/rc</code>) — живые сессии; у каждой кнопки "
+    "<b>Open in Claude</b> и <b>⏹ Stop</b>\n"
     "<b>🌿 Worktrees</b> (<code>/wt</code>) — созданные worktree и их состояние\n"
     "<code>/rckill</code> &lt;имя&gt; — погасить сессию (без имени — все)\n"
     "<code>/wtrm</code> &lt;имя&gt; — удалить worktree\n\n"
@@ -240,6 +242,7 @@ async def main() -> None:
     pending: dict[str, tuple[Path, str | None]] = {}
     # Сессии, которые ждут ответа на диалог доверия каталогу.
     trust_pending: dict[str, tuple[str, str]] = {}
+    stop_pending: dict[str, str] = {}
 
     async def start_session(message: Message, target: Path, branch: str | None) -> None:
         head = f"⏳ Поднимаю сессию в <code>{html.escape(str(target))}</code>"
@@ -306,7 +309,25 @@ async def main() -> None:
         if not sessions:
             await message.reply("Живых сессий нет. <b>/rc</b> &lt;репо&gt;", parse_mode="HTML")
             return
-        await message.reply("\n\n".join(_list_item(s) for s in sessions), parse_mode="HTML")
+
+        # По сообщению на сессию: гасить надо конкретную, а кнопка должна быть рядом
+        # со своей ссылкой, а не в общей простыне.
+        for session in sessions:
+            token = uuid.uuid4().hex[:8]
+            # Имя в callback_data не кладём: там 64 байта, а имя worktree с кириллицей
+            # в пути легко выходит за лимит.
+            stop_pending[token] = session.tmux_name
+            rows = []
+            if session.url:
+                rows.append([InlineKeyboardButton(text="Open in Claude", url=session.url)])
+            rows.append(
+                [InlineKeyboardButton(text="⏹ Stop", callback_data=f"stop:{token}")]
+            )
+            await message.answer(
+                _list_item(session),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
 
     @dp.message(lambda event: not _is_authorized(event.from_user, config.allowed_user_id))
     async def reject_strangers(message: Message) -> None:
@@ -462,6 +483,30 @@ async def main() -> None:
         note = " Сессия погашена." if session is not None else ""
         await message.reply(
             f"Worktree <b>{html.escape(name)}</b> удалён.{note}", parse_mode="HTML"
+        )
+
+    @dp.callback_query(F.data.startswith("stop:"))
+    async def on_stop(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        tmux_name = stop_pending.pop(query.data[5:], None)
+        if tmux_name is None:
+            await query.answer("Список устарел")
+            if query.message is not None:
+                await query.message.edit_reply_markup(reply_markup=None)
+            return
+
+        killed = await kill_tmux(tmux_name)
+        await query.answer("Погашена" if killed else "Уже не жива")
+        if query.message is None:
+            return
+        name = tmux_name.removeprefix(REMOTE_PREFIX)
+        # Worktree намеренно остаётся: там может лежать несохранённая работа.
+        await query.message.edit_text(
+            f"⏹ Сессия <b>{html.escape(name)}</b> погашена."
+            if killed
+            else f"Сессия <b>{html.escape(name)}</b> уже не жива.",
+            parse_mode="HTML",
         )
 
     @dp.callback_query(F.data.startswith("jump:"))
