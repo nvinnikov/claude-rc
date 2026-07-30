@@ -200,6 +200,18 @@ make run         # запустить бота вручную
 
 CI (GitHub Actions) гоняет те же четыре шага плюс скан секретов gitleaks.
 
+Отдельным воркфлоу PR ревьюит Claude Code Action по правилам из
+[CLAUDE.md](CLAUDE.md#code-review-guidelines). Чтобы он заработал, нужно два
+разовых действия: поставить на репозиторий [GitHub App](https://github.com/apps/claude)
+и положить токен в секреты —
+
+```bash
+claude setup-token                       # выдаст токен
+gh secret set CLAUDE_CODE_OAUTH_TOKEN    # вставить его сюда
+```
+
+Без токена джоба тихо пропускается и PR не краснеет.
+
 ## Тесты
 
 `make test` или `uv run pytest`
