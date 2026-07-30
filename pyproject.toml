@@ -3,7 +3,6 @@ name = "tg-claude"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "claude-agent-sdk>=0.2.126",
     "aiogram>=3.15",
 ]
 

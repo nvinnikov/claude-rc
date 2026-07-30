@@ -5,61 +5,84 @@ import pytest
 from tgclaude.config import Config, load_config
 
 
+def _write(tmp_path: Path, body: str) -> Path:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(body)
+    return cfg
+
+
 def test_load_config_reads_all_fields(tmp_path: Path):
-    cfg_file = tmp_path / "config.toml"
-    cfg_file.write_text(
+    code = tmp_path / "code"
+    code.mkdir()
+    cfg = _write(
+        tmp_path,
         'bot_token = "abc"\n'
         "allowed_user_id = 42\n"
-        "chat_id = -100500\n"
-        f'default_cwd = "{tmp_path}"\n'
-        "approval_timeout_s = 60\n"
-        'db_path = "s.db"\n'
+        f'rc_roots = ["{code}"]\n'
+        "scan_depth = 2\n"
+        "launch_timeout_s = 30\n",
     )
 
-    cfg = load_config(cfg_file)
-
-    assert cfg == Config(
+    assert load_config(cfg) == Config(
         bot_token="abc",
         allowed_user_id=42,
-        chat_id=-100500,
-        default_cwd=tmp_path,
-        approval_timeout_s=60,
-        db_path=tmp_path / "s.db",
+        rc_roots=(code,),
+        scan_depth=2,
+        launch_timeout_s=30.0,
     )
 
 
-def test_db_path_is_resolved_next_to_config(tmp_path: Path):
-    cfg_file = tmp_path / "config.toml"
-    cfg_file.write_text(
+def test_defaults_are_applied(tmp_path: Path):
+    cfg = _write(
+        tmp_path,
+        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n',
+    )
+
+    loaded = load_config(cfg)
+
+    assert loaded.scan_depth == 3
+    assert loaded.launch_timeout_s == 90.0
+
+
+def test_rc_roots_accepts_bare_string(tmp_path: Path):
+    cfg = _write(
+        tmp_path, f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = "{tmp_path}"\n'
+    )
+
+    assert load_config(cfg).rc_roots == (tmp_path,)
+
+
+def test_rc_roots_defaults_to_home(tmp_path: Path):
+    cfg = _write(tmp_path, 'bot_token = "abc"\nallowed_user_id = 1\n')
+
+    assert load_config(cfg).rc_roots == (Path.home(),)
+
+
+def test_leftover_keys_from_chat_version_are_ignored(tmp_path: Path):
+    cfg = _write(
+        tmp_path,
         'bot_token = "abc"\n'
         "allowed_user_id = 1\n"
-        "chat_id = 2\n"
-        f'default_cwd = "{tmp_path}"\n'
+        "chat_id = -100500\n"
+        'default_cwd = "~"\n'
         'db_path = "sessions.db"\n'
+        f'rc_roots = ["{tmp_path}"]\n',
     )
 
-    cfg = load_config(cfg_file)
-
-    assert cfg.db_path == tmp_path / "sessions.db"
-    assert cfg.approval_timeout_s == 300
+    assert load_config(cfg).bot_token == "abc"
 
 
 def test_missing_required_field_raises(tmp_path: Path):
-    cfg_file = tmp_path / "config.toml"
-    cfg_file.write_text('bot_token = "abc"\n')
+    cfg = _write(tmp_path, 'bot_token = "abc"\n')
 
     with pytest.raises(KeyError):
-        load_config(cfg_file)
+        load_config(cfg)
 
 
-def test_nonexistent_default_cwd_raises(tmp_path: Path):
-    cfg_file = tmp_path / "config.toml"
-    cfg_file.write_text(
-        'bot_token = "abc"\n'
-        "allowed_user_id = 1\n"
-        "chat_id = 2\n"
-        'default_cwd = "/no/such/dir"\n'
+def test_nonexistent_root_raises(tmp_path: Path):
+    cfg = _write(
+        tmp_path, 'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["/no/such/dir"]\n'
     )
 
-    with pytest.raises(ValueError, match="default_cwd"):
-        load_config(cfg_file)
+    with pytest.raises(ValueError, match="rc_roots"):
+        load_config(cfg)
