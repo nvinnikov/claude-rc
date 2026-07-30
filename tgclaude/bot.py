@@ -1,6 +1,7 @@
 import asyncio
 import html
 import logging
+import os
 import time
 import uuid
 from collections import Counter
@@ -35,16 +36,16 @@ from tgclaude.remote import (
     list_sessions,
     tmux_available,
 )
-from tgclaude.render import chunks
 from tgclaude.repos import discover, resolve
 from tgclaude.state import State
-from tgclaude.worktrees import WorktreeError
+from tgclaude.worktrees import Worktree, WorktreeError
 
 log = logging.getLogger("tgclaude")
 
 DISCOVERY_TTL_S = 60.0
 MAX_CHOICES = 8
 MAX_PROJECT_BUTTONS = 60
+MAX_TREE_CARDS = 10
 HELP = (
     "Поднимаю сессии Claude Code с Remote Control — дальше работа в приложении Claude.\n\n"
     "<b>Куда идём</b>\n"
@@ -57,11 +58,12 @@ HELP = (
     "так работают параллельно с уже запущенной\n"
     "<code>/rc</code> &lt;репо&gt; [ветка] — то же по имени, без хождения\n\n"
     "<b>Что запущено</b>\n"
-    "<b>💬 Chats</b> (<code>/rc</code>) — живые сессии; у каждой кнопки "
-    "<b>Open in Claude</b> и <b>⏹ Stop</b>\n"
-    "<b>🌿 Worktrees</b> (<code>/wt</code>) — созданные worktree и их состояние\n"
+    "<b>💬 Chats</b> (<code>/rc</code>) — живые сессии с кнопками "
+    "<b>Open in Claude</b> и <b>⏹ Stop</b>, а следом worktree, оставшиеся без сессии: "
+    "их можно поднять заново или удалить\n"
+    "<code>/wt</code> — все worktree, включая занятые\n"
     "<code>/rckill</code> &lt;имя&gt; — погасить сессию (без имени — все)\n"
-    "<code>/wtrm</code> &lt;имя&gt; — удалить worktree\n\n"
+    "<code>/wtrm</code> &lt;имя&gt; [force] — удалить worktree\n\n"
     "Сессии живут в tmux и переживают рестарт бота."
 )
 
@@ -69,14 +71,14 @@ HELP = (
 BTN_PWD = "📁 PWD"
 BTN_SESSIONS = "💬 Chats"
 BTN_REPOS = "📚 Projects"
-BTN_WT = "🌿 Worktrees"
 BTN_HELP = "⌨️ Commands"
 
+# Worktree своей кнопки внизу не имеет: без сессии он — остаток работы, и место
+# ему рядом с сессиями в Chats, а не в отдельном разделе.
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_PWD), KeyboardButton(text=BTN_SESSIONS)],
-        [KeyboardButton(text=BTN_REPOS), KeyboardButton(text=BTN_WT)],
-        [KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BTN_REPOS), KeyboardButton(text=BTN_HELP)],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -129,12 +131,31 @@ def _fresh_text(session: RemoteSession) -> str:
     )
 
 
-def _list_item(session: RemoteSession) -> str:
-    return (
-        f"▸ <b>{html.escape(session.name)}</b> · {_uptime(session.uptime_s())}\n"
-        f"<code>{html.escape(session.cwd)}</code>\n"
-        f"{_link_line(session)}"
+def _list_item(session: RemoteSession, tree: Worktree | None = None) -> str:
+    lines = [
+        f"▸ <b>{html.escape(session.name)}</b> · {_uptime(session.uptime_s())}",
+        f"<code>{html.escape(session.cwd)}</code>",
+    ]
+    if tree is not None:
+        lines.append(f"🌿 <code>{html.escape(tree.branch)}</code> · {_tree_state(tree)}")
+    lines.append(_link_line(session))
+    return "\n".join(lines)
+
+
+def _tree_state(tree: Worktree) -> str:
+    return html.escape("; ".join(tree.blockers)) or "чисто"
+
+
+def _tree_text(tree: Worktree, session: RemoteSession | None) -> str:
+    head = "🌿 <b>{}</b> · {}".format(
+        html.escape(tree.name), "сессия жива" if session is not None else "без сессии"
     )
+    body = (
+        f"{html.escape(tree.repo)} · <code>{html.escape(tree.branch)}</code> · {_tree_state(tree)}"
+    )
+    if session is not None and session.url:
+        return f"{head}\n{body}\n{html.escape(session.url)}"
+    return f"{head}\n{body}"
 
 
 def _browse_card(cwd: Path) -> tuple[str, InlineKeyboardMarkup]:
@@ -243,6 +264,7 @@ async def main() -> None:
     # Сессии, которые ждут ответа на диалог доверия каталогу.
     trust_pending: dict[str, tuple[str, str]] = {}
     stop_pending: dict[str, str] = {}
+    tree_pending: dict[str, Path] = {}
 
     async def start_session(message: Message, target: Path, branch: str | None) -> None:
         head = f"⏳ Поднимаю сессию в <code>{html.escape(str(target))}</code>"
@@ -304,29 +326,59 @@ async def main() -> None:
             _fresh_text(session), parse_mode="HTML", reply_markup=_open_keyboard(session.url)
         )
 
-    async def show_sessions(message: Message) -> None:
-        sessions = await list_sessions()
-        if not sessions:
-            await message.reply("Живых сессий нет. <b>/rc</b> &lt;репо&gt;", parse_mode="HTML")
-            return
+    async def send_tree_card(
+        message: Message, tree: Worktree, session: RemoteSession | None
+    ) -> None:
+        token = uuid.uuid4().hex[:8]
+        tree_pending[token] = tree.path
+        row = []
+        if session is not None and session.url:
+            row.append(InlineKeyboardButton(text="Open in Claude", url=session.url))
+        elif session is None:
+            row.append(InlineKeyboardButton(text="▶️ Start", callback_data=f"wtstart:{token}"))
+        row.append(InlineKeyboardButton(text="🗑 Remove", callback_data=f"wtrm:{token}"))
+        await message.answer(
+            _tree_text(tree, session),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[row]),
+        )
 
-        # По сообщению на сессию: гасить надо конкретную, а кнопка должна быть рядом
+    async def show_chats(message: Message) -> None:
+        """Всё, что запущено или осталось: живые сессии плюс worktree без сессии."""
+        sessions = await list_sessions()
+        trees = {os.path.realpath(t.path): t for t in await worktrees.list_all(config.worktree_root)}
+        occupied: set[str] = set()
+
+        # По сообщению на сессию: гасить надо конкретную, и кнопка должна быть рядом
         # со своей ссылкой, а не в общей простыне.
         for session in sessions:
+            real = os.path.realpath(session.cwd)
+            occupied.add(real)
             token = uuid.uuid4().hex[:8]
-            # Имя в callback_data не кладём: там 64 байта, а имя worktree с кириллицей
-            # в пути легко выходит за лимит.
+            # Имя в callback_data не кладём: там 64 байта, а путь worktree с кириллицей
+            # за лимит выходит легко.
             stop_pending[token] = session.tmux_name
             rows = []
             if session.url:
                 rows.append([InlineKeyboardButton(text="Open in Claude", url=session.url)])
-            rows.append(
-                [InlineKeyboardButton(text="⏹ Stop", callback_data=f"stop:{token}")]
-            )
+            rows.append([InlineKeyboardButton(text="⏹ Stop", callback_data=f"stop:{token}")])
             await message.answer(
-                _list_item(session),
+                _list_item(session, trees.get(real)),
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+
+        orphans = [tree for real, tree in trees.items() if real not in occupied]
+        if not sessions and not orphans:
+            await message.reply("Живых сессий нет. <b>/rc</b> &lt;репо&gt;", parse_mode="HTML")
+            return
+
+        for tree in orphans[:MAX_TREE_CARDS]:
+            await send_tree_card(message, tree, None)
+        if len(orphans) > MAX_TREE_CARDS:
+            await message.answer(
+                f"…и ещё {len(orphans) - MAX_TREE_CARDS} worktree без сессии — <code>/wt</code>",
+                parse_mode="HTML",
             )
 
     @dp.message(lambda event: not _is_authorized(event.from_user, config.allowed_user_id))
@@ -347,7 +399,7 @@ async def main() -> None:
 
     @dp.message(F.text == BTN_SESSIONS)
     async def cmd_sessions(message: Message) -> None:
-        await show_sessions(message)
+        await show_chats(message)
 
     @dp.message(Command("cd"))
     async def cmd_cd(message: Message) -> None:
@@ -375,7 +427,7 @@ async def main() -> None:
     async def cmd_rc(message: Message) -> None:
         parts = (message.text or "").split()
         if len(parts) < 2:
-            await show_sessions(message)
+            await show_chats(message)
             return
 
         query = parts[1]
@@ -424,7 +476,6 @@ async def main() -> None:
             )
 
     @dp.message(Command("wt"))
-    @dp.message(F.text == BTN_WT)
     async def cmd_wt(message: Message) -> None:
         items = await worktrees.list_all(config.worktree_root)
         if not items:
@@ -432,13 +483,10 @@ async def main() -> None:
                 "Worktree нет. <b>/rc</b> &lt;репо&gt; &lt;ветка&gt;", parse_mode="HTML"
             )
             return
-        lines = [
-            f"▸ <b>{html.escape(wt.name)}</b> · {'; '.join(wt.blockers) or 'чисто'}\n"
-            f"{html.escape(wt.repo)} · <code>{html.escape(wt.branch)}</code>"
-            for wt in items
-        ]
-        for part in chunks("\n\n".join(lines)):
-            await message.answer(part, parse_mode="HTML")
+        for tree in items[:MAX_TREE_CARDS]:
+            await send_tree_card(message, tree, await find(str(tree.path)))
+        if len(items) > MAX_TREE_CARDS:
+            await message.answer(f"…и ещё {len(items) - MAX_TREE_CARDS}.")
 
     @dp.message(Command("wtrm"))
     async def cmd_wtrm(message: Message) -> None:
@@ -483,6 +531,77 @@ async def main() -> None:
         note = " Сессия погашена." if session is not None else ""
         await message.reply(
             f"Worktree <b>{html.escape(name)}</b> удалён.{note}", parse_mode="HTML"
+        )
+
+    @dp.callback_query(F.data.startswith("wtstart:"))
+    async def on_tree_start(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        path = tree_pending.get(query.data[8:])
+        await query.answer()
+        if query.message is None:
+            return
+        if path is None or not path.is_dir():
+            await query.message.answer("Список устарел, повтори /wt.")
+            return
+        await query.message.edit_reply_markup(reply_markup=None)
+        # Ветка уже выкачена в этом каталоге — второй worktree заводить не нужно.
+        await start_session(query.message, path, None)
+
+    @dp.callback_query(F.data.startswith(("wtrm:", "wtrmf:")))
+    async def on_tree_remove(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        verdict, _, token = query.data.partition(":")
+        forced = verdict == "wtrmf"
+        path = tree_pending.get(token)
+        await query.answer()
+        if query.message is None:
+            return
+        if path is None:
+            await query.message.edit_reply_markup(reply_markup=None)
+            await query.message.answer("Список устарел, повтори /wt.")
+            return
+
+        info = await worktrees.inspect(path) if path.is_dir() else None
+        if info is None:
+            tree_pending.pop(token, None)
+            await query.message.edit_text("Worktree уже нет.")
+            return
+
+        if info.blockers and not forced:
+            # Токен оставляем: он нужен кнопке подтверждения.
+            await query.message.edit_text(
+                f"{_tree_text(info, None)}\n\n❌ Не удаляю: {_tree_state(info)}.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="🗑 Remove anyway", callback_data=f"wtrmf:{token}"
+                            )
+                        ]
+                    ]
+                ),
+            )
+            return
+
+        tree_pending.pop(token, None)
+        # Сессия могла подняться уже после показа карточки.
+        session = await find(str(path))
+        if session is not None:
+            await kill_tmux(session.tmux_name)
+        try:
+            await worktrees.remove(config.worktree_root, path.name, force=forced)
+        except WorktreeError as exc:
+            await query.message.edit_text(
+                f"❌ Не удалился.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
+            )
+            return
+
+        note = " Сессия погашена." if session is not None else ""
+        await query.message.edit_text(
+            f"🗑 Worktree <b>{html.escape(path.name)}</b> удалён.{note}", parse_mode="HTML"
         )
 
     @dp.callback_query(F.data.startswith("stop:"))
