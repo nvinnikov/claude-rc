@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 # Каталоги, внутрь которых спускаться бессмысленно и дорого.
-_SKIP = {
+SKIP_DIRS = {
     "node_modules",
     "vendor",
     "target",
@@ -26,19 +26,19 @@ def _walk(root: Path, depth: int) -> Iterator[Path]:
     except OSError:
         return  # нет прав или каталог исчез — просто пропускаем
     for entry in entries:
-        if entry.name.startswith(".") or entry.name in _SKIP or not entry.is_dir():
+        if entry.name.startswith(".") or entry.name in SKIP_DIRS or not entry.is_dir():
             continue
         if (entry / ".git").exists():
             yield entry
-        # Спускаемся и внутрь репозиториев: там лежат сабмодули (flybo_packages)
-        # и вложенные сервисы (flybo-arch-v2/services/*).
+        # Спускаемся и внутрь репозиториев: там лежат сабмодули и вложенные
+        # сервисы вида <монорепо>/services/<сервис>.
         yield from _walk(entry, depth - 1)
 
 
 def discover(roots: list[Path], depth: int = 3) -> list[Path]:
     """Цели запуска: сами корни плюс всё с `.git` на глубину `depth`.
 
-    Корни включены потому, что рабочий зонт (`~/Documents/Flybo`) собственного
+    Корни включены потому, что рабочий зонт-каталог собственного
     `.git` не имеет, но запускаться в нём осмысленно.
     """
     found: dict[Path, None] = {}

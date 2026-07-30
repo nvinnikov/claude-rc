@@ -10,7 +10,7 @@ def _mkrepo(base: Path, rel: str) -> Path:
 
 
 def test_discover_finds_repo_three_levels_deep(tmp_path: Path):
-    # так лежат сервисы: Flybo/flybo-arch-v2/services/oms
+    # так лежат сервисы: <зонт>/<монорепо>/services/<сервис>
     target = _mkrepo(tmp_path, "arch/services/oms")
 
     assert target in discover([tmp_path], depth=3)
@@ -23,7 +23,7 @@ def test_discover_stops_at_depth_limit(tmp_path: Path):
 
 
 def test_discover_includes_root_without_git(tmp_path: Path):
-    # рабочий зонт ~/Documents/Flybo своего .git не имеет, но цель валидная
+    # рабочий зонт-каталог своего .git не имеет, но цель валидная
     assert tmp_path in discover([tmp_path])
 
 
@@ -64,9 +64,9 @@ def test_resolve_returns_all_partial_matches(tmp_path: Path):
 
 
 def test_resolve_is_case_insensitive(tmp_path: Path):
-    repo = _mkrepo(tmp_path, "Flybo-Mobile")
+    repo = _mkrepo(tmp_path, "Mobile-App")
 
-    assert resolve("flybo-mobile", discover([tmp_path])) == [repo]
+    assert resolve("mobile-app", discover([tmp_path])) == [repo]
 
 
 def test_resolve_empty_query_matches_nothing(tmp_path: Path):
