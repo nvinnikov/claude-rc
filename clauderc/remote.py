@@ -19,7 +19,7 @@ import shutil
 import time
 from dataclasses import dataclass
 
-log = logging.getLogger("tgclaude.remote")
+log = logging.getLogger("clauderc.remote")
 
 PREFIX = "rc-"
 CLAUDE_BIN = "claude"
@@ -198,9 +198,7 @@ async def launch(repo: str, cwd: str, *, timeout_s: float = 90.0) -> RemoteSessi
         return existing
 
     name = await _unique_name(repo, cwd)
-    command = (
-        _SCRUB_ENV + f"exec {shlex.quote(CLAUDE_BIN)} --remote-control {shlex.quote(repo)}"
-    )
+    command = _SCRUB_ENV + f"exec {shlex.quote(CLAUDE_BIN)} --remote-control {shlex.quote(repo)}"
     await _run("new-session", "-d", "-s", name, "-x", _COLS, "-y", _ROWS, "-c", cwd, command)
     return await await_url(name, cwd, timeout_s=timeout_s)
 

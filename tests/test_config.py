@@ -1,8 +1,7 @@
 from pathlib import Path
 
 import pytest
-
-from tgclaude.config import Config, load_config
+from clauderc.config import Config, load_config
 
 
 def _write(tmp_path: Path, body: str) -> Path:
@@ -11,7 +10,7 @@ def _write(tmp_path: Path, body: str) -> Path:
     return cfg
 
 
-def test_load_config_reads_all_fields(tmp_path: Path):
+def test_load_config_reads_all_fields(tmp_path: Path) -> None:
     code = tmp_path / "code"
     code.mkdir()
     cfg = _write(
@@ -36,16 +35,14 @@ def test_load_config_reads_all_fields(tmp_path: Path):
     )
 
 
-def test_worktree_root_defaults_and_need_not_exist(tmp_path: Path):
-    cfg = _write(
-        tmp_path, f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n'
-    )
+def test_worktree_root_defaults_and_need_not_exist(tmp_path: Path) -> None:
+    cfg = _write(tmp_path, f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n')
 
     # каталог создаётся при первом worktree, заранее его существования не требуем
-    assert load_config(cfg).worktree_root == Path("~/.tg-claude/worktrees").expanduser()
+    assert load_config(cfg).worktree_root == Path("~/.claude-rc/worktrees").expanduser()
 
 
-def test_defaults_are_applied(tmp_path: Path):
+def test_defaults_are_applied(tmp_path: Path) -> None:
     cfg = _write(
         tmp_path,
         f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n',
@@ -57,21 +54,19 @@ def test_defaults_are_applied(tmp_path: Path):
     assert loaded.launch_timeout_s == 90.0
 
 
-def test_rc_roots_accepts_bare_string(tmp_path: Path):
-    cfg = _write(
-        tmp_path, f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = "{tmp_path}"\n'
-    )
+def test_rc_roots_accepts_bare_string(tmp_path: Path) -> None:
+    cfg = _write(tmp_path, f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = "{tmp_path}"\n')
 
     assert load_config(cfg).rc_roots == (tmp_path,)
 
 
-def test_rc_roots_defaults_to_home(tmp_path: Path):
+def test_rc_roots_defaults_to_home(tmp_path: Path) -> None:
     cfg = _write(tmp_path, 'bot_token = "abc"\nallowed_user_id = 1\n')
 
     assert load_config(cfg).rc_roots == (Path.home(),)
 
 
-def test_leftover_keys_from_chat_version_are_ignored(tmp_path: Path):
+def test_leftover_keys_from_chat_version_are_ignored(tmp_path: Path) -> None:
     cfg = _write(
         tmp_path,
         'bot_token = "abc"\n'
@@ -85,17 +80,15 @@ def test_leftover_keys_from_chat_version_are_ignored(tmp_path: Path):
     assert load_config(cfg).bot_token == "abc"
 
 
-def test_missing_required_field_raises(tmp_path: Path):
+def test_missing_required_field_raises(tmp_path: Path) -> None:
     cfg = _write(tmp_path, 'bot_token = "abc"\n')
 
     with pytest.raises(KeyError):
         load_config(cfg)
 
 
-def test_nonexistent_root_raises(tmp_path: Path):
-    cfg = _write(
-        tmp_path, 'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["/no/such/dir"]\n'
-    )
+def test_nonexistent_root_raises(tmp_path: Path) -> None:
+    cfg = _write(tmp_path, 'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["/no/such/dir"]\n')
 
     with pytest.raises(ValueError, match="rc_roots"):
         load_config(cfg)

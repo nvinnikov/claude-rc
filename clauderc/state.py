@@ -9,7 +9,7 @@ import json
 import logging
 from pathlib import Path
 
-log = logging.getLogger("tgclaude.state")
+log = logging.getLogger("clauderc.state")
 
 
 class State:

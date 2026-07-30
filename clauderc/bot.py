@@ -16,13 +16,16 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    User,
 )
 
-from tgclaude import browse, worktrees
-from tgclaude.browse import BrowseError
-from tgclaude.config import Config, load_config
-from tgclaude.remote import (
+from clauderc import browse, worktrees
+from clauderc.browse import BrowseError
+from clauderc.config import Config, load_config
+from clauderc.remote import (
     PREFIX as REMOTE_PREFIX,
+)
+from clauderc.remote import (
     LaunchError,
     RemoteSession,
     TrustRequired,
@@ -36,11 +39,11 @@ from tgclaude.remote import (
     list_sessions,
     tmux_available,
 )
-from tgclaude.repos import discover, resolve
-from tgclaude.state import State
-from tgclaude.worktrees import Worktree, WorktreeError
+from clauderc.repos import discover, resolve
+from clauderc.state import State
+from clauderc.worktrees import Worktree, WorktreeError
 
-log = logging.getLogger("tgclaude")
+log = logging.getLogger("clauderc")
 
 DISCOVERY_TTL_S = 60.0
 MAX_CHOICES = 8
@@ -51,7 +54,8 @@ HELP = (
     "<b>Куда идём</b>\n"
     "<b>📁 PWD</b> (<code>/pwd</code>) — где я, с кнопками по подкаталогам\n"
     "<b>📚 Projects</b> (<code>/repos</code>) — все git-репозитории, тап переносит внутрь\n"
-    "<code>/cd</code> &lt;путь&gt; — перейти (<code>..</code>, <code>~</code>, относительный, абсолютный)\n\n"
+    "<code>/cd</code> &lt;путь&gt; — перейти "
+    "(<code>..</code>, <code>~</code>, относительный, абсолютный)\n\n"
     "<b>Запуск</b>\n"
     "<b>▶️ Start Claude RC</b> — сессия в текущем каталоге\n"
     "<b>🌿 New worktree</b> — сессия в свежем worktree, ветка по времени; "
@@ -85,9 +89,18 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
-def _is_authorized(from_user, allowed_user_id: int) -> bool:
+def _is_authorized(from_user: User | None, allowed_user_id: int) -> bool:
     """Пропускаем только владельца. from_user=None (канал/анонимный админ) → отказ (fail-closed)."""
     return from_user is not None and from_user.id == allowed_user_id
+
+
+def _live_message(query: CallbackQuery) -> Message | None:
+    """Сообщение кнопки, если его ещё можно редактировать.
+
+    Для слишком старых сообщений Telegram присылает InaccessibleMessage: у него нет
+    ни edit_text, ни answer, и обращение к ним падает.
+    """
+    return query.message if isinstance(query.message, Message) else None
 
 
 def _open_keyboard(url: str) -> InlineKeyboardMarkup | None:
@@ -188,9 +201,7 @@ def _browse_card(cwd: Path) -> tuple[str, InlineKeyboardMarkup]:
     launch_row = [InlineKeyboardButton(text="▶️ Start Claude RC", callback_data="nav:here")]
     # Вторая сессия в том же каталоге дралась бы за индекс и ветку — только через worktree.
     if browse.is_repo(cwd):
-        launch_row.append(
-            InlineKeyboardButton(text="🌿 New worktree", callback_data="nav:newwt")
-        )
+        launch_row.append(InlineKeyboardButton(text="🌿 New worktree", callback_data="nav:newwt"))
     rows.append(launch_row)
 
     text = f"📁 <code>{html.escape(str(cwd))}</code>{mark}"
@@ -246,9 +257,7 @@ class Discovery:
 
 
 async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     root = Path(__file__).resolve().parent.parent
     config = load_config(root / "config.toml")
     if not tmux_available():
@@ -306,9 +315,7 @@ async def main() -> None:
                     inline_keyboard=[
                         [
                             InlineKeyboardButton(text="Trust", callback_data=f"trust:{token}"),
-                            InlineKeyboardButton(
-                                text="Cancel", callback_data=f"notrust:{token}"
-                            ),
+                            InlineKeyboardButton(text="Cancel", callback_data=f"notrust:{token}"),
                         ]
                     ]
                 ),
@@ -346,7 +353,9 @@ async def main() -> None:
     async def show_chats(message: Message) -> None:
         """Всё, что запущено или осталось: живые сессии плюс worktree без сессии."""
         sessions = await list_sessions()
-        trees = {os.path.realpath(t.path): t for t in await worktrees.list_all(config.worktree_root)}
+        trees = {
+            os.path.realpath(t.path): t for t in await worktrees.list_all(config.worktree_root)
+        }
         occupied: set[str] = set()
 
         # По сообщению на сессию: гасить надо конкретную, и кнопка должна быть рядом
@@ -529,49 +538,49 @@ async def main() -> None:
             return
 
         note = " Сессия погашена." if session is not None else ""
-        await message.reply(
-            f"Worktree <b>{html.escape(name)}</b> удалён.{note}", parse_mode="HTML"
-        )
+        await message.reply(f"Worktree <b>{html.escape(name)}</b> удалён.{note}", parse_mode="HTML")
 
     @dp.callback_query(F.data.startswith("wtstart:"))
     async def on_tree_start(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        path = tree_pending.get(query.data[8:])
+        path = tree_pending.get((query.data or "").removeprefix("wtstart:"))
         await query.answer()
-        if query.message is None:
+        message = _live_message(query)
+        if message is None:
             return
         if path is None or not path.is_dir():
-            await query.message.answer("Список устарел, повтори /wt.")
+            await message.answer("Список устарел, повтори /wt.")
             return
-        await query.message.edit_reply_markup(reply_markup=None)
+        await message.edit_reply_markup(reply_markup=None)
         # Ветка уже выкачена в этом каталоге — второй worktree заводить не нужно.
-        await start_session(query.message, path, None)
+        await start_session(message, path, None)
 
     @dp.callback_query(F.data.startswith(("wtrm:", "wtrmf:")))
     async def on_tree_remove(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        verdict, _, token = query.data.partition(":")
+        verdict, _, token = (query.data or "").partition(":")
         forced = verdict == "wtrmf"
         path = tree_pending.get(token)
         await query.answer()
-        if query.message is None:
+        message = _live_message(query)
+        if message is None:
             return
         if path is None:
-            await query.message.edit_reply_markup(reply_markup=None)
-            await query.message.answer("Список устарел, повтори /wt.")
+            await message.edit_reply_markup(reply_markup=None)
+            await message.answer("Список устарел, повтори /wt.")
             return
 
         info = await worktrees.inspect(path) if path.is_dir() else None
         if info is None:
             tree_pending.pop(token, None)
-            await query.message.edit_text("Worktree уже нет.")
+            await message.edit_text("Worktree уже нет.")
             return
 
         if info.blockers and not forced:
             # Токен оставляем: он нужен кнопке подтверждения.
-            await query.message.edit_text(
+            await message.edit_text(
                 f"{_tree_text(info, None)}\n\n❌ Не удаляю: {_tree_state(info)}.",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(
@@ -594,13 +603,13 @@ async def main() -> None:
         try:
             await worktrees.remove(config.worktree_root, path.name, force=forced)
         except WorktreeError as exc:
-            await query.message.edit_text(
+            await message.edit_text(
                 f"❌ Не удалился.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
             )
             return
 
         note = " Сессия погашена." if session is not None else ""
-        await query.message.edit_text(
+        await message.edit_text(
             f"🗑 Worktree <b>{html.escape(path.name)}</b> удалён.{note}", parse_mode="HTML"
         )
 
@@ -608,20 +617,21 @@ async def main() -> None:
     async def on_stop(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        tmux_name = stop_pending.pop(query.data[5:], None)
+        tmux_name = stop_pending.pop((query.data or "").removeprefix("stop:"), None)
+        message = _live_message(query)
         if tmux_name is None:
             await query.answer("Список устарел")
-            if query.message is not None:
-                await query.message.edit_reply_markup(reply_markup=None)
+            if message is not None:
+                await message.edit_reply_markup(reply_markup=None)
             return
 
         killed = await kill_tmux(tmux_name)
         await query.answer("Погашена" if killed else "Уже не жива")
-        if query.message is None:
+        if message is None:
             return
         name = tmux_name.removeprefix(REMOTE_PREFIX)
         # Worktree намеренно остаётся: там может лежать несохранённая работа.
-        await query.message.edit_text(
+        await message.edit_text(
             f"⏹ Сессия <b>{html.escape(name)}</b> погашена."
             if killed
             else f"Сессия <b>{html.escape(name)}</b> уже не жива.",
@@ -635,31 +645,33 @@ async def main() -> None:
         # Без refresh: список должен совпадать с тем, по которому только что тапнули.
         paths = await discovery.paths()
         await query.answer()
-        if query.message is None:
+        message = _live_message(query)
+        if message is None:
             return
         try:
-            state.set_cwd(paths[int(query.data[5:])])
+            state.set_cwd(paths[int((query.data or "").removeprefix("jump:"))])
         except (ValueError, IndexError):
-            await query.message.answer("Список устарел, повтори /repos.")
+            await message.answer("Список устарел, повтори /repos.")
             return
         text, keyboard = _browse_card(state.cwd)
-        await query.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+        await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
     @dp.callback_query(F.data.startswith("nav:"))
     async def on_nav(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        action = query.data[4:]
+        action = (query.data or "").removeprefix("nav:")
         await query.answer()
-        if query.message is None:
+        message = _live_message(query)
+        if message is None:
             return
 
         if action == "here":
-            await start_session(query.message, state.cwd, None)
+            await start_session(message, state.cwd, None)
             return
 
         if action == "newwt":
-            await start_session(query.message, state.cwd, worktrees.generate_branch())
+            await start_session(message, state.cwd, worktrees.generate_branch())
             return
 
         if action == "up":
@@ -671,33 +683,34 @@ async def main() -> None:
             try:
                 state.set_cwd(children[int(action)])
             except (ValueError, IndexError):
-                await query.message.answer("Список устарел, повтори /pwd.")
+                await message.answer("Список устарел, повтори /pwd.")
                 return
 
         text, keyboard = _browse_card(state.cwd)
         try:
-            await query.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+            await message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
         except Exception:  # редактирование тем же текстом даёт ошибку — она не важна
-            await query.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+            await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
     @dp.callback_query(F.data.startswith(("trust:", "notrust:")))
     async def on_trust(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        verdict, _, token = query.data.partition(":")
+        verdict, _, token = (query.data or "").partition(":")
         waiting = trust_pending.pop(token, None)
         await query.answer()
-        if query.message is None:
+        message = _live_message(query)
+        if message is None:
             return
-        await query.message.edit_reply_markup(reply_markup=None)
+        await message.edit_reply_markup(reply_markup=None)
         if waiting is None:
-            await query.message.answer("Запрос устарел, повтори /rc.")
+            await message.answer("Запрос устарел, повтори /rc.")
             return
 
         tmux_name, cwd = waiting
         if verdict == "notrust":
             await kill_tmux(tmux_name)
-            await query.message.answer("Отменил, сессия погашена.")
+            await message.answer("Отменил, сессия погашена.")
             return
 
         await confirm_trust(tmux_name)
@@ -709,12 +722,12 @@ async def main() -> None:
             )
         except LaunchError as exc:
             log.warning("launch failed after trust for %s: %s", cwd, exc)
-            await query.message.answer(
+            await message.answer(
                 f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
             )
             return
 
-        await query.message.answer(
+        await message.answer(
             _fresh_text(session), parse_mode="HTML", reply_markup=_open_keyboard(session.url)
         )
 
@@ -722,16 +735,17 @@ async def main() -> None:
     async def on_pick(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        choice = pending.pop(query.data[3:], None)
+        choice = pending.pop((query.data or "").removeprefix("rc:"), None)
         await query.answer()
-        if query.message is None:
+        message = _live_message(query)
+        if message is None:
             return
-        await query.message.edit_reply_markup(reply_markup=None)
+        await message.edit_reply_markup(reply_markup=None)
         if choice is None:
-            await query.message.answer("Выбор устарел, повтори /rc.")
+            await message.answer("Выбор устарел, повтори /rc.")
             return
         target, branch = choice
-        await start_session(query.message, target, branch)
+        await start_session(message, target, branch)
 
     await dp.start_polling(bot)
 

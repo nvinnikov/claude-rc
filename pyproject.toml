@@ -1,5 +1,5 @@
 [project]
-name = "tg-claude"
+name = "claude-rc"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
@@ -10,15 +10,40 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+    "mypy>=1.14",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["clauderc", "tests"]
+# ruff format переписывает и python-блоки внутри markdown. В docs/ лежат планы и
+# спеки — записи о том, как код выглядел тогда; переформатировать их нельзя.
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+# pyflakes(F), pycodestyle(E/W), isort(I), bugbear(B), pyupgrade(UP), comprehensions(C4)
+select = ["E", "F", "W", "I", "B", "UP", "C4"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["clauderc", "tests"]
+
+# aiogram отдаёт свои типы, но обработчики регистрируются декораторами, которые
+# mypy видит как нетипизированные — на границе с фреймворком strict не помогает.
+[[tool.mypy.overrides]]
+module = "aiogram.*"
+ignore_missing_imports = true
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["tgclaude*"]
+include = ["clauderc*"]

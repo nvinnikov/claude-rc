@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-groups --frozen
+      - name: Format check
+        run: uv run ruff format --check .
+      - name: Lint
+        run: uv run ruff check .
+
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-groups --frozen
+      - name: mypy --strict
+        run: uv run mypy
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-groups --frozen
+      # Сквозной тест поднимает настоящую tmux-сессию. Без tmux он молча
+      # пропускается — а это ровно тот тест, ради которого CI и нужен.
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      # Тесты worktree создают временные репозитории и коммитят в них.
+      - name: Configure git
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+      - name: pytest
+        run: uv run pytest
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    # gitleaks-action перечисляет коммиты PR через API; дефолтному GITHUB_TOKEN
+    # этого скоупа не хватает, иначе 403 "Resource not accessible by integration".
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
