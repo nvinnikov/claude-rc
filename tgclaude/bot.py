@@ -14,19 +14,25 @@ from aiogram.types import (
     Message,
 )
 
+from tgclaude import worktrees
 from tgclaude.config import Config, load_config
 from tgclaude.remote import (
     LaunchError,
     RemoteSession,
-    get_session,
+    TrustRequired,
+    await_url,
+    confirm_trust,
+    find,
     kill_all,
     kill_session,
+    kill_tmux,
     launch,
     list_sessions,
     tmux_available,
 )
 from tgclaude.render import chunks
 from tgclaude.repos import discover, resolve
+from tgclaude.worktrees import WorktreeError
 
 log = logging.getLogger("tgclaude")
 
@@ -35,9 +41,12 @@ MAX_CHOICES = 8
 HELP = (
     "Поднимаю сессии Claude Code с Remote Control — дальше работа в приложении Claude.\n\n"
     "<b>/rc</b> &lt;репо&gt; — поднять сессию\n"
+    "<b>/rc</b> &lt;репо&gt; &lt;ветка&gt; — то же, но в отдельном worktree\n"
     "<b>/rc</b> — живые сессии\n"
     "<b>/repos</b> — доступные репозитории\n"
-    "<b>/rckill</b> &lt;имя&gt; — погасить сессию (без имени — все)\n\n"
+    "<b>/rckill</b> &lt;имя&gt; — погасить сессию (без имени — все)\n"
+    "<b>/wt</b> — созданные worktree\n"
+    "<b>/wtrm</b> &lt;имя&gt; — удалить worktree\n\n"
     "Сессии живут в tmux и переживают рестарт бота."
 )
 
@@ -128,27 +137,62 @@ async def main() -> None:
     discovery = Discovery(config)
     # Кандидаты для кнопок выбора при неоднозначном запросе. Токен короткий,
     # потому что в callback_data влезает 64 байта — полный путь туда не поместится.
-    pending: dict[str, Path] = {}
+    pending: dict[str, tuple[Path, str | None]] = {}
+    # Сессии, которые ждут ответа на диалог доверия каталогу.
+    trust_pending: dict[str, tuple[str, str]] = {}
 
-    async def start_session(message: Message, target: Path) -> None:
-        name = target.name
-        alive = await get_session(name)
+    async def start_session(message: Message, target: Path, branch: str | None) -> None:
+        head = f"⏳ Поднимаю сессию в <code>{html.escape(str(target))}</code>"
+        if branch:
+            head += f"\nветка <code>{html.escape(branch)}</code>"
+        notice = await message.answer(head + "…", parse_mode="HTML")
+
+        cwd = target
+        if branch:
+            try:
+                cwd = await worktrees.ensure(target, branch, config.worktree_root)
+            except WorktreeError as exc:
+                await notice.edit_text(
+                    f"❌ Worktree не создан.\n<pre>{html.escape(str(exc))}</pre>"[:3800],
+                    parse_mode="HTML",
+                )
+                return
+
+        alive = await find(str(cwd))
         if alive is not None:
-            await message.answer(
+            await notice.edit_text(
                 f"Уже поднята.\n{_list_item(alive)}",
                 parse_mode="HTML",
                 reply_markup=_open_keyboard(alive.url),
             )
             return
 
-        notice = await message.answer(
-            f"⏳ Поднимаю сессию в <code>{html.escape(str(target))}</code>…",
-            parse_mode="HTML",
-        )
         try:
-            session = await launch(name, str(target), timeout_s=config.launch_timeout_s)
+            session = await launch(cwd.name, str(cwd), timeout_s=config.launch_timeout_s)
+        except TrustRequired as need:
+            token = uuid.uuid4().hex[:8]
+            trust_pending[token] = (need.tmux_name, need.cwd)
+            await notice.edit_text(
+                "🔐 Claude впервые видит этот каталог и ждёт подтверждения.\n"
+                f"<code>{html.escape(need.cwd)}</code>\n\n"
+                "Он получит право читать, менять и запускать здесь файлы.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="Доверяю", callback_data=f"trust:{token}"
+                            ),
+                            InlineKeyboardButton(
+                                text="Отмена", callback_data=f"notrust:{token}"
+                            ),
+                        ]
+                    ]
+                ),
+            )
+            return
         except LaunchError as exc:
-            log.warning("launch failed for %s: %s", target, exc)
+            log.warning("launch failed for %s: %s", cwd, exc)
             await notice.edit_text(
                 f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800],
                 parse_mode="HTML",
@@ -180,7 +224,7 @@ async def main() -> None:
 
     @dp.message(Command("rc"))
     async def cmd_rc(message: Message) -> None:
-        parts = (message.text or "").split(maxsplit=1)
+        parts = (message.text or "").split()
         if len(parts) < 2:
             sessions = await list_sessions()
             if not sessions:
@@ -190,6 +234,7 @@ async def main() -> None:
             return
 
         query = parts[1]
+        branch = parts[2] if len(parts) > 2 else None
         matches = resolve(query, await discovery.paths())
         if not matches:
             await message.reply(
@@ -197,13 +242,13 @@ async def main() -> None:
             )
             return
         if len(matches) == 1:
-            await start_session(message, matches[0])
+            await start_session(message, matches[0], branch)
             return
 
         rows = []
         for path in matches[:MAX_CHOICES]:
             token = uuid.uuid4().hex[:8]
-            pending[token] = path
+            pending[token] = (path, branch)
             rows.append(
                 [
                     InlineKeyboardButton(
@@ -219,32 +264,133 @@ async def main() -> None:
 
     @dp.message(Command("rckill"))
     async def cmd_rckill(message: Message) -> None:
-        parts = (message.text or "").split(maxsplit=1)
+        parts = (message.text or "").split()
         if len(parts) < 2:
             killed = await kill_all()
             await message.reply(f"Погашено сессий: {killed}." if killed else "Гасить нечего.")
             return
-        name = parts[1].strip()
+        name = parts[1]
         if await kill_session(name):
+            # Worktree намеренно остаётся: в нём может лежать несохранённая работа.
             await message.reply(f"Сессия <b>{html.escape(name)}</b> погашена.", parse_mode="HTML")
         else:
             await message.reply(
                 f"Нет живой сессии <code>{html.escape(name)}</code>.", parse_mode="HTML"
             )
 
-    @dp.callback_query(F.data.startswith("rc:"))
-    async def on_pick(query: CallbackQuery) -> None:
+    @dp.message(Command("wt"))
+    async def cmd_wt(message: Message) -> None:
+        items = await worktrees.list_all(config.worktree_root)
+        if not items:
+            await message.reply(
+                "Worktree нет. <b>/rc</b> &lt;репо&gt; &lt;ветка&gt;", parse_mode="HTML"
+            )
+            return
+        lines = [
+            f"▸ <b>{html.escape(wt.name)}</b> · {'; '.join(wt.blockers) or 'чисто'}\n"
+            f"{html.escape(wt.repo)} · <code>{html.escape(wt.branch)}</code>"
+            for wt in items
+        ]
+        for part in chunks("\n\n".join(lines)):
+            await message.answer(part, parse_mode="HTML")
+
+    @dp.message(Command("wtrm"))
+    async def cmd_wtrm(message: Message) -> None:
+        parts = (message.text or "").split()
+        if len(parts) < 2:
+            await message.reply(
+                "Использование: <b>/wtrm</b> &lt;имя&gt; [force]. Список — /wt", parse_mode="HTML"
+            )
+            return
+
+        name = parts[1]
+        force = len(parts) > 2 and parts[2].lower() == "force"
+        path = config.worktree_root / name
+
+        info = await worktrees.inspect(path) if path.is_dir() else None
+        if info is None:
+            await message.reply(
+                f"Нет worktree <code>{html.escape(name)}</code>. Список — /wt", parse_mode="HTML"
+            )
+            return
+        if info.blockers and not force:
+            await message.reply(
+                f"❌ Не удаляю: {html.escape('; '.join(info.blockers))}.\n"
+                f"Если работа не нужна — <code>/wtrm {html.escape(name)} force</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        # Сессия держит этот каталог: не погасив её, оставим Claude в исчезнувшем cwd.
+        session = await find(str(path))
+        if session is not None:
+            await kill_session(session.name)
+
+        try:
+            await worktrees.remove(config.worktree_root, name, force=force)
+        except WorktreeError as exc:
+            await message.reply(
+                f"❌ Не удалился.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
+            )
+            return
+
+        note = " Сессия погашена." if session is not None else ""
+        await message.reply(
+            f"Worktree <b>{html.escape(name)}</b> удалён.{note}", parse_mode="HTML"
+        )
+
+    @dp.callback_query(F.data.startswith(("trust:", "notrust:")))
+    async def on_trust(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        target = pending.pop(query.data[3:], None)
+        verdict, _, token = query.data.partition(":")
+        waiting = trust_pending.pop(token, None)
         await query.answer()
         if query.message is None:
             return
         await query.message.edit_reply_markup(reply_markup=None)
-        if target is None:
+        if waiting is None:
+            await query.message.answer("Запрос устарел, повтори /rc.")
+            return
+
+        tmux_name, cwd = waiting
+        if verdict == "notrust":
+            await kill_tmux(tmux_name)
+            await query.message.answer("Отменил, сессия погашена.")
+            return
+
+        await confirm_trust(tmux_name)
+        try:
+            # watch_trust=False: диалог ещё мгновение висит на экране после Enter,
+            # и повторная проверка снова приняла бы его за неотвеченный.
+            session = await await_url(
+                tmux_name, cwd, timeout_s=config.launch_timeout_s, watch_trust=False
+            )
+        except LaunchError as exc:
+            log.warning("launch failed after trust for %s: %s", cwd, exc)
+            await query.message.answer(
+                f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
+            )
+            return
+
+        await query.message.answer(
+            _fresh_text(session), parse_mode="HTML", reply_markup=_open_keyboard(session.url)
+        )
+
+    @dp.callback_query(F.data.startswith("rc:"))
+    async def on_pick(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        choice = pending.pop(query.data[3:], None)
+        await query.answer()
+        if query.message is None:
+            return
+        await query.message.edit_reply_markup(reply_markup=None)
+        if choice is None:
             await query.message.answer("Выбор устарел, повтори /rc.")
             return
-        await start_session(query.message, target)
+        target, branch = choice
+        await start_session(query.message, target, branch)
 
     await dp.start_polling(bot)
 

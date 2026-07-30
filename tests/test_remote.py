@@ -19,7 +19,7 @@ def _stub(handler):
 
 
 def test_session_name_prefixes_and_sanitizes():
-    assert session_name("flybo-arch-v2") == "rc-flybo-arch-v2"
+    assert session_name("my-services-v2") == "rc-my-services-v2"
     # tmux не принимает `.` и `:` в имени сессии
     assert session_name("my.repo:1") == "rc-my-repo-1"
 
@@ -147,3 +147,79 @@ async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch):
         assert repo not in {s.name for s in await remote.list_sessions()}
     finally:
         await remote._run("kill-session", "-t", f"=rc-{repo}", check=False)
+
+
+async def test_find_matches_by_directory_not_name(monkeypatch):
+    """Два клона с одинаковым basename — сессия ищется по каталогу."""
+    rows = "\n".join(
+        [
+            "rc-claude-rules\t/a/claude-rules\t1700000000\thttps://claude.ai/code/session_A",
+            "rc-claude-rules-9f1c2d\t/b/claude-rules\t1700000001\thttps://claude.ai/code/session_B",
+        ]
+    )
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, rows)))
+
+    assert (await remote.find("/a/claude-rules")).url.endswith("session_A")
+    assert (await remote.find("/b/claude-rules")).url.endswith("session_B")
+    assert await remote.find("/c/claude-rules") is None
+
+
+async def test_launch_does_not_reuse_session_from_another_directory(monkeypatch):
+    """Раньше второй клон молча получал ссылку на сессию первого."""
+    created: list[tuple] = []
+
+    def handler(*args):
+        if args[0] == "list-sessions":
+            return 0, _ROW  # живая сессия rc-oms, но в /repos/oms
+        if args[0] == "new-session":
+            created.append(args)
+            return 0, ""
+        return 0, ""
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    monkeypatch.setattr(remote, "_POLL_S", 0.0)
+
+    with pytest.raises(LaunchError):  # ссылку так и не дождались, но сессию завели
+        await remote.launch("oms", "/other/oms", timeout_s=0.05)
+
+    assert created, "для другого каталога нужна новая сессия"
+    # имя занято сессией из /repos/oms → к базовому добавляется хвост от пути
+    name = created[0][created[0].index("-s") + 1]
+    assert name.startswith("rc-oms-") and name != "rc-oms"
+
+
+async def test_await_url_raises_trust_required_and_keeps_session(monkeypatch):
+    """Диалог доверия — не ошибка: сессия жива и ждёт ответа человека."""
+    calls: list[str] = []
+
+    def handler(*args):
+        calls.append(args[0])
+        if args[0] == "capture-pane":
+            return 0, "Quick safety check\n ❯ 1. Yes, I trust this folder\n   2. No, exit"
+        return 0, ""
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    monkeypatch.setattr(remote, "_POLL_S", 0.0)
+
+    with pytest.raises(remote.TrustRequired) as exc:
+        await remote.await_url("rc-oms", "/repos/oms", timeout_s=5.0)
+
+    assert exc.value.tmux_name == "rc-oms"
+    assert exc.value.cwd == "/repos/oms"
+    assert "kill-session" not in calls, "сессию гасить нельзя — она держит вопрос"
+
+
+async def test_await_url_ignores_trust_prompt_after_confirmation(monkeypatch):
+    """После Enter диалог ещё мгновение на экране — принимать его за новый нельзя."""
+    pane = (
+        "Quick safety check\n ❯ 1. Yes, I trust this folder\n"
+        "https://claude.ai/code/session_A\n"
+    )
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, pane if a[0] == "capture-pane" else _ROW)))
+    monkeypatch.setattr(remote, "_POLL_S", 0.0)
+
+    session = await remote.await_url(
+        "rc-oms", "/repos/oms", timeout_s=5.0, watch_trust=False
+    )
+
+    assert session.url.endswith("session_A")

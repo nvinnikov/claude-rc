@@ -5,11 +5,15 @@ bot_token = "123456:REPLACE_ME"
 allowed_user_id = 0
 
 # Где искать репозитории. Сами корни тоже валидные цели (рабочий зонт без .git).
-rc_roots = ["~/Documents/Flybo", "~/Documents"]
+rc_roots = ["~/code", "~/Documents"]
 
 # Глубина обхода от каждого корня. 3 нужны, чтобы достать
-# flybo-arch-v2/services/<сервис>.
+# <монорепо>/services/<сервис>.
 scan_depth = 3
+
+# Куда складывать git worktree'ы, создаваемые командой /rc <репо> <ветка>.
+# Каталог создаётся сам при первом worktree.
+worktree_root = "~/.tg-claude/worktrees"
 
 # Сколько секунд ждать, пока claude напечатает ссылку на сессию.
 launch_timeout_s = 90

@@ -19,6 +19,7 @@ def test_load_config_reads_all_fields(tmp_path: Path):
         'bot_token = "abc"\n'
         "allowed_user_id = 42\n"
         f'rc_roots = ["{code}"]\n'
+        f'worktree_root = "{tmp_path / "wt"}"\n'
         "scan_depth = 2\n"
         "launch_timeout_s = 30\n",
     )
@@ -27,9 +28,19 @@ def test_load_config_reads_all_fields(tmp_path: Path):
         bot_token="abc",
         allowed_user_id=42,
         rc_roots=(code,),
+        worktree_root=tmp_path / "wt",
         scan_depth=2,
         launch_timeout_s=30.0,
     )
+
+
+def test_worktree_root_defaults_and_need_not_exist(tmp_path: Path):
+    cfg = _write(
+        tmp_path, f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n'
+    )
+
+    # каталог создаётся при первом worktree, заранее его существования не требуем
+    assert load_config(cfg).worktree_root == Path("~/.tg-claude/worktrees").expanduser()
 
 
 def test_defaults_are_applied(tmp_path: Path):
