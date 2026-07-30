@@ -162,3 +162,27 @@ async def test_list_all_reports_created_worktrees(repo: Path, tmp_path: Path):
 
     assert {w.branch for w in items} == {"one", "two"}
     assert {w.name for w in items} == {"demo-one", "demo-two"}
+
+
+def test_generate_branch_has_sortable_timestamp():
+    import re
+
+    assert re.fullmatch(r"wt/\d{8}-\d{6}", worktrees.generate_branch(1700000000.0))
+
+
+def test_generate_branch_differs_by_second():
+    first = worktrees.generate_branch(1700000000.0)
+    second = worktrees.generate_branch(1700000001.0)
+
+    # два нажатия подряд не должны попасть в один worktree
+    assert first != second
+
+
+async def test_generated_branch_makes_usable_worktree(repo: Path, tmp_path: Path):
+    branch = worktrees.generate_branch(1700000000.0)
+
+    path = await worktrees.ensure(repo, branch, tmp_path / "wt")
+
+    info = await worktrees.inspect(path)
+    assert info is not None and info.branch == branch
+    assert path.name.startswith("demo-wt-")

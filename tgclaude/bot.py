@@ -11,7 +11,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 from tgclaude import browse, worktrees
@@ -45,7 +47,9 @@ HELP = (
     "<b>Дойти ногами</b>\n"
     "<b>/pwd</b> — где я сейчас, с кнопками по подкаталогам\n"
     "<b>/cd</b> &lt;путь&gt; — перейти (<code>..</code>, <code>~</code>, относительный, абсолютный)\n"
-    "Кнопка «Запустить здесь» поднимает сессию в текущем каталоге.\n\n"
+    "«▶️ Запустить здесь» — сессия в текущем каталоге.\n"
+    "«🌿 Новый worktree» — сессия в свежем worktree с веткой по времени, "
+    "чтобы работать параллельно с уже запущенной.\n\n"
     "<b>По имени</b>\n"
     "<b>/rc</b> &lt;репо&gt; — поднять сессию\n"
     "<b>/rc</b> &lt;репо&gt; &lt;ветка&gt; — то же, но в отдельном worktree\n"
@@ -56,6 +60,23 @@ HELP = (
     "<b>/wt</b> — созданные worktree\n"
     "<b>/wtrm</b> &lt;имя&gt; — удалить worktree\n\n"
     "Сессии живут в tmux и переживают рестарт бота."
+)
+
+# Постоянная клавиатура: команд немного, и на телефоне они должны быть под пальцем.
+BTN_PWD = "📁 Где я"
+BTN_SESSIONS = "📋 Сессии"
+BTN_REPOS = "📦 Репозитории"
+BTN_WT = "🌿 Worktree"
+BTN_HELP = "❓ Помощь"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_PWD), KeyboardButton(text=BTN_SESSIONS)],
+        [KeyboardButton(text=BTN_REPOS), KeyboardButton(text=BTN_WT)],
+        [KeyboardButton(text=BTN_HELP)],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
 )
 
 
@@ -140,7 +161,13 @@ def _browse_card(cwd: Path) -> tuple[str, InlineKeyboardMarkup]:
     if pair:
         rows.append(pair)
 
-    rows.append([InlineKeyboardButton(text="▶️ Запустить здесь", callback_data="nav:here")])
+    launch_row = [InlineKeyboardButton(text="▶️ Запустить здесь", callback_data="nav:here")]
+    # Вторая сессия в том же каталоге дралась бы за индекс и ветку — только через worktree.
+    if browse.is_repo(cwd):
+        launch_row.append(
+            InlineKeyboardButton(text="🌿 Новый worktree", callback_data="nav:newwt")
+        )
+    rows.append(launch_row)
 
     text = f"📁 <code>{html.escape(str(cwd))}</code>{mark}"
     if not children:
@@ -249,19 +276,32 @@ async def main() -> None:
             _fresh_text(session), parse_mode="HTML", reply_markup=_open_keyboard(session.url)
         )
 
+    async def show_sessions(message: Message) -> None:
+        sessions = await list_sessions()
+        if not sessions:
+            await message.reply("Живых сессий нет. <b>/rc</b> &lt;репо&gt;", parse_mode="HTML")
+            return
+        await message.reply("\n\n".join(_list_item(s) for s in sessions), parse_mode="HTML")
+
     @dp.message(lambda event: not _is_authorized(event.from_user, config.allowed_user_id))
     async def reject_strangers(message: Message) -> None:
         uid = message.from_user.id if message.from_user else None
         log.warning("dropped message from user_id=%s", uid)
 
     @dp.message(Command("start", "help"))
+    @dp.message(F.text == BTN_HELP)
     async def cmd_help(message: Message) -> None:
-        await message.reply(HELP, parse_mode="HTML")
+        await message.reply(HELP, parse_mode="HTML", reply_markup=MAIN_KEYBOARD)
 
     @dp.message(Command("pwd", "ls"))
+    @dp.message(F.text == BTN_PWD)
     async def cmd_pwd(message: Message) -> None:
         text, keyboard = _browse_card(state.cwd)
         await message.reply(text, parse_mode="HTML", reply_markup=keyboard)
+
+    @dp.message(F.text == BTN_SESSIONS)
+    async def cmd_sessions(message: Message) -> None:
+        await show_sessions(message)
 
     @dp.message(Command("cd"))
     async def cmd_cd(message: Message) -> None:
@@ -276,6 +316,7 @@ async def main() -> None:
         await message.reply(text, parse_mode="HTML", reply_markup=keyboard)
 
     @dp.message(Command("repos"))
+    @dp.message(F.text == BTN_REPOS)
     async def cmd_repos(message: Message) -> None:
         paths = await discovery.paths(refresh=True)
         if not paths:
@@ -289,11 +330,7 @@ async def main() -> None:
     async def cmd_rc(message: Message) -> None:
         parts = (message.text or "").split()
         if len(parts) < 2:
-            sessions = await list_sessions()
-            if not sessions:
-                await message.reply("Живых сессий нет. <b>/rc</b> &lt;репо&gt;", parse_mode="HTML")
-                return
-            await message.reply("\n\n".join(_list_item(s) for s in sessions), parse_mode="HTML")
+            await show_sessions(message)
             return
 
         query = parts[1]
@@ -342,6 +379,7 @@ async def main() -> None:
             )
 
     @dp.message(Command("wt"))
+    @dp.message(F.text == BTN_WT)
     async def cmd_wt(message: Message) -> None:
         items = await worktrees.list_all(config.worktree_root)
         if not items:
@@ -413,6 +451,10 @@ async def main() -> None:
 
         if action == "here":
             await start_session(query.message, state.cwd, None)
+            return
+
+        if action == "newwt":
+            await start_session(query.message, state.cwd, worktrees.generate_branch())
             return
 
         if action == "up":

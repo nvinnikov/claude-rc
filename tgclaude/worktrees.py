@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,6 +45,14 @@ class Worktree:
 
 def slug(text: str) -> str:
     return _SLUG.sub("-", text).strip("-").lower() or "wt"
+
+
+def generate_branch(now: float | None = None) -> str:
+    """Имя ветки, когда оно не важно — важна параллельная сессия.
+
+    Секунды в метке нужны, чтобы два нажатия подряд не пришли в один worktree.
+    """
+    return "wt/" + time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
 
 
 async def _git(cwd: Path, *args: str) -> tuple[int, str]:
