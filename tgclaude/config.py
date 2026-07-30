@@ -9,6 +9,7 @@ class Config:
     allowed_user_id: int
     rc_roots: tuple[Path, ...]
     worktree_root: Path
+    state_path: Path
     scan_depth: int
     launch_timeout_s: float
 
@@ -33,6 +34,7 @@ def load_config(path: Path) -> Config:
         rc_roots=roots,
         # Каталог создаётся при первом worktree, существования заранее не требуем.
         worktree_root=Path(raw.get("worktree_root", "~/.tg-claude/worktrees")).expanduser(),
+        state_path=Path(raw.get("state_path", "~/.tg-claude/state.json")).expanduser(),
         scan_depth=int(raw.get("scan_depth", 3)),
         launch_timeout_s=float(raw.get("launch_timeout_s", 90)),
     )

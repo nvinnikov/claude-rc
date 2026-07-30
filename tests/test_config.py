@@ -20,6 +20,7 @@ def test_load_config_reads_all_fields(tmp_path: Path):
         "allowed_user_id = 42\n"
         f'rc_roots = ["{code}"]\n'
         f'worktree_root = "{tmp_path / "wt"}"\n'
+        f'state_path = "{tmp_path / "state.json"}"\n'
         "scan_depth = 2\n"
         "launch_timeout_s = 30\n",
     )
@@ -29,6 +30,7 @@ def test_load_config_reads_all_fields(tmp_path: Path):
         allowed_user_id=42,
         rc_roots=(code,),
         worktree_root=tmp_path / "wt",
+        state_path=tmp_path / "state.json",
         scan_depth=2,
         launch_timeout_s=30.0,
     )

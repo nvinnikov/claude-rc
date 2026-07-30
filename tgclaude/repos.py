@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 # Каталоги, внутрь которых спускаться бессмысленно и дорого.
-_SKIP = {
+SKIP_DIRS = {
     "node_modules",
     "vendor",
     "target",
@@ -26,7 +26,7 @@ def _walk(root: Path, depth: int) -> Iterator[Path]:
     except OSError:
         return  # нет прав или каталог исчез — просто пропускаем
     for entry in entries:
-        if entry.name.startswith(".") or entry.name in _SKIP or not entry.is_dir():
+        if entry.name.startswith(".") or entry.name in SKIP_DIRS or not entry.is_dir():
             continue
         if (entry / ".git").exists():
             yield entry

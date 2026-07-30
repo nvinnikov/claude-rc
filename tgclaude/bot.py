@@ -14,7 +14,8 @@ from aiogram.types import (
     Message,
 )
 
-from tgclaude import worktrees
+from tgclaude import browse, worktrees
+from tgclaude.browse import BrowseError
 from tgclaude.config import Config, load_config
 from tgclaude.remote import (
     LaunchError,
@@ -32,6 +33,7 @@ from tgclaude.remote import (
 )
 from tgclaude.render import chunks
 from tgclaude.repos import discover, resolve
+from tgclaude.state import State
 from tgclaude.worktrees import WorktreeError
 
 log = logging.getLogger("tgclaude")
@@ -40,10 +42,16 @@ DISCOVERY_TTL_S = 60.0
 MAX_CHOICES = 8
 HELP = (
     "Поднимаю сессии Claude Code с Remote Control — дальше работа в приложении Claude.\n\n"
+    "<b>Дойти ногами</b>\n"
+    "<b>/pwd</b> — где я сейчас, с кнопками по подкаталогам\n"
+    "<b>/cd</b> &lt;путь&gt; — перейти (<code>..</code>, <code>~</code>, относительный, абсолютный)\n"
+    "Кнопка «Запустить здесь» поднимает сессию в текущем каталоге.\n\n"
+    "<b>По имени</b>\n"
     "<b>/rc</b> &lt;репо&gt; — поднять сессию\n"
     "<b>/rc</b> &lt;репо&gt; &lt;ветка&gt; — то же, но в отдельном worktree\n"
+    "<b>/repos</b> — доступные репозитории\n\n"
+    "<b>Хозяйство</b>\n"
     "<b>/rc</b> — живые сессии\n"
-    "<b>/repos</b> — доступные репозитории\n"
     "<b>/rckill</b> &lt;имя&gt; — погасить сессию (без имени — все)\n"
     "<b>/wt</b> — созданные worktree\n"
     "<b>/wtrm</b> &lt;имя&gt; — удалить worktree\n\n"
@@ -105,6 +113,43 @@ def _list_item(session: RemoteSession) -> str:
     )
 
 
+def _browse_card(cwd: Path) -> tuple[str, InlineKeyboardMarkup]:
+    """Карточка навигации: где мы и куда можно шагнуть одним тапом."""
+    mark = " · git-репозиторий" if browse.is_repo(cwd) else ""
+    try:
+        children, total = browse.entries(cwd)
+    except BrowseError as exc:
+        return f"📁 <code>{html.escape(str(cwd))}</code>\n❌ {html.escape(str(exc))}", (
+            InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬆️ ..", callback_data="nav:up")]]
+            )
+        )
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if cwd.parent != cwd:
+        rows.append([InlineKeyboardButton(text="⬆️ ..", callback_data="nav:up")])
+
+    # По две кнопки в ряд: на телефоне длинные имена иначе не читаются.
+    pair: list[InlineKeyboardButton] = []
+    for index, child in enumerate(children):
+        title = ("● " if browse.is_repo(child) else "") + child.name
+        pair.append(InlineKeyboardButton(text=title, callback_data=f"nav:{index}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+
+    rows.append([InlineKeyboardButton(text="▶️ Запустить здесь", callback_data="nav:here")])
+
+    text = f"📁 <code>{html.escape(str(cwd))}</code>{mark}"
+    if not children:
+        text += "\nПодкаталогов нет."
+    elif total > len(children):
+        text += f"\nПоказал {len(children)} из {total} — остальные через <b>/cd</b>."
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 class Discovery:
     """Кэш обхода файловой системы: скан на глубину 3 не бесплатный."""
 
@@ -135,6 +180,7 @@ async def main() -> None:
     bot = Bot(token=config.bot_token)
     dp = Dispatcher()
     discovery = Discovery(config)
+    state = State(config.state_path, config.rc_roots[0])
     # Кандидаты для кнопок выбора при неоднозначном запросе. Токен короткий,
     # потому что в callback_data влезает 64 байта — полный путь туда не поместится.
     pending: dict[str, tuple[Path, str | None]] = {}
@@ -211,6 +257,23 @@ async def main() -> None:
     @dp.message(Command("start", "help"))
     async def cmd_help(message: Message) -> None:
         await message.reply(HELP, parse_mode="HTML")
+
+    @dp.message(Command("pwd", "ls"))
+    async def cmd_pwd(message: Message) -> None:
+        text, keyboard = _browse_card(state.cwd)
+        await message.reply(text, parse_mode="HTML", reply_markup=keyboard)
+
+    @dp.message(Command("cd"))
+    async def cmd_cd(message: Message) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        target = parts[1] if len(parts) > 1 else ""
+        try:
+            state.set_cwd(browse.change_dir(state.cwd, target))
+        except BrowseError as exc:
+            await message.reply(f"❌ {html.escape(str(exc))}", parse_mode="HTML")
+            return
+        text, keyboard = _browse_card(state.cwd)
+        await message.reply(text, parse_mode="HTML", reply_markup=keyboard)
 
     @dp.message(Command("repos"))
     async def cmd_repos(message: Message) -> None:
@@ -338,6 +401,37 @@ async def main() -> None:
         await message.reply(
             f"Worktree <b>{html.escape(name)}</b> удалён.{note}", parse_mode="HTML"
         )
+
+    @dp.callback_query(F.data.startswith("nav:"))
+    async def on_nav(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        action = query.data[4:]
+        await query.answer()
+        if query.message is None:
+            return
+
+        if action == "here":
+            await start_session(query.message, state.cwd, None)
+            return
+
+        if action == "up":
+            state.set_cwd(state.cwd.parent)
+        else:
+            # Индекс, а не путь: в callback_data влезает 64 байта, а каталоги
+            # переоткрываются от текущего cwd, так что ссылаться на них дёшево.
+            children, _ = browse.entries(state.cwd)
+            try:
+                state.set_cwd(children[int(action)])
+            except (ValueError, IndexError):
+                await query.message.answer("Список устарел, повтори /pwd.")
+                return
+
+        text, keyboard = _browse_card(state.cwd)
+        try:
+            await query.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        except Exception:  # редактирование тем же текстом даёт ошибку — она не важна
+            await query.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
     @dp.callback_query(F.data.startswith(("trust:", "notrust:")))
     async def on_trust(query: CallbackQuery) -> None:

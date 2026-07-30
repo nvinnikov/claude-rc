@@ -15,5 +15,8 @@ scan_depth = 3
 # Каталог создаётся сам при первом worktree.
 worktree_root = "~/.tg-claude/worktrees"
 
+# Где помнить текущий каталог навигации (/cd) между перезапусками бота.
+state_path = "~/.tg-claude/state.json"
+
 # Сколько секунд ждать, пока claude напечатает ссылку на сессию.
 launch_timeout_s = 90
