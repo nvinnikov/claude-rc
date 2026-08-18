@@ -17,6 +17,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var loginItemError: String?
     private var signalSources: [DispatchSourceSignal] = []
 
+    /// Без супервизора (CLI не нашли или это второй экземпляр) `menuNeedsUpdate`
+    /// перерисовывает меню на каждое открытие — не только один раз в `applicationDidFinishLaunching`.
+    /// Раньше в этом случае она всегда рисовала жёстко зашитое «CLI not found»,
+    /// затирая настоящую причину («уже запущен другой экземпляр») уже на первом
+    /// открытии меню. Причина решается один раз при старте и живёт здесь.
+    private var stalledReason = "CLI not found"
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         installSignalHandlers()
         Log.app(
@@ -34,7 +41,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // через `open`) не должен поднимать второго поллера — см. SingleInstance.
         guard !SingleInstance.check() else {
             Log.app("launch: другой экземпляр (bundle \(Bundle.main.bundleIdentifier ?? "?")) уже запущен, бот не поднимаем")
-            render(.crashed(reason: "уже запущен другой экземпляр приложения"))
+            stalledReason = "уже запущен другой экземпляр приложения"
+            render(.crashed(reason: stalledReason))
             return
         }
 
@@ -137,7 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Пока меню закрыто, обновлять нечего — поэтому пересборка здесь, а не по таймеру.
     func menuNeedsUpdate(_ menu: NSMenu) {
-        render(supervisor?.state ?? .crashed(reason: "CLI not found"))
+        render(supervisor?.state ?? .crashed(reason: stalledReason))
         configRow.isEnabled = cli != nil
         loginRow.state = LoginItem.isEnabled ? .on : .off
         renderLoginNote()

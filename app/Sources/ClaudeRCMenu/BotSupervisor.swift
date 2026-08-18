@@ -34,6 +34,11 @@ enum TakeOverDecision: Equatable {
     /// На месте запомненного pid теперь другой процесс — это не тот, кого мы
     /// собирались забрать; гасить его нельзя, только показать актуальный pid.
     case updateForeign(pid: Int32)
+    /// pid ≤ 0: `kill` в этом случае ушёл бы не одному процессу, а целой группе.
+    /// Через `pgrep` недостижимо (он не отдаёт 0 или отрицательные pid), но раз
+    /// решение теперь разбирается тестом, а не только глазами в `takeOver()` —
+    /// разбор обязан включать и этот случай.
+    case refuseInvalidPID(pid: Int32)
 }
 
 /// Чистая логика решения takeOver — вынесена отдельно, чтобы её можно было
@@ -42,8 +47,9 @@ enum TakeOverDecision: Equatable {
 /// свежий результат `foreignBotPID()`.
 func takeOverDecision(remembered pid: Int32, current: Int32?) -> TakeOverDecision {
     guard let current else { return .startDirectly }
-    if current == pid { return .killThenStart(pid: pid) }
-    return .updateForeign(pid: current)
+    guard current == pid else { return .updateForeign(pid: current) }
+    guard pid > 0 else { return .refuseInvalidPID(pid: pid) }
+    return .killThenStart(pid: pid)
 }
 
 /// Паузы перед перезапуском упавшего бота. `nil` — больше не пытаемся.
@@ -285,18 +291,13 @@ final class BotSupervisor {
         let current = BotSupervisor.foreignBotPID()
         switch takeOverDecision(remembered: pid, current: current) {
         case .killThenStart(let pid):
-            // `pid > 0`: недостижимо через pgrep (он не отдаёт 0 или отрицательные
-            // pid), но это `kill`, и при 0 сигнал ушёл бы всей группе процессов —
-            // защита в одну строку тут уместна.
-            guard pid > 0 else {
-                Log.app("takeOver: pid \(pid) <= 0, сигнал не шлём")
-                state = .stopped
-                return
-            }
             Log.app("takeOver: SIGTERM чужому pid \(pid)")
             kill(pid, SIGTERM)
             state = .starting
             waitForForeignExit(pid: pid, attempt: 0)
+        case .refuseInvalidPID(let pid):
+            Log.app("takeOver: pid \(pid) <= 0, сигнал не шлём")
+            state = .stopped
         case .updateForeign(let newPID):
             Log.app("takeOver: запомненный pid \(pid) больше не тот процесс (сейчас \(newPID)), сигнал не шлём")
             state = .foreignBotRunning(pid: newPID)
@@ -310,7 +311,19 @@ final class BotSupervisor {
     /// SIGTERM не убивает мгновенно — если запустить своего бота раньше, чем чужой
     /// правда исчез, получим двух поллеров одного токена. `kill(pid, 0)` сигнала не
     /// шлёт, только проверяет, жив ли pid (ESRCH — нет).
+    ///
+    /// Стоп в начале, а не только в конце: `stop()` во время ожидания ставит
+    /// `stopRequested` и `state = .stopped`, но сам таймер об этом не знал — он
+    /// либо звал `start()` по факту смерти чужого (тот сам сбрасывает
+    /// `stopRequested`, и клик «Стоп» проигрывал), либо через 3 с перетирал
+    /// состояние обратно на `.foreignBotRunning`. Проверка нужна на каждом шаге
+    /// рекурсии, а не только при входе, — `stop()` могли нажать в любой момент
+    /// ожидания.
     private func waitForForeignExit(pid: Int32, attempt: Int) {
+        guard !stopRequested else {
+            state = .stopped
+            return
+        }
         guard kill(pid, 0) == 0 else {
             start()
             return
