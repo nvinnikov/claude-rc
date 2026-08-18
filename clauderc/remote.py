@@ -188,8 +188,23 @@ async def kill_all() -> int:
     return killed
 
 
-async def launch(repo: str, cwd: str, *, timeout_s: float = 90.0) -> RemoteSession:
-    """Поднимает RC-сессию в `cwd` и ждёт, пока claude напечатает ссылку."""
+def _resume_flag(resume: str | None) -> str:
+    """Хвост командной строки для резюма диалога."""
+    if resume is None:
+        return ""
+    if resume == "last":
+        return " --continue"
+    return f" --resume {shlex.quote(resume)}"
+
+
+async def launch(
+    repo: str, cwd: str, *, timeout_s: float = 90.0, resume: str | None = None
+) -> RemoteSession:
+    """Поднимает RC-сессию в `cwd` и ждёт, пока claude напечатает ссылку.
+
+    `resume` продолжает прежний диалог (`"last"` — последний, id — конкретный);
+    проверка на уже живую сессию в `cwd` его не отменяет — сессия одна на каталог.
+    """
     if not tmux_available():
         raise LaunchError("tmux не найден в PATH — поставь через `brew install tmux`")
 
@@ -198,7 +213,11 @@ async def launch(repo: str, cwd: str, *, timeout_s: float = 90.0) -> RemoteSessi
         return existing
 
     name = await _unique_name(repo, cwd)
-    command = _SCRUB_ENV + f"exec {shlex.quote(CLAUDE_BIN)} --remote-control {shlex.quote(repo)}"
+    command = (
+        _SCRUB_ENV
+        + f"exec {shlex.quote(CLAUDE_BIN)} --remote-control {shlex.quote(repo)}"
+        + _resume_flag(resume)
+    )
     await _run("new-session", "-d", "-s", name, "-x", _COLS, "-y", _ROWS, "-c", cwd, command)
     return await await_url(name, cwd, timeout_s=timeout_s)
 

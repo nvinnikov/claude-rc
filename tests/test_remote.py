@@ -235,3 +235,94 @@ async def test_await_url_ignores_trust_prompt_after_confirmation(
     session = await remote.await_url("rc-oms", "/repos/oms", timeout_s=5.0, watch_trust=False)
 
     assert session.url.endswith("session_A")
+
+
+_FRESH = "rc-repo\t/repos/repo\t1700000000\thttps://claude.ai/code/session_A"
+
+
+def _capture_new_session(commands: list[str]) -> Handler:
+    """Заглушка tmux: до new-session сессий нет, после — есть.
+
+    Порядок важен: launch первым делом зовёт find(cwd), и заглушка, отдающая
+    готовую сессию сразу, вернула бы её вместо запуска — new-session не случился бы.
+    """
+
+    def handler(*args: str) -> tuple[int, str]:
+        if args[0] == "new-session":
+            commands.append(args[-1])
+            return 0, ""
+        if args[0] == "capture-pane":
+            return 0, "https://claude.ai/code/session_A"
+        if args[0] == "list-sessions":
+            return (0, _FRESH) if commands else (0, "")
+        return 0, ""
+
+    return handler
+
+
+def _fast(monkeypatch: pytest.MonkeyPatch, commands: list[str]) -> None:
+    """Заглушка tmux плюс нулевая пауза опроса: четыре теста иначе спят три секунды."""
+    monkeypatch.setattr(remote, "_run", _stub(_capture_new_session(commands)))
+    monkeypatch.setattr(remote, "tmux_available", lambda: True)
+    monkeypatch.setattr(remote, "_POLL_S", 0)
+
+
+async def test_launch_without_resume_has_no_extra_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[str] = []
+    _fast(monkeypatch, commands)
+
+    await remote.launch("repo", "/repos/repo", timeout_s=5)
+
+    assert "--resume" not in commands[0]
+    assert "--continue" not in commands[0]
+
+
+async def test_launch_with_last_uses_continue(monkeypatch: pytest.MonkeyPatch) -> None:
+    commands: list[str] = []
+    _fast(monkeypatch, commands)
+
+    await remote.launch("repo", "/repos/repo", timeout_s=5, resume="last")
+
+    assert commands[0].endswith("--continue")
+
+
+async def test_launch_with_id_uses_resume(monkeypatch: pytest.MonkeyPatch) -> None:
+    commands: list[str] = []
+    _fast(monkeypatch, commands)
+
+    await remote.launch("repo", "/repos/repo", timeout_s=5, resume="abc-123")
+
+    assert commands[0].endswith("--resume abc-123")
+
+
+async def test_launch_quotes_resume_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    # id приходит из имени файла на диске — в командную строку без кавычек нельзя.
+    commands: list[str] = []
+    _fast(monkeypatch, commands)
+
+    await remote.launch("repo", "/repos/repo", timeout_s=5, resume="a b; rm -rf /")
+
+    assert "'a b; rm -rf /'" in commands[0]
+
+
+async def test_launch_with_resume_returns_existing_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Инвариант «один каталог — одна сессия» резюм не отменяет.
+    started: list[str] = []
+
+    def handler(*args: str) -> tuple[int, str]:
+        if args[0] == "new-session":
+            started.append(args[-1])
+            return 0, ""
+        return 0, _ROW
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    monkeypatch.setattr(remote, "tmux_available", lambda: True)
+
+    session = await remote.launch("oms", "/repos/oms", timeout_s=5, resume="last")
+
+    assert session.tmux_name == "rc-oms"
+    assert started == []
