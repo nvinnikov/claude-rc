@@ -24,8 +24,15 @@
 
 ```bash
 FW="$(xcode-select -p)/Library/Developer/Frameworks"
-swift test --package-path app -Xswiftc -F"$FW" -Xlinker -F"$FW" -Xlinker -rpath -Xlinker "$FW"
+swift test --package-path app \
+  -Xswiftc -F"$FW" -Xlinker -F"$FW" -Xlinker -rpath -Xlinker "$FW" \
+  -Xswiftc -Xfrontend -Xswiftc -disable-cross-import-overlays
 ```
+
+  Последний флаг обязателен, если тест импортирует и `Foundation`, и `Testing`:
+  это включает cross-import overlay `_Testing_Foundation`, а в Command Line Tools
+  он идёт без `.swiftmodule`. Наши тесты трогают `URL` и `FileManager`, так что
+  флаг нужен везде.
 
   Проверено живьём: с этими флагами набор проходит. Примеры тестов ниже по плану записаны в синтаксисе XCTest — **переводи их механически**, состав случаев и их смысл не меняя:
 
@@ -116,7 +123,7 @@ cat > ClaudeRCSpike.app/Contents/Info.plist <<'PLIST'
     <key>CFBundleName</key><string>ClaudeRCSpike</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.0.1</string>
-    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
 </dict>
 </plist>
@@ -193,7 +200,7 @@ import PackageDescription
 
 let package = Package(
     name: "ClaudeRCMenu",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(name: "ClaudeRCMenu"),
         .testTarget(name: "ClaudeRCMenuTests", dependencies: ["ClaudeRCMenu"]),
@@ -1047,7 +1054,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
-    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
 </dict>
 </plist>
@@ -1068,7 +1075,9 @@ app:
 app-test:
 	@FW="$$(xcode-select -p)/Library/Developer/Frameworks"; \
 	if [ -d "$$FW" ]; then \
-		swift test --package-path app -Xswiftc -F"$$FW" -Xlinker -F"$$FW" -Xlinker -rpath -Xlinker "$$FW"; \
+		swift test --package-path app \
+			-Xswiftc -F"$$FW" -Xlinker -F"$$FW" -Xlinker -rpath -Xlinker "$$FW" \
+			-Xswiftc -Xfrontend -Xswiftc -disable-cross-import-overlays; \
 	else \
 		swift test --package-path app; \
 	fi
