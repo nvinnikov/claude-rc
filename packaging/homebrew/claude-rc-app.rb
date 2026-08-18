@@ -8,15 +8,26 @@ cask "claude-rc-app" do
   homepage "https://github.com/nvinnikov/claude-rc"
 
   # Приложение без тулзы бессмысленно: оно только запускает `claude-rc bot`.
-  depends_on formula: "claude-rc"
+  # Полный путь тапа — иначе зависимость резолвится только потому, что тап
+  # уже подключён у того, кто ставит cask руками, а не сама по себе.
+  depends_on formula: "nvinnikov/tap/claude-rc"
   depends_on macos: ">= :sonoma"
 
   app "ClaudeRC.app"
 
-  # `~/.config/claude-rc/config.toml` сюда намеренно не входит: там боевой
-  # токен бота, и удалять его при удалении приложения нельзя.
+  # Без этого `brew uninstall --cask` удалит бандл из-под живого процесса:
+  # приложение останется в памяти, а бот внутри него продолжит поллить
+  # Telegram, хотя человек считает, что его удалил.
+  uninstall quit: "com.nvinnikov.claude-rc-app"
+
+  # `~/.claude-rc` целиком сюда не входит: там `worktree_root` и `state_path`
+  # (см. config.example.toml) — рабочие каталоги, которые бот заводит под
+  # git worktree, и в них может быть незакоммиченная работа человека. `zap`
+  # чистит только то, что приложение оставляет само: лог и LaunchAgent.
+  # `~/.config/claude-rc/config.toml` тоже не входит — там боевой токен бота,
+  # и удалять его при удалении приложения нельзя.
   zap trash: [
-    "~/.claude-rc",
+    "~/.claude-rc/claude-rc.log",
     "~/Library/LaunchAgents/com.nvinnikov.claude-rc-app.plist",
   ]
 end

@@ -5,7 +5,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   verify:
@@ -65,6 +65,14 @@ jobs:
       # после распаковки перестаёт проверяться.
       - name: Zip bundle
         run: ditto -c -k --keepParent app/build/ClaudeRC.app ClaudeRC.app.zip
+      # Проверяем само утверждение из комментария выше, а не полагаемся на
+      # него: распаковываем во временный каталог и валидируем подпись так же,
+      # как это сделает Gatekeeper после xattr -dr на машине пользователя.
+      - name: Verify signature survives the zip round-trip
+        run: |
+          rm -rf /tmp/verify-bundle && mkdir /tmp/verify-bundle
+          ditto -x -k ClaudeRC.app.zip /tmp/verify-bundle
+          codesign --verify --deep --strict /tmp/verify-bundle/ClaudeRC.app
       - uses: actions/upload-artifact@v4
         with:
           name: app-bundle
@@ -74,6 +82,10 @@ jobs:
     name: Publish release
     needs: [package, bundle]
     runs-on: ubuntu-latest
+    # Write-токен нужен только здесь, чтобы создать релиз. verify/package/bundle
+    # гоняют сторонние действия и всю сборку — им запись не нужна.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -83,7 +95,7 @@ jobs:
         run: |
           echo "Скопируй в формулу и cask:"
           find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print0 \
-            | xargs -0 shasum -a 256
+            | xargs -0 --no-run-if-empty shasum -a 256
       - uses: softprops/action-gh-release@v2
         with:
           files: |
