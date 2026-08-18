@@ -50,10 +50,15 @@ app-test:
 install-tool:
 	uv tool install --force .
 
+# Шаблон заякорён так же, как в BotSupervisor.swift (foreignBotPID): голое
+# 'ClaudeRCMenu' ловит любой процесс, чья командная строка просто содержит
+# это слово — на этом классе дефекта уже теряли время. `/ClaudeRCMenu$`
+# требует, чтобы командная строка заканчивалась ровно на имя исполняемого
+# файла бандла, а не на произвольный текст с этой подстрокой.
 install-app: install-tool app
-	@if pgrep -f 'ClaudeRCMenu' >/dev/null; then \
+	@if pgrep -f '/ClaudeRCMenu$$' >/dev/null; then \
 		echo "Гашу запущенное приложение: иначе cp положит файлы под работающим процессом."; \
-		pkill -f 'ClaudeRCMenu'; sleep 2; \
+		pkill -f '/ClaudeRCMenu$$'; sleep 2; \
 	fi
 	rm -rf /Applications/ClaudeRC.app
 	cp -R app/build/ClaudeRC.app /Applications/ClaudeRC.app
