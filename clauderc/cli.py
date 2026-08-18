@@ -10,8 +10,8 @@ import argparse
 import asyncio
 import json
 import os
-import shutil as shutil  # тесты подменяют cli.shutil.which — реэкспорт для mypy --strict
-import sys
+import shutil as shutil  # тесты подменяют cli.shutil/cli.sys.stdin — реэкспорт для mypy --strict
+import sys as sys
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
@@ -128,7 +128,7 @@ class _Commands:
             return EXIT_FAILED
         except _TrustDeclined as exc:
             print(str(exc), file=sys.stderr)
-            return EXIT_ENVIRONMENT
+            return exc.exit_code
         print(f"{session.name}\t{session.cwd}\n{session.url}")
         return 0
 
@@ -159,7 +159,11 @@ class _Commands:
 
 
 class _TrustDeclined(RuntimeError):
-    """Каталог требует подтверждения доверия, а подтвердить некому."""
+    """Каталог требует подтверждения доверия, а подтвердить некому или отказались."""
+
+    def __init__(self, message: str, *, exit_code: int) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
 
 
 def _as_dict(session: RemoteSession) -> dict[str, Any]:
@@ -186,14 +190,17 @@ async def _start(target: Path, branch: str | None, resume: str | None) -> Remote
 async def _ask_trust(need: TrustRequired) -> RemoteSession:
     """Диалог доверия каталогу. За терминалом человек — его «да» и есть решение."""
     if not sys.stdin.isatty():
+        # Нечем спросить — это «не с чем работать», EXIT_ENVIRONMENT.
         raise _TrustDeclined(
             f"Каталог {need.cwd} ждёт подтверждения доверия, а stdin не терминал.\n"
-            f"Подтверди в панели: tmux attach -t {need.tmux_name}"
+            f"Подтверди в панели: tmux attach -t {need.tmux_name}",
+            exit_code=EXIT_ENVIRONMENT,
         )
     answer = input(f"Claude впервые видит {need.cwd}. Доверяешь каталогу? [y/N] ")
     if answer.strip().lower() not in {"y", "yes", "д", "да"}:
         await kill_tmux(need.tmux_name)
-        raise _TrustDeclined("Отменено, сессия погашена.")
+        # Спросили и получили «нет» — это «попробовали, не вышло», EXIT_FAILED.
+        raise _TrustDeclined("Отменено, сессия погашена.", exit_code=EXIT_FAILED)
     await confirm_trust(need.tmux_name)
     # watch_trust=False: диалог ещё мгновение висит на экране и был бы принят
     # за неотвеченный (та же причина, что в боте).

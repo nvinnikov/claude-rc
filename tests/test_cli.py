@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 from clauderc import cli
-from clauderc.remote import LaunchError, RemoteSession
+from clauderc.remote import LaunchError, RemoteSession, TrustRequired
 
 
 def _session(name: str = "oms") -> RemoteSession:
@@ -15,6 +15,16 @@ def _session(name: str = "oms") -> RemoteSession:
         url="https://claude.ai/code/session_A",
         created_at=0,
     )
+
+
+class _FakeStdin:
+    """Подменяет только `isatty()` — `_ask_trust` больше у stdin ничего не спрашивает."""
+
+    def __init__(self, is_tty: bool) -> None:
+        self._is_tty = is_tty
+
+    def isatty(self) -> bool:
+        return self._is_tty
 
 
 def test_no_command_prints_usage_and_fails() -> None:
@@ -113,6 +123,81 @@ def test_start_rejects_empty_resume(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert capsys.readouterr().err.strip()
 
 
+def test_start_trust_without_tty_fails_without_confirming(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Без tty спросить некого — автоподтверждение доверия каталогу запрещено.
+    confirmed: list[str] = []
+
+    async def fake_launch(repo: str, cwd: str, **kwargs: Any) -> RemoteSession:
+        raise TrustRequired("rc-oms", cwd)
+
+    async def fake_confirm(tmux_name: str) -> None:
+        confirmed.append(tmux_name)
+
+    monkeypatch.setattr(cli, "launch", fake_launch)
+    monkeypatch.setattr(cli, "confirm_trust", fake_confirm)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(is_tty=False))
+
+    assert cli.main(["start", str(tmp_path)]) == 2
+    assert "tmux attach -t rc-oms" in capsys.readouterr().err
+    assert confirmed == []
+
+
+def test_start_trust_declined_kills_session_without_confirming(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    confirmed: list[str] = []
+    killed: list[str] = []
+
+    async def fake_launch(repo: str, cwd: str, **kwargs: Any) -> RemoteSession:
+        raise TrustRequired("rc-oms", cwd)
+
+    async def fake_confirm(tmux_name: str) -> None:
+        confirmed.append(tmux_name)
+
+    async def fake_kill(tmux_name: str) -> bool:
+        killed.append(tmux_name)
+        return True
+
+    monkeypatch.setattr(cli, "launch", fake_launch)
+    monkeypatch.setattr(cli, "confirm_trust", fake_confirm)
+    monkeypatch.setattr(cli, "kill_tmux", fake_kill)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(is_tty=True))
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+
+    assert cli.main(["start", str(tmp_path)]) == 1
+    assert killed == ["rc-oms"]
+    assert confirmed == []
+    assert capsys.readouterr().err.strip()
+
+
+def test_start_trust_confirmed_prints_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    confirmed: list[str] = []
+
+    async def fake_launch(repo: str, cwd: str, **kwargs: Any) -> RemoteSession:
+        raise TrustRequired("rc-oms", cwd)
+
+    async def fake_confirm(tmux_name: str) -> None:
+        confirmed.append(tmux_name)
+
+    async def fake_await_url(name: str, cwd: str, **kwargs: Any) -> RemoteSession:
+        assert kwargs["watch_trust"] is False
+        return _session()
+
+    monkeypatch.setattr(cli, "launch", fake_launch)
+    monkeypatch.setattr(cli, "confirm_trust", fake_confirm)
+    monkeypatch.setattr(cli, "await_url", fake_await_url)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(is_tty=True))
+    monkeypatch.setattr("builtins.input", lambda prompt: "y")
+
+    assert cli.main(["start", str(tmp_path)]) == 0
+    assert confirmed == ["rc-oms"]
+    assert "https://claude.ai/code/session_A" in capsys.readouterr().out
+
+
 def test_stop_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
     killed: list[str] = []
 
@@ -208,6 +293,22 @@ def test_doctor_never_prints_the_token(
     monkeypatch.setattr(cli.paths, "config_file", lambda: config)
 
     cli.main(["doctor", "--json"])
+    captured = capsys.readouterr()
+    assert "SECRET_VALUE" not in captured.out
+    assert "SECRET_VALUE" not in captured.err
+
+
+def test_doctor_never_prints_the_token_on_broken_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Токен выше по файлу, синтаксическая ошибка ниже — `except` печатает `str(exc)`,
+    # и это не должно ронять его в сообщение об ошибке.
+    config = tmp_path / "config.toml"
+    config.write_text('bot_token = "123456:SECRET_VALUE"\nallowed_user_id = 1\nbroken = [\n')
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli.paths, "config_file", lambda: config)
+
+    assert cli.main(["doctor", "--json"]) == 2
     captured = capsys.readouterr()
     assert "SECRET_VALUE" not in captured.out
     assert "SECRET_VALUE" not in captured.err
