@@ -23,6 +23,9 @@ make test        # pytest
 make run         # запустить бота вручную
 make app         # собрать app/build/ClaudeRC.app (Swift, без Xcode)
 make app-test    # тесты Swift-пакета в app/
+make install       # тулзу + приложение одной командой — основной способ поставить себе
+make install-tool  # только тулзу claude-rc, без приложения (например, машина без графики)
+make install-app   # то же, что install: install-tool + сборка и установка приложения
 
 uv run pytest tests/test_remote.py::test_launch_stores_url_in_tmux_option  # один тест
 

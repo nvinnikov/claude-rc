@@ -144,6 +144,17 @@ remote; перебить отказ можно явным `/wtrm <имя> force`
 
 ## Установка
 
+Три способа, по возрастанию расстояния от исходников:
+
+- **из клона репозитория** — `make install` (см. ниже);
+- **из релиза на GitHub** — скачать `ClaudeRC.app.zip` и пакет со
+  [страницы релизов](https://github.com/nvinnikov/claude-rc/releases), см. раздел
+  «Релиз» ниже про снятие карантина;
+- **через Homebrew** — `brew install nvinnikov/tap/claude-rc-app` поставит и
+  тулзу, и приложение. Формула и cask лежат в `packaging/homebrew/`, но
+  репозиторий `nvinnikov/homebrew-tap` пока не создан — этот способ ещё не
+  заработает, пока его не завести руками (см. `packaging/homebrew/README.md`).
+
 `make install` ставит всё одной командой: тулзу `claude-rc` в `~/.local/bin` (через
 `uv tool install`) и `ClaudeRC.app` в `/Applications`. Приложение перед копированием
 гасится, если уже запущено, — иначе `cp` кладёт файлы под работающим процессом и
