@@ -72,6 +72,28 @@ async def test_expected_death_is_silent(monkeypatch: pytest.MonkeyPatch) -> None
     assert killed == ["rc-a"]
 
 
+async def test_failed_kill_does_not_swallow_real_death(monkeypatch: pytest.MonkeyPatch) -> None:
+    # kill_tmux вернул False — сессия жива, метка не должна пережить её и проглотить
+    # настоящее падение позже.
+    async def fake_kill(tmux_name: str) -> bool:
+        return False
+
+    monkeypatch.setattr(watch, "kill_tmux", fake_kill)
+    _sessions(monkeypatch, [_session("a", "/repos/a")], [_session("a", "/repos/a")], [])
+
+    watcher = Watcher()
+    seen: list[Died] = []
+
+    async def on_died(died: Died) -> None:
+        seen.append(died)
+
+    await watcher.poll(on_died)  # базовый снимок
+    assert await watcher.kill("rc-a") is False
+    await watcher.poll(on_died)  # гашение не удалось, сессия ещё жива
+    await watcher.poll(on_died)  # исчезла по-настоящему
+    assert seen == [Died(name="a", tmux_name="rc-a", cwd="/repos/a")]
+
+
 async def test_mark_does_not_leak_to_next_session(monkeypatch: pytest.MonkeyPatch) -> None:
     # Одноразовость метки: сессия с тем же именем, упавшая позже, должна попасть в отчёт.
     async def fake_kill(tmux_name: str) -> bool:

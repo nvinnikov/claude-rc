@@ -43,7 +43,12 @@ class Watcher:
 
     async def kill(self, tmux_name: str) -> bool:
         self._expected.add(tmux_name)
-        return await kill_tmux(tmux_name)
+        killed = await kill_tmux(tmux_name)
+        if not killed:
+            # Гашение не удалось — сессия жива, а метка на живой сессии переживёт
+            # её и проглотит настоящее падение. Одноразовость важнее лишней карточки.
+            self._expected.discard(tmux_name)
+        return killed
 
     async def kill_named(self, repo: str) -> bool:
         return await self.kill(session_name(repo))
