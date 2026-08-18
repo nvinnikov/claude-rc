@@ -203,6 +203,8 @@ final class BotSupervisor {
         }
         // Один handle на оба потока: два независимых FileHandle на один файл делят
         // смещение так, что stdout и stderr затирают друг друга при чередовании записей.
+        // Сам handle открыт через Log.openAppending с O_APPEND — см. его комментарий:
+        // без этого флага и записи приложения (Log.app) в тот же файл затирались бы.
         task.standardOutput = handle
         task.standardError = handle
 
@@ -310,8 +312,6 @@ final class BotSupervisor {
         }
         try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logURL.path)
 
-        let handle = try FileHandle(forWritingTo: logURL)
-        try handle.seekToEnd()
-        return handle
+        return try Log.openAppending(at: logURL)
     }
 }
