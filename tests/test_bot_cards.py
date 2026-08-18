@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 
 from clauderc import bot as bot_module
-from clauderc.bot import _died_text, _resume_keyboard
+from clauderc.bot import ResumeChoice, _died_text, _pop_resume_group, _resume_keyboard
 from clauderc.watch import Died
 
 # Гашение обязано идти через Watcher — иначе намеренно погашенная сессия
@@ -42,6 +42,31 @@ def test_died_text_escapes_html() -> None:
     text = _died_text(Died(name="a&b", tmux_name="rc-a-b", cwd="/repos/<x>"))
     assert "&amp;" in text
     assert "<x>" not in text
+
+
+def test_pop_resume_group_clears_sibling_tokens() -> None:
+    # Два быстрых тапа по разным кнопкам одной карточки не должны поднять две
+    # сессии: выбор одного варианта гасит соседние токены той же карточки.
+    choice_a: ResumeChoice = (Path("/repos/oms"), None, None)
+    choice_b: ResumeChoice = (Path("/repos/oms"), None, "last")
+    pending: dict[str, tuple[str, ResumeChoice]] = {
+        "t0": ("g1", choice_a),
+        "t1": ("g1", choice_b),
+        "t2": ("g2", (Path("/repos/geo"), None, None)),
+    }
+
+    picked = _pop_resume_group(pending, "t0")
+
+    assert picked == choice_a
+    assert "t1" not in pending, "сосед по карточке должен исчезнуть"
+    assert "t2" in pending, "токен другой карточки трогать нельзя"
+
+
+def test_pop_resume_group_unknown_token_returns_none() -> None:
+    pending: dict[str, tuple[str, ResumeChoice]] = {"t0": ("g1", (Path("/repos/oms"), None, None))}
+
+    assert _pop_resume_group(pending, "stale") is None
+    assert "t0" in pending, "неизвестный токен не должен трогать чужую карточку"
 
 
 def test_no_direct_kill_calls_bypass_watcher() -> None:

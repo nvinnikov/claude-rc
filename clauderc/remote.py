@@ -51,8 +51,10 @@ _SCRUB_ENV = 'for v in $(env | grep ^CLAUDE_CODE_ | cut -d= -f1); do unset "$v";
 class LaunchError(RuntimeError):
     """Сессию не удалось поднять или tmux ответил ошибкой.
 
-    `tmux_name` заполняется, если сессия при этом была погашена: вызывающему
-    нужно имя, чтобы пометить смерть ожидаемой и не отчитаться о ней как о падении.
+    `tmux_name` заполняется, если о смерти сессии уже можно судить по этому вызову —
+    watcher её видел живой и должен считать смерть ожидаемой, а не отчитываться о ней
+    как о падении второй раз. Не только для гашения по таймауту: то же верно, если
+    сессия завершилась сама или исчезла между capture-pane и list-sessions.
     """
 
     def __init__(self, message: str, *, tmux_name: str | None = None) -> None:
@@ -245,7 +247,7 @@ async def await_url(
         await asyncio.sleep(_POLL_S)
         code, pane = await _run("capture-pane", "-p", "-J", "-t", f"={name}:", check=False)
         if code != 0:
-            raise LaunchError(_failure("сессия завершилась, не отдав ссылку", pane))
+            raise LaunchError(_failure("сессия завершилась, не отдав ссылку", pane), tmux_name=name)
         match = _URL.search(pane)
         if match is None:
             if watch_trust and _TRUST_PROMPT.search(pane):
@@ -256,7 +258,7 @@ async def await_url(
         await _run("set-option", "-t", f"={name}:", _URL_OPTION, url, check=False)
         session = await find(cwd)
         if session is None:  # успела умереть между capture и list
-            raise LaunchError(_failure("сессия исчезла сразу после запуска", pane))
+            raise LaunchError(_failure("сессия исчезла сразу после запуска", pane), tmux_name=name)
         log.info("rc session %s up: %s", name, url)
         return session
 

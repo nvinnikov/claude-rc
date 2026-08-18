@@ -123,10 +123,10 @@ async def test_mark_does_not_leak_to_next_session(monkeypatch: pytest.MonkeyPatc
 
 
 async def test_kill_all_marks_everything(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_kill_all() -> int:
-        return 2
+    async def fake_kill(tmux_name: str) -> bool:
+        return True
 
-    monkeypatch.setattr(watch, "kill_all", fake_kill_all)
+    monkeypatch.setattr(watch, "kill_tmux", fake_kill)
     _sessions(
         monkeypatch,
         [_session("a"), _session("b")],  # базовый
@@ -144,6 +144,34 @@ async def test_kill_all_marks_everything(monkeypatch: pytest.MonkeyPatch) -> Non
     assert await watcher.kill_all() == 2
     await watcher.poll(on_died)
     assert seen == []
+
+
+async def test_kill_all_reports_session_that_did_not_die(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # kill_all делит работу на kill() по одной сессии — неудача одной не должна
+    # погасить метку на другой и не должна помешать репорту о настоящем падении.
+    async def fake_kill(tmux_name: str) -> bool:
+        return tmux_name != "rc-b"
+
+    monkeypatch.setattr(watch, "kill_tmux", fake_kill)
+    _sessions(
+        monkeypatch,
+        [_session("a"), _session("b")],  # базовый
+        [_session("a"), _session("b")],  # снимок внутри kill_all
+        [],  # b не погасилась, но исчезла сама следующим опросом
+    )
+
+    watcher = Watcher()
+    seen: list[Died] = []
+
+    async def on_died(died: Died) -> None:
+        seen.append(died)
+
+    await watcher.poll(on_died)
+    assert await watcher.kill_all() == 1
+    await watcher.poll(on_died)
+    assert [d.tmux_name for d in seen] == ["rc-b"]
 
 
 async def test_kill_named_translates_repo_name(monkeypatch: pytest.MonkeyPatch) -> None:

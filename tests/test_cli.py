@@ -230,6 +230,25 @@ def test_stop_by_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert killed == ["rc-oms"]
 
 
+def test_stop_kill_failure_is_not_reported_as_not_found(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Сессия нашлась, но tmux не смог её погасить — сообщение не должно вводить
+    # в заблуждение, будто цели вообще не было.
+    async def fake_list() -> list[RemoteSession]:
+        return [_session()]
+
+    async def fake_kill(tmux_name: str) -> bool:
+        return False
+
+    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(cli, "kill_tmux", fake_kill)
+    assert cli.main(["stop", "oms"]) == 1
+    err = capsys.readouterr().err
+    assert "не найдена" not in err
+    assert "oms" in err
+
+
 def test_stop_unknown_target_fails(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

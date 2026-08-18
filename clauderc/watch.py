@@ -15,7 +15,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from clauderc.remote import RemoteSession, kill_all, kill_tmux, list_sessions, session_name
+from clauderc.remote import RemoteSession, kill_tmux, list_sessions, session_name
 
 log = logging.getLogger("clauderc.watch")
 
@@ -58,9 +58,10 @@ class Watcher:
         return await self.kill(session_name(repo))
 
     async def kill_all(self) -> int:
+        killed = 0
         for session in await list_sessions():
-            self._expected.add(session.tmux_name)
-        return await kill_all()
+            killed += await self.kill(session.tmux_name)
+        return killed
 
     async def poll(self, on_died: OnDied) -> None:
         current = {s.tmux_name: s for s in await list_sessions()}

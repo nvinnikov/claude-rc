@@ -140,7 +140,11 @@ class _Commands:
         if not args.target:
             print("Укажи имя сессии, каталог или --all.", file=sys.stderr)
             return EXIT_ENVIRONMENT
-        killed = asyncio.run(_stop(args.target))
+        try:
+            killed = asyncio.run(_stop(args.target))
+        except _StopFailed as exc:
+            print(f"Нашёл, но не погасил: {exc}", file=sys.stderr)
+            return EXIT_FAILED
         if killed is None:
             print(f"Сессия не найдена: {args.target}", file=sys.stderr)
             return EXIT_FAILED
@@ -164,6 +168,10 @@ class _TrustDeclined(RuntimeError):
     def __init__(self, message: str, *, exit_code: int) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
+
+class _StopFailed(RuntimeError):
+    """Сессия нашлась, но tmux не смог её погасить — не путать с «не найдена»."""
 
 
 def _as_dict(session: RemoteSession) -> dict[str, Any]:
@@ -216,8 +224,9 @@ async def _stop(target: str) -> str | None:
     wanted = os.path.realpath(Path(target).expanduser())
     for session in await list_sessions():
         if session.name == target or os.path.realpath(session.cwd) == wanted:
-            if await kill_tmux(session.tmux_name):
-                return session.name
+            if not await kill_tmux(session.tmux_name):
+                raise _StopFailed(session.name)
+            return session.name
     return None
 
 

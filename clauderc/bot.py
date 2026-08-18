@@ -119,6 +119,27 @@ def _resume_keyboard(items: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     )
 
 
+ResumeChoice = tuple[Path, str | None, str | None]
+
+
+def _pop_resume_group(
+    pending: dict[str, tuple[str, ResumeChoice]], token: str
+) -> ResumeChoice | None:
+    """Достаёт выбранный вариант и гасит остальные токены той же карточки.
+
+    Варианты одной карточки независимы только с виду: выбор любого из них должен
+    сделать соседние недействительными, иначе два быстрых тапа по разным кнопкам
+    поднимут две RC-сессии в одном каталоге.
+    """
+    entry = pending.pop(token, None)
+    if entry is None:
+        return None
+    group, choice = entry
+    for other in [key for key, (other_group, _) in pending.items() if other_group == group]:
+        pending.pop(other, None)
+    return choice
+
+
 def _died_text(died: Died) -> str:
     return (
         f"⚠️ Сессия <b>{html.escape(died.name)}</b> завершилась\n"
@@ -289,7 +310,9 @@ async def main() -> None:
     trust_pending: dict[str, tuple[str, str]] = {}
     stop_pending: dict[str, str] = {}
     tree_pending: dict[str, Path] = {}
-    resume_pending: dict[str, tuple[Path, str | None, str | None]] = {}
+    # Значение — (id карточки, выбор): выбор любого варианта гасит остальные
+    # токены той же карточки, чтобы два тапа не подняли две сессии в одном каталоге.
+    resume_pending: dict[str, tuple[str, ResumeChoice]] = {}
 
     async def start_session(
         message: Message, target: Path, branch: str | None, resume: str | None = None
@@ -344,7 +367,8 @@ async def main() -> None:
         except LaunchError as exc:
             log.warning("launch failed for %s: %s", cwd, exc)
             if exc.tmux_name:
-                # await_url сам погасил сессию по таймауту — без метки watcher
+                # await_url уже видел сессию мёртвой (таймаут, упала сама
+                # или исчезла между capture и list) — без метки watcher
                 # опросил бы её как упавшую следом за этим же сообщением.
                 watcher.expect_death(exc.tmux_name)
             await notice.edit_text(
@@ -372,14 +396,15 @@ async def main() -> None:
             await start_session(message, target, None)
             return
 
+        group = uuid.uuid4().hex[:8]
         items: list[tuple[str, str]] = []
         for label, resume in [("New session", None), ("Continue last", "last")]:
             token = uuid.uuid4().hex[:8]
-            resume_pending[token] = (target, None, resume)
+            resume_pending[token] = (group, (target, None, resume))
             items.append((token, label))
         for conversation in found:
             token = uuid.uuid4().hex[:8]
-            resume_pending[token] = (target, None, conversation.session_id)
+            resume_pending[token] = (group, (target, None, conversation.session_id))
             items.append((token, conversation.preview))
 
         await message.answer(
@@ -778,7 +803,8 @@ async def main() -> None:
         except LaunchError as exc:
             log.warning("launch failed after trust for %s: %s", cwd, exc)
             if exc.tmux_name:
-                # await_url сам погасил сессию по таймауту — без метки watcher
+                # await_url уже видел сессию мёртвой (таймаут, упала сама
+                # или исчезла между capture и list) — без метки watcher
                 # опросил бы её как упавшую следом за этим же сообщением.
                 watcher.expect_death(exc.tmux_name)
             await message.answer(
@@ -810,15 +836,15 @@ async def main() -> None:
     async def on_resume(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        choice = resume_pending.pop((query.data or "").removeprefix("res:"), None)
+        choice = _pop_resume_group(resume_pending, (query.data or "").removeprefix("res:"))
         await query.answer()
         message = _live_message(query)
         if message is None:
             return
-        await message.edit_reply_markup(reply_markup=None)
         if choice is None:
             await message.answer("Выбор устарел, повтори запуск.")
             return
+        await message.edit_reply_markup(reply_markup=None)
         target, branch, resume = choice
         await start_session(message, target, branch, resume)
 
@@ -828,7 +854,7 @@ async def main() -> None:
         # оставшиеся падения того же опроса тогда пропадут без следа.
         try:
             token = uuid.uuid4().hex[:8]
-            resume_pending[token] = (Path(died.cwd), None, "last")
+            resume_pending[token] = (token, (Path(died.cwd), None, "last"))
             await bot.send_message(
                 config.allowed_user_id,
                 _died_text(died),

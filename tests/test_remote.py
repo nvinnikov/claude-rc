@@ -131,6 +131,20 @@ async def test_launch_reports_dead_session(monkeypatch: pytest.MonkeyPatch) -> N
         await remote.launch("oms", "/repos/oms", timeout_s=1.0)
 
 
+async def test_await_url_fills_tmux_name_when_session_ended_on_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Сессия уже мертва в этой ветке (capture-pane её не нашёл), watcher её видел —
+    # tmux_name должен доехать до вызывающего, иначе о смерти доложат дважды.
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (1, "can't find pane")))
+    monkeypatch.setattr(remote, "_POLL_S", 0.0)
+
+    with pytest.raises(LaunchError) as exc:
+        await remote.await_url("rc-oms", "/repos/oms", timeout_s=1.0)
+
+    assert exc.value.tmux_name == "rc-oms"
+
+
 @pytest.mark.skipif(not remote.tmux_available(), reason="нет tmux")
 async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Сквозная проверка: настоящий tmux, вместо claude — заглушка с tty."""
