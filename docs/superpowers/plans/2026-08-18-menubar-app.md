@@ -20,6 +20,26 @@
 - Комментарии только там, где решение неочевидно.
 - Коммиты атомарные, Conventional Commits; в теле — **почему**, а не что.
 - Изменение поведения сопровождается тестом там, где предмет тестируем. GUI и настоящий `Process` не тестируем — они проверяются по чек-листу.
+- **Тесты пишем на swift-testing, а не на XCTest.** `XCTest.framework` поставляется только вместе с Xcode.app, а на машине его нет — проверено поиском по диску. `Testing.framework` в Command Line Tools есть, но SPM не знает про его каталог, поэтому тесты гоняются так:
+
+```bash
+FW="$(xcode-select -p)/Library/Developer/Frameworks"
+swift test --package-path app -Xswiftc -F"$FW" -Xlinker -F"$FW" -Xlinker -rpath -Xlinker "$FW"
+```
+
+  Проверено живьём: с этими флагами набор проходит. Примеры тестов ниже по плану записаны в синтаксисе XCTest — **переводи их механически**, состав случаев и их смысл не меняя:
+
+| XCTest | swift-testing |
+|---|---|
+| `import XCTest` + `final class X: XCTestCase` | `import Testing` + `struct X` (или свободные функции) |
+| `func testFoo()` | `@Test func foo()` |
+| `XCTAssertEqual(a, b)` | `#expect(a == b)` |
+| `XCTAssertNil(a)` | `#expect(a == nil)` |
+| `XCTAssertTrue(a)` / `XCTAssertFalse(a)` | `#expect(a)` / `#expect(!(a))` |
+| `setUpWithError` / `tearDownWithError` | `init() throws` / `deinit`, либо создание и уборка внутри самого теста |
+| `throws`-тест | `@Test func foo() throws` |
+
+  Уборку временных каталогов делай внутри теста через `defer` — это надёжнее, чем полагаться на `deinit` у структуры.
 - Бота из-под тестов не запускать: у токена может быть живой поллер, второй получит от Telegram конфликт.
 
 ---
@@ -293,7 +313,7 @@ final class CLILocatorTests: XCTestCase {
 
 - [ ] **Step 3: Убедиться, что тесты падают**
 
-Run: `cd app && swift test 2>&1 | tail -20`
+Run: `make app-test 2>&1 | tail -20` (цель появится в задаче 4; до неё гоняй командой с флагами из Global Constraints)
 Expected: ошибка компиляции — `cannot find 'CLILocator' in scope`
 
 - [ ] **Step 4: Написать `CLILocator`**
@@ -354,7 +374,7 @@ enum CLILocator {
 
 - [ ] **Step 5: Проверить, что тесты проходят**
 
-Run: `cd app && swift test 2>&1 | tail -10`
+Run: командой из Global Constraints
 Expected: 9 тестов зелёные
 
 - [ ] **Step 6: Коммит**
@@ -479,7 +499,7 @@ final class DoctorTests: XCTestCase {
 
 - [ ] **Step 3: Убедиться, что тесты падают**
 
-Run: `cd app && swift test 2>&1 | tail -20`
+Run: `make app-test 2>&1 | tail -20` (цель появится в задаче 4; до неё гоняй командой с флагами из Global Constraints)
 Expected: `cannot find 'backoffDelay' in scope`, `cannot find 'Doctor' in scope`
 
 - [ ] **Step 4: Написать `Doctor`**
@@ -669,7 +689,7 @@ final class BotSupervisor {
 
 - [ ] **Step 6: Проверить, что тесты проходят**
 
-Run: `cd app && swift test 2>&1 | tail -10`
+Run: командой из Global Constraints
 Expected: все тесты зелёные (9 из задачи 1 плюс 9 новых)
 
 - [ ] **Step 7: Коммит**
@@ -960,7 +980,7 @@ app.run()
 
 - [ ] **Step 4: Убедиться, что собирается и тесты не сломались**
 
-Run: `cd app && swift build 2>&1 | tail -10 && swift test 2>&1 | tail -5`
+Run: `swift build --package-path app`, затем тесты командой из Global Constraints
 Expected: сборка без ошибок, все тесты зелёные
 
 - [ ] **Step 5: Коммит**
@@ -1043,8 +1063,15 @@ echo "$APP"
 app:
 	./app/make-app.sh
 
+# Testing.framework живёт в каталоге Command Line Tools, про который SPM не знает.
+# Флаги добавляются, только если каталог есть, — на машине с полным Xcode он не нужен.
 app-test:
-	swift test --package-path app
+	@FW="$$(xcode-select -p)/Library/Developer/Frameworks"; \
+	if [ -d "$$FW" ]; then \
+		swift test --package-path app -Xswiftc -F"$$FW" -Xlinker -F"$$FW" -Xlinker -rpath -Xlinker "$$FW"; \
+	else \
+		swift test --package-path app; \
+	fi
 ```
 
 Добавь `app` и `app-test` в список `.PHONY`.
