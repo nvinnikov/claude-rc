@@ -51,4 +51,19 @@ import Testing
         """.data(using: .utf8)!
         #expect(Doctor.parse(json).count == 1)
     }
+
+    @Test func missingDetailDoesNotDropWholeEnvelope() {
+        // Одна проверка без detail не должна ронять декодирование всего конверта:
+        // раньше это молча превращало parse() в пустой список.
+        let json = """
+        {"checks": [
+          {"name": "tmux", "ok": true},
+          {"name": "config", "ok": false, "detail": "нет файла"}
+        ]}
+        """.data(using: .utf8)!
+
+        let checks = Doctor.parse(json)
+        #expect(checks.count == 2)
+        #expect(checks[0].detail == "")
+    }
 }

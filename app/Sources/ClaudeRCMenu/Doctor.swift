@@ -9,6 +9,17 @@ enum Doctor {
         let name: String
         let ok: Bool
         let detail: String
+
+        private enum CodingKeys: String, CodingKey { case name, ok, detail }
+
+        // detail отсутствует в JSON — не повод ронять декодирование всего конверта:
+        // без этого одна неполная проверка молча стирала все остальные из parse().
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            name = try container.decode(String.self, forKey: .name)
+            ok = try container.decode(Bool.self, forKey: .ok)
+            detail = try container.decodeIfPresent(String.self, forKey: .detail) ?? ""
+        }
     }
 
     private struct Envelope: Decodable {
