@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "ClaudeRCMenu",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(name: "ClaudeRCMenu"),
         .testTarget(name: "ClaudeRCMenuTests", dependencies: ["ClaudeRCMenu"]),
