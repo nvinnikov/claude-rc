@@ -107,23 +107,58 @@ final class BotSupervisor {
         let output = String(
             data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
         ) ?? ""
-        // "-l" даёт "pid имя_команды" — достаточно, чтобы при отказе запуска было видно,
-        // что именно приняли за чужого бота, не поднимая на это отдельный процесс.
+        // На macOS "-l" в связке с "-f" — это не «имя процесса», а ПОЛНАЯ командная
+        // строка (см. `man pgrep`: "If used in conjunction with -f, print the process
+        // ID and the full argument list"). Раньше это шло прямиком в лог — а командная
+        // строка произвольного процесса может содержать токен или пароль (`TOKEN=xxx
+        // ./script`), и `ps`/`pgrep` покажут его целиком. Поэтому из вывода pgrep
+        // берём только pid; безопасную для лога диагностику собирает
+        // `diagnosticLine(forPID:)` отдельным запросом к `ps`.
         let match = output
             .split(separator: "\n")
-            .compactMap { line -> (pid: Int32, line: Substring)? in
+            .compactMap { line -> Int32? in
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
-                guard let firstSpace = trimmed.firstIndex(of: " "),
-                    let pid = Int32(trimmed[trimmed.startIndex..<firstSpace])
-                else { return nil }
-                return (pid, line)
+                let firstToken = trimmed.split(separator: " ", maxSplits: 1).first ?? trimmed[...]
+                return Int32(firstToken)
             }
-            .first { $0.pid != ProcessInfo.processInfo.processIdentifier }
+            .first { $0 != ProcessInfo.processInfo.processIdentifier }
 
         if let match {
-            Log.app("foreignBotPID: matched \(match.line.trimmingCharacters(in: .whitespaces))")
+            Log.app("foreignBotPID: matched \(diagnosticLine(forPID: match))")
         }
-        return match?.pid
+        return match
+    }
+
+    /// Безопасная для лога диагностика о процессе: pid, ppid и **только имя**
+    /// исполняемого файла (`ps -o comm=` на macOS отдаёт полный путь — берём его
+    /// последний компонент). Аргументов командной строки здесь намеренно нет: они
+    /// могут содержать секреты (см. комментарий в `foreignBotPID`), а pid/ppid/имя
+    /// уже достаточно, чтобы при ложном срабатывании понять, что за процесс приняли
+    /// за бота, — не поднимая читаемость лога до "виден любой чужой пароль".
+    private static func diagnosticLine(forPID pid: Int32) -> String {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-o", "pid=,ppid=,comm=", "-p", String(pid)]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+
+        let exited = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in exited.signal() }
+        guard (try? task.run()) != nil else { return "pid \(pid)" }
+
+        guard exited.wait(timeout: .now() + 2) == .success else {
+            task.terminate()
+            return "pid \(pid) (ps не ответил за 2с)"
+        }
+
+        let output = String(
+            data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
+        )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let fields = output.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+        guard fields.count == 3, let ppid = Int32(fields[1]) else { return "pid \(pid)" }
+        let name = URL(fileURLWithPath: String(fields[2])).lastPathComponent
+        return "pid \(pid) ppid \(ppid) comm \(name)"
     }
 
     func start() {
@@ -202,14 +237,31 @@ final class BotSupervisor {
     }
 
     /// Дозапись, а не перезапись: причина падения не должна теряться при перезапуске.
+    ///
+    /// Права ужимаем явно (0700 на каталог, 0600 на файл): в логе — операционные
+    /// данные бота и, с недавних пор, диагностика о чужих процессах машины
+    /// (`foreignBotPID`); ни то ни другое не должно читаться любым локальным
+    /// пользователем, а `FileManager.createFile`/`createDirectory` без `attributes`
+    /// берут маску по умолчанию (обычно 644/755). `createDirectory` не трогает права
+    /// уже существующего каталога, а файл лог мог создать и `Log.swift` — с теми же
+    /// правами по умолчанию, — поэтому права ужимаем безусловно, а не только при
+    /// первом создании.
     private func appendingHandle() throws -> FileHandle {
         let manager = FileManager.default
+        let directory = logURL.deletingLastPathComponent()
         try manager.createDirectory(
-            at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true
+            at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
         )
+        try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+
         if !manager.fileExists(atPath: logURL.path) {
-            manager.createFile(atPath: logURL.path, contents: nil)
+            manager.createFile(
+                atPath: logURL.path, contents: nil, attributes: [.posixPermissions: 0o600]
+            )
         }
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logURL.path)
+
         let handle = try FileHandle(forWritingTo: logURL)
         try handle.seekToEnd()
         return handle
