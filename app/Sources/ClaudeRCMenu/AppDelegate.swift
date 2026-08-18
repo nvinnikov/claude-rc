@@ -10,7 +10,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let statusRow = NSMenuItem(title: "Bot: stopped", action: nil, keyEquivalent: "")
     private let toggleRow = NSMenuItem(title: "Start bot", action: nil, keyEquivalent: "")
+    private let configRow = NSMenuItem(title: "Reveal config", action: nil, keyEquivalent: "")
     private let loginRow = NSMenuItem(title: "Launch at login", action: nil, keyEquivalent: "")
+    private let loginNoteRow = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private var loginItemError: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -59,15 +62,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         log.target = self
         menu.addItem(log)
 
-        let config = NSMenuItem(title: "Reveal config", action: #selector(revealConfig), keyEquivalent: "")
-        config.target = self
-        menu.addItem(config)
+        configRow.action = #selector(revealConfig)
+        configRow.target = self
+        menu.addItem(configRow)
 
         menu.addItem(.separator())
 
         loginRow.action = #selector(toggleLoginItem)
         loginRow.target = self
         menu.addItem(loginRow)
+
+        loginNoteRow.isEnabled = false
+        loginNoteRow.isHidden = true
+        menu.addItem(loginNoteRow)
 
         let quit = NSMenuItem(
             title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"
@@ -79,7 +86,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Пока меню закрыто, обновлять нечего — поэтому пересборка здесь, а не по таймеру.
     func menuNeedsUpdate(_ menu: NSMenu) {
         render(supervisor?.state ?? .crashed(reason: "CLI not found"))
+        configRow.isEnabled = cli != nil
         loginRow.state = LoginItem.isEnabled ? .on : .off
+        renderLoginNote()
+    }
+
+    /// Показывает причину, по которой галочка не значит «автозапуск точно работает»:
+    /// либо явная ошибка запасного пути, либо ожидание подтверждения человеком.
+    private func renderLoginNote() {
+        if let loginItemError {
+            loginNoteRow.title = "⚠ \(loginItemError)"
+            loginNoteRow.isHidden = false
+        } else if LoginItem.needsApproval {
+            loginNoteRow.title = "⚠ Confirm in System Settings → Login Items"
+            loginNoteRow.isHidden = false
+        } else {
+            loginNoteRow.isHidden = true
+        }
     }
 
     private func render(_ state: BotState) {
@@ -138,6 +161,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func revealConfig() {
         guard let cli else { return }
+        guard let output = runDoctorJSON(cli: cli) else {
+            revealConfigFallback()
+            return
+        }
+
+        let checks = Doctor.parse(output)
+        if let path = Doctor.configPath(in: checks) {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        } else {
+            revealConfigFallback()
+        }
+    }
+
+    /// `doctor --json` под таймаутом на главном потоке: то же соображение, что и у
+    /// `pgrep` в `BotSupervisor` — зависший внешний вызов не должен вешать меню-бар
+    /// целиком. `nil` — не дождались ответа, дальше действуем как при пустом выводе.
+    private func runDoctorJSON(cli: URL) -> Data? {
         let task = Process()
         task.executableURL = cli
         task.arguments = ["doctor", "--json"]
@@ -145,27 +185,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         task.standardOutput = pipe
         task.standardError = Pipe()
         task.environment = CLILocator.childEnvironment(base: ProcessInfo.processInfo.environment)
-        guard (try? task.run()) != nil else { return }
-        task.waitUntilExit()
 
-        let checks = Doctor.parse(pipe.fileHandleForReading.readDataToEndOfFile())
-        if let path = Doctor.configPath(in: checks) {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-        } else {
-            // Конфига ещё нет — показываем каталог, куда его класть.
-            let directory = URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent(".config/claude-rc")
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            NSWorkspace.shared.open(directory)
+        let exited = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in exited.signal() }
+        guard (try? task.run()) != nil else { return nil }
+
+        guard exited.wait(timeout: .now() + 5) == .success else {
+            task.terminate()
+            FileHandle.standardError.write(
+                Data("claude-rc: doctor --json не ответил за 5с, показываем каталог по умолчанию\n".utf8)
+            )
+            return nil
         }
+        return pipe.fileHandleForReading.readDataToEndOfFile()
+    }
+
+    /// Конфига ещё нет (или `doctor` не ответил вовремя) — показываем каталог, куда его класть.
+    private func revealConfigFallback() {
+        let directory = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".config/claude-rc")
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(directory)
     }
 
     @objc private func toggleLoginItem() {
         if LoginItem.isEnabled {
             LoginItem.disable()
+            loginItemError = nil
         } else {
-            try? LoginItem.enable()
+            do {
+                try LoginItem.enable()
+                loginItemError = nil
+            } catch {
+                // Запасной путь (LaunchAgent) не смог включиться — молчать нельзя:
+                // человек видит невключившуюся галочку без единой причины.
+                loginItemError = error.localizedDescription
+                FileHandle.standardError.write(
+                    Data("claude-rc: не удалось включить автозапуск: \(error.localizedDescription)\n".utf8)
+                )
+            }
         }
         loginRow.state = LoginItem.isEnabled ? .on : .off
+        renderLoginNote()
     }
 }
