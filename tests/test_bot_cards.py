@@ -1,5 +1,15 @@
+import re
+from pathlib import Path
+
+from clauderc import bot as bot_module
 from clauderc.bot import _died_text, _resume_keyboard
 from clauderc.watch import Died
+
+# Гашение обязано идти через Watcher — иначе намеренно погашенная сессия
+# попадает в отчёт как упавшая (см. CLAUDE.md, «Точки гашения»). Ловим прямой
+# вызов remote.kill_* мимо `watcher.`, чтобы регрессия не держалась на ручном
+# грепе при следующей правке bot.py.
+_DIRECT_KILL = re.compile(r"(?<!watcher\.)\b(?:kill_tmux|kill_all|kill_session)\(")
 
 
 def test_resume_keyboard_lists_new_continue_and_conversations() -> None:
@@ -32,3 +42,15 @@ def test_died_text_escapes_html() -> None:
     text = _died_text(Died(name="a&b", tmux_name="rc-a-b", cwd="/repos/<x>"))
     assert "&amp;" in text
     assert "<x>" not in text
+
+
+def test_no_direct_kill_calls_bypass_watcher() -> None:
+    """Прямой вызов kill_tmux/kill_all/kill_session мимо watcher — тихий баг.
+
+    Такая сессия гаснет, но Watcher о ней не узнаёт и на следующем опросе
+    доложит о ней как об упавшей — пользователь получит карточку «сессия
+    завершилась» сразу после того, как сам её погасил.
+    """
+    source = Path(bot_module.__file__).read_text(encoding="utf-8")
+    offenders = _DIRECT_KILL.findall(source)
+    assert not offenders, f"нашёл гашение мимо watcher: {offenders}"

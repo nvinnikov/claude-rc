@@ -41,8 +41,12 @@ class Watcher:
         self._known: dict[str, RemoteSession] | None = None
         self._expected: set[str] = set()
 
-    async def kill(self, tmux_name: str) -> bool:
+    def expect_death(self, tmux_name: str) -> None:
+        """Помечает смерть ожидаемой, не гася сессию: её уже погасил кто-то другой."""
         self._expected.add(tmux_name)
+
+    async def kill(self, tmux_name: str) -> bool:
+        self.expect_death(tmux_name)
         killed = await kill_tmux(tmux_name)
         if not killed:
             # Гашение не удалось — сессия жива, а метка на живой сессии переживёт

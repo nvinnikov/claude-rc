@@ -343,6 +343,10 @@ async def main() -> None:
             return
         except LaunchError as exc:
             log.warning("launch failed for %s: %s", cwd, exc)
+            if exc.tmux_name:
+                # await_url сам погасил сессию по таймауту — без метки watcher
+                # опросил бы её как упавшую следом за этим же сообщением.
+                watcher.expect_death(exc.tmux_name)
             await notice.edit_text(
                 f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800],
                 parse_mode="HTML",
@@ -773,6 +777,10 @@ async def main() -> None:
             )
         except LaunchError as exc:
             log.warning("launch failed after trust for %s: %s", cwd, exc)
+            if exc.tmux_name:
+                # await_url сам погасил сессию по таймауту — без метки watcher
+                # опросил бы её как упавшую следом за этим же сообщением.
+                watcher.expect_death(exc.tmux_name)
             await message.answer(
                 f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
             )
@@ -815,22 +823,33 @@ async def main() -> None:
         await start_session(message, target, branch, resume)
 
     async def on_died(died: Died) -> None:
-        token = uuid.uuid4().hex[:8]
-        resume_pending[token] = (Path(died.cwd), None, "last")
-        await bot.send_message(
-            config.allowed_user_id,
-            _died_text(died),
-            parse_mode="HTML",
-            reply_markup=_resume_keyboard([(token, "↻ Resume")]),
-        )
+        # Watcher зовёт колбэк в цикле по всем упавшим за один опрос сессиям;
+        # необработанное исключение оборвёт цикл, а его снимок уже сменился —
+        # оставшиеся падения того же опроса тогда пропадут без следа.
+        try:
+            token = uuid.uuid4().hex[:8]
+            resume_pending[token] = (Path(died.cwd), None, "last")
+            await bot.send_message(
+                config.allowed_user_id,
+                _died_text(died),
+                parse_mode="HTML",
+                reply_markup=_resume_keyboard([(token, "↻ Resume")]),
+            )
+        except Exception:
+            log.warning("failed to report died session %s", died.tmux_name, exc_info=True)
 
-    for session in await list_sessions():
-        await bot.send_message(
-            config.allowed_user_id,
-            _list_item(session),
-            parse_mode="HTML",
-            reply_markup=_open_keyboard(session.url),
-        )
+    # Список — удобство при рестарте бота, а не условие запуска: ошибка Telegram
+    # здесь (бота заблокировали, сеть недоступна) не должна срывать поллинг.
+    try:
+        for session in await list_sessions():
+            await bot.send_message(
+                config.allowed_user_id,
+                _list_item(session),
+                parse_mode="HTML",
+                reply_markup=_open_keyboard(session.url),
+            )
+    except Exception:
+        log.warning("failed to send startup session list", exc_info=True)
 
     watch_task = asyncio.create_task(watcher.run(on_died))
     try:

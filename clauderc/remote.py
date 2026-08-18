@@ -49,7 +49,15 @@ _SCRUB_ENV = 'for v in $(env | grep ^CLAUDE_CODE_ | cut -d= -f1); do unset "$v";
 
 
 class LaunchError(RuntimeError):
-    """Сессию не удалось поднять или tmux ответил ошибкой."""
+    """Сессию не удалось поднять или tmux ответил ошибкой.
+
+    `tmux_name` заполняется, если сессия при этом была погашена: вызывающему
+    нужно имя, чтобы пометить смерть ожидаемой и не отчитаться о ней как о падении.
+    """
+
+    def __init__(self, message: str, *, tmux_name: str | None = None) -> None:
+        super().__init__(message)
+        self.tmux_name = tmux_name
 
 
 class TrustRequired(RuntimeError):
@@ -253,7 +261,7 @@ async def await_url(
         return session
 
     await _run("kill-session", "-t", f"={name}", check=False)
-    raise LaunchError(_failure(f"ссылка не появилась за {int(timeout_s)}с", pane))
+    raise LaunchError(_failure(f"ссылка не появилась за {int(timeout_s)}с", pane), tmux_name=name)
 
 
 def _failure(reason: str, pane: str) -> str:
