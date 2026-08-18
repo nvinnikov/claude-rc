@@ -25,6 +25,27 @@ func takeOverRowTitle(for state: BotState) -> String? {
     return "Take over bot (pid \(pid))"
 }
 
+/// Что делать в `takeOver()` после свежей проверки чужого pid.
+enum TakeOverDecision: Equatable {
+    /// Тот же процесс, что и был увиден, — гасим сигналом.
+    case killThenStart(pid: Int32)
+    /// Чужой процесс уже исчез сам — сигнал слать некому, просто стартуем.
+    case startDirectly
+    /// На месте запомненного pid теперь другой процесс — это не тот, кого мы
+    /// собирались забрать; гасить его нельзя, только показать актуальный pid.
+    case updateForeign(pid: Int32)
+}
+
+/// Чистая логика решения takeOver — вынесена отдельно, чтобы её можно было
+/// проверить таблицей истинности по всем комбинациям, не поднимая настоящие
+/// процессы. `remembered` — pid из состояния `.foreignBotRunning`, `current` —
+/// свежий результат `foreignBotPID()`.
+func takeOverDecision(remembered pid: Int32, current: Int32?) -> TakeOverDecision {
+    guard let current else { return .startDirectly }
+    if current == pid { return .killThenStart(pid: pid) }
+    return .updateForeign(pid: current)
+}
+
 /// Паузы перед перезапуском упавшего бота. `nil` — больше не пытаемся.
 func backoffDelay(attempt: Int) -> TimeInterval? {
     switch attempt {
@@ -118,7 +139,13 @@ final class BotSupervisor {
         // не мог зависнуть на главном потоке без объяснения причины.
         guard exited.wait(timeout: .now() + 2) == .success else {
             task.terminate()
-            FileHandle.standardError.write(Data("claude-rc: pgrep не ответил за 2с, считаем что чужого бота нет\n".utf8))
+            // stderr — не канал, на который можно полагаться: у GUI-приложения,
+            // запущенного через Finder/`open`, он идёт в /dev/null (см. Log.swift).
+            // А это решение важное — таймаут значит «считаем, что чужого бота нет»
+            // и ведёт прямиком к запуску второго поллера, — поэтому и в Log.app.
+            let message = "claude-rc: pgrep не ответил за 2с, считаем что чужого бота нет"
+            FileHandle.standardError.write(Data((message + "\n").utf8))
+            Log.app(message)
             return nil
         }
 
@@ -180,7 +207,14 @@ final class BotSupervisor {
     }
 
     func start() {
-        guard process == nil else { return }
+        guard process == nil else {
+            // `stop()` намеренно не зануляет `process` сразу (см. её комментарий) —
+            // окно между «стоп нажали» и `handleTermination` миллисекундное, но
+            // повторный клик `Start bot` в это окно не должен молчать: раньше
+            // здесь не оставалось ни следа в логе, ни изменения состояния.
+            Log.app("start: бот уже поднят (pid \(process?.processIdentifier ?? -1)), повторный запуск игнорируем")
+            return
+        }
         if let foreign = BotSupervisor.foreignBotPID() {
             state = .foreignBotRunning(pid: foreign)
             return
@@ -238,12 +272,39 @@ final class BotSupervisor {
     /// его погасить. При старте мы этого не делаем сами: чужой процесс мог быть
     /// запущен намеренно, и гасить его без спроса нельзя (см. диалог доверия
     /// каталогу в CLI — тот же принцип).
+    ///
+    /// `pid` в состоянии запомнен с момента, когда `foreignBotPID()` его увидел —
+    /// это могло быть сколько угодно давно, `menuNeedsUpdate` состояние не
+    /// перепроверяет. macOS переиспользует номера процессов по кругу: слепой
+    /// `kill(pid, …)` рискует попасть не в тот процесс, а в того, кто успел занять
+    /// этот номер с тех пор, — на этой машине с равной вероятностью это `claude`
+    /// внутри tmux-панели. Поэтому перед сигналом опрашиваем `foreignBotPID()`
+    /// заново и гасим только если это буквально тот же pid.
     func takeOver() {
         guard case .foreignBotRunning(let pid) = state else { return }
-        Log.app("takeOver: SIGTERM чужому pid \(pid)")
-        kill(pid, SIGTERM)
-        state = .starting
-        waitForForeignExit(pid: pid, attempt: 0)
+        let current = BotSupervisor.foreignBotPID()
+        switch takeOverDecision(remembered: pid, current: current) {
+        case .killThenStart(let pid):
+            // `pid > 0`: недостижимо через pgrep (он не отдаёт 0 или отрицательные
+            // pid), но это `kill`, и при 0 сигнал ушёл бы всей группе процессов —
+            // защита в одну строку тут уместна.
+            guard pid > 0 else {
+                Log.app("takeOver: pid \(pid) <= 0, сигнал не шлём")
+                state = .stopped
+                return
+            }
+            Log.app("takeOver: SIGTERM чужому pid \(pid)")
+            kill(pid, SIGTERM)
+            state = .starting
+            waitForForeignExit(pid: pid, attempt: 0)
+        case .updateForeign(let newPID):
+            Log.app("takeOver: запомненный pid \(pid) больше не тот процесс (сейчас \(newPID)), сигнал не шлём")
+            state = .foreignBotRunning(pid: newPID)
+        case .startDirectly:
+            Log.app("takeOver: чужой pid \(pid) уже исчез сам, стартуем без сигнала")
+            state = .stopped
+            start()
+        }
     }
 
     /// SIGTERM не убивает мгновенно — если запустить своего бота раньше, чем чужой
@@ -287,31 +348,10 @@ final class BotSupervisor {
     }
 
     /// Дозапись, а не перезапись: причина падения не должна теряться при перезапуске.
-    ///
-    /// Права ужимаем явно (0700 на каталог, 0600 на файл): в логе — операционные
-    /// данные бота и, с недавних пор, диагностика о чужих процессах машины
-    /// (`foreignBotPID`); ни то ни другое не должно читаться любым локальным
-    /// пользователем, а `FileManager.createFile`/`createDirectory` без `attributes`
-    /// берут маску по умолчанию (обычно 644/755). `createDirectory` не трогает права
-    /// уже существующего каталога, а файл лог мог создать и `Log.swift` — с теми же
-    /// правами по умолчанию, — поэтому права ужимаем безусловно, а не только при
-    /// первом создании.
+    /// Создание каталога/файла и ужатие прав (0700/0600) — в одном месте,
+    /// `Log.openAppending`, чтобы правило было одно на всех писателей (см. её
+    /// комментарий и M-3 в финальном ревью).
     private func appendingHandle() throws -> FileHandle {
-        let manager = FileManager.default
-        let directory = logURL.deletingLastPathComponent()
-        try manager.createDirectory(
-            at: directory, withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-
-        if !manager.fileExists(atPath: logURL.path) {
-            manager.createFile(
-                atPath: logURL.path, contents: nil, attributes: [.posixPermissions: 0o600]
-            )
-        }
-        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logURL.path)
-
-        return try Log.openAppending(at: logURL)
+        try Log.openAppending(at: logURL)
     }
 }

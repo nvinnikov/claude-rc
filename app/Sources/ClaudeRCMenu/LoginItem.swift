@@ -8,6 +8,21 @@ import ServiceManagement
 enum LoginItem {
     private static let label = "com.nvinnikov.claude-rc-app"
 
+    enum LoginItemError: LocalizedError {
+        case launchctlFailed(arguments: [String], status: Int32?)
+
+        var errorDescription: String? {
+            switch self {
+            case .launchctlFailed(let arguments, let status):
+                let command = "launchctl \(arguments.joined(separator: " "))"
+                if let status {
+                    return "\(command) завершился кодом \(status)"
+                }
+                return "\(command) не ответил за 5с"
+            }
+        }
+    }
+
     /// И `.enabled`, и `.requiresApproval` значат, что штатный путь сработал — просто
     /// в первом случае человек уже подтвердил элемент входа, а во втором ещё нет.
     static var isEnabled: Bool {
@@ -83,19 +98,48 @@ enum LoginItem {
         )
         try data.write(to: agentURL)
 
-        let load = Process()
-        load.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        load.arguments = ["bootstrap", "gui/\(getuid())", agentURL.path]
-        try? load.run()
-        load.waitUntilExit()
+        let arguments = ["bootstrap", "gui/\(getuid())", agentURL.path]
+        let status = runLaunchctl(arguments)
+        guard status == 0 else {
+            // `isEnabled` смотрит только на существование файла плиста — если
+            // bootstrap не прошёл, галочка встанет, а автозапуска не будет.
+            // Бросаем наверх, чтобы AppDelegate показал причину рядом с галочкой.
+            Log.app("writeAgent: launchctl bootstrap не прошёл, status=\(status.map(String.init) ?? "nil")")
+            throw LoginItemError.launchctlFailed(arguments: arguments, status: status)
+        }
     }
 
     private static func removeAgent() {
-        let unload = Process()
-        unload.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        unload.arguments = ["bootout", "gui/\(getuid())/\(label)"]
-        try? unload.run()
-        unload.waitUntilExit()
+        let arguments = ["bootout", "gui/\(getuid())/\(label)"]
+        let status = runLaunchctl(arguments)
+        if status != 0 {
+            // disable() best-effort и не throws (запасной путь снимается в любом
+            // случае), но неуспех не должен пропадать бесследно.
+            Log.app("removeAgent: launchctl bootout завершился status=\(status.map(String.init) ?? "nil")")
+        }
         try? FileManager.default.removeItem(at: agentURL)
+    }
+
+    /// `launchctl` без таймаута на главном потоке — тот же класс дефекта, что и
+    /// `pgrep`/`doctor --json` (см. их комментарии в BotSupervisor/AppDelegate):
+    /// залипший launchd не должен вешать меню-бар навсегда. Возвращает код
+    /// завершения (`nil` — не дождались ответа), а не просто факт "запустился".
+    private static func runLaunchctl(_ arguments: [String]) -> Int32? {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        task.arguments = arguments
+        task.standardOutput = Pipe()
+        task.standardError = Pipe()
+
+        let exited = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in exited.signal() }
+        guard (try? task.run()) != nil else { return nil }
+
+        guard exited.wait(timeout: .now() + 5) == .success else {
+            task.terminate()
+            Log.app("launchctl \(arguments.joined(separator: " ")) не ответил за 5с")
+            return nil
+        }
+        return task.terminationStatus
     }
 }

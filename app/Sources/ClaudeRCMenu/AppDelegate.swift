@@ -30,6 +30,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = buildMenu()
         statusItem = item
 
+        // Второй экземпляр (прямой запуск бинаря рядом с уже открытым .app, а не
+        // через `open`) не должен поднимать второго поллера — см. SingleInstance.
+        guard !SingleInstance.check() else {
+            Log.app("launch: другой экземпляр (bundle \(Bundle.main.bundleIdentifier ?? "?")) уже запущен, бот не поднимаем")
+            render(.crashed(reason: "уже запущен другой экземпляр приложения"))
+            return
+        }
+
         cli = CLILocator.find(
             searchPaths: CLILocator.defaultSearchPaths,
             environmentPath: ProcessInfo.processInfo.environment["PATH"]
@@ -182,6 +190,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
+    /// Отдельно от `isAlive` (та про иконку — «процесс реально поднят»): здесь про
+    /// то, что должен делать клик по кнопке. В `.starting` подпись уже «Stop bot»
+    /// (см. `render`) — раньше `toggleBot` этого не знал и уводил в повторный
+    /// `start()`, потому что `isAlive(.starting) == false`. Видно в окне ожидания
+    /// `takeOver` (до 3 с).
+    private func shouldStopOnToggle(_ state: BotState) -> Bool {
+        switch state {
+        case .running, .starting: return true
+        default: return false
+        }
+    }
+
     private func uptime(since: Date) -> String {
         let seconds = Int(Date().timeIntervalSince(since))
         if seconds < 60 { return "\(seconds)s" }
@@ -198,7 +218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleBot() {
         guard let supervisor else { return }
-        if isAlive(supervisor.state) {
+        if shouldStopOnToggle(supervisor.state) {
             supervisor.stop()
         } else {
             supervisor.start()
@@ -246,9 +266,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         guard exited.wait(timeout: .now() + 5) == .success else {
             task.terminate()
-            FileHandle.standardError.write(
-                Data("claude-rc: doctor --json не ответил за 5с, показываем каталог по умолчанию\n".utf8)
-            )
+            // stderr у GUI-приложения, запущенного через Finder/`open`, уходит в
+            // /dev/null (см. Log.swift) — без Log.app этого сообщения не существует.
+            let message = "claude-rc: doctor --json не ответил за 5с, показываем каталог по умолчанию"
+            FileHandle.standardError.write(Data((message + "\n").utf8))
+            Log.app(message)
             return nil
         }
         return pipe.fileHandleForReading.readDataToEndOfFile()
@@ -272,11 +294,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 loginItemError = nil
             } catch {
                 // Запасной путь (LaunchAgent) не смог включиться — молчать нельзя:
-                // человек видит невключившуюся галочку без единой причины.
+                // человек видит невключившуюся галочку без единой причины. stderr
+                // здесь тоже не гарантирует ничего (см. два выше) — основной канал
+                // Log.app, stderr оставлен как есть.
                 loginItemError = error.localizedDescription
-                FileHandle.standardError.write(
-                    Data("claude-rc: не удалось включить автозапуск: \(error.localizedDescription)\n".utf8)
-                )
+                let message = "claude-rc: не удалось включить автозапуск: \(error.localizedDescription)"
+                FileHandle.standardError.write(Data((message + "\n").utf8))
+                Log.app(message)
             }
         }
         loginRow.state = LoginItem.isEnabled ? .on : .off

@@ -18,17 +18,23 @@ enum Log {
 
     private static func write(_ line: String) {
         guard let data = line.data(using: .utf8) else { return }
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
         guard let handle = try? openAppending(at: url) else { return }
         defer { try? handle.close() }
         try? handle.write(contentsOf: data)
     }
 
-    /// Открывает файл лога на дозапись с флагом `O_APPEND`, создавая его при
-    /// необходимости с правами 0600. Общая точка входа для приложения (этот файл)
-    /// и для `BotSupervisor`, который тем же дескриптором пишет stdout/stderr бота.
+    /// Открывает файл лога на дозапись с флагом `O_APPEND`, создавая каталог и
+    /// файл при необходимости с правами 0700/0600. Общая точка входа для
+    /// приложения (этот файл) и для `BotSupervisor`, который тем же дескриптором
+    /// пишет stdout/stderr бота.
+    ///
+    /// Права ужимаются здесь безусловно, а не только при первом создании, и это
+    /// единственное место, где это делается: раньше каталог создавал ещё и
+    /// `Log.write` — без атрибутов, маской по умолчанию (обычно 755) — а права
+    /// файла ужимал только `BotSupervisor.appendingHandle`, которого не было, если
+    /// CLI не нашли или бота ни разу не запускали. Унаследованный от прошлой жизни
+    /// лог с правами 0644 в такой конфигурации продолжал бы молча принимать
+    /// записи. Раз правило одно — ему тут и место, а не в каждом писателе отдельно.
     ///
     /// В файл пишут два независимых процесса-писателя одновременно (бот и
     /// приложение о себе), а `FileHandle(forWritingTo:)` курсора не двигает — у
@@ -41,10 +47,20 @@ enum Log {
     /// записью может вклиниться другой писатель. Если решишь вернуть
     /// `FileHandle(forWritingTo:)` — не надо, это тот самый баг.
     static func openAppending(at url: URL) throws -> FileHandle {
+        let manager = FileManager.default
+        let directory = url.deletingLastPathComponent()
+        try manager.createDirectory(
+            at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+
         let fd = open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
         guard fd >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+
         return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 }
