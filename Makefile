@@ -10,7 +10,7 @@ install:
 # и ruff/mypy/pytest не нашлись бы. Повторный `uv sync` — быстрый no-op,
 # а make выполняет зависимость один раз за вызов.
 run: install
-	uv run python -m clauderc.bot
+	uv run claude-rc bot
 
 lint: install
 	uv run ruff format --check .

@@ -163,7 +163,7 @@ remote; перебить отказ можно явным `/wtrm <имя> force`
 
 ## Запуск
 
-Вручную: `uv run python -m clauderc.bot`
+Вручную: `make run` (то же самое, что `claude-rc bot` — см. раздел «CLI»).
 
 Автозапуск. Подставь в `launchd/com.nvinnikov.claude-rc.plist` свои пути вместо
 `/Users/YOUR_USERNAME/claude-rc` (`WorkingDirectory`, `PATH`, пути логов), при
@@ -177,6 +177,30 @@ launchctl load ~/Library/LaunchAgents/com.nvinnikov.claude-rc.plist
 Остановить: `launchctl unload ~/Library/LaunchAgents/com.nvinnikov.claude-rc.plist`
 
 Чтобы бот отвечал, мак не должен засыпать: `sudo pmset -c sleep 0`.
+
+## CLI
+
+Те же действия, что у бота, но из терминала на самой машине — не нужно ждать,
+пока сообщение дойдёт из Telegram. Ставится вместе с пакетом:
+
+```bash
+uv tool install .
+```
+
+| Команда | Действие |
+|---|---|
+| `claude-rc version` | версия |
+| `claude-rc sessions [--json]` | живые RC-сессии |
+| `claude-rc start [путь] [--branch ветка] [--resume last\|id]` | поднять сессию (по умолчанию — текущий каталог) |
+| `claude-rc stop <имя\|путь>` / `claude-rc stop --all` | погасить сессию |
+| `claude-rc doctor [--json]` | проверить tmux, claude и конфиг |
+| `claude-rc bot` | запустить Telegram-бота на переднем плане — то же, что `make run` |
+
+Диалог доверия незнакомому каталогу (см. «Доверие каталогу» выше) в CLI
+спрашивается прямо на stdin: за терминалом сидит человек, и его ответ — это и
+есть решение о правах на каталог, автоподтверждения нет и здесь. Без tty
+(например, в скрипте) `start` не подвисает в ожидании ввода, а падает с кодом
+2 и подсказкой `tmux attach -t rc-<имя>`, чтобы ответить в панели вручную.
 
 ## Как это устроено
 

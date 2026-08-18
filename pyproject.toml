@@ -6,6 +6,9 @@ dependencies = [
     "aiogram>=3.15",
 ]
 
+[project.scripts]
+claude-rc = "clauderc.cli:run"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
