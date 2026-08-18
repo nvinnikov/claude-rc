@@ -5,6 +5,24 @@ enum BotState {
     case starting
     case running(since: Date)
     case crashed(reason: String)
+    /// Токен уже держит чужой процесс — не наш ребёнок. Отдельный случай, а не
+    /// текст внутри `crashed`: меню должно уметь показать пункт восстановления
+    /// без разбора строки причины.
+    case foreignBotRunning(pid: Int32)
+}
+
+/// Показывать ли в меню пункт «забрать бота себе» — только когда рядом реально
+/// работает чужой процесс: в любом другом состоянии забирать нечего.
+func showsTakeOverRow(for state: BotState) -> Bool {
+    if case .foreignBotRunning = state { return true }
+    return false
+}
+
+/// Подпись пункта восстановления с pid — человеку нужно видеть, какой именно
+/// процесс он гасит, прежде чем нажать. `nil` вне `foreignBotRunning`.
+func takeOverRowTitle(for state: BotState) -> String? {
+    guard case .foreignBotRunning(let pid) = state else { return nil }
+    return "Take over bot (pid \(pid))"
 }
 
 /// Паузы перед перезапуском упавшего бота. `nil` — больше не пытаемся.
@@ -164,7 +182,7 @@ final class BotSupervisor {
     func start() {
         guard process == nil else { return }
         if let foreign = BotSupervisor.foreignBotPID() {
-            state = .crashed(reason: "бот уже запущен вне приложения, pid \(foreign)")
+            state = .foreignBotRunning(pid: foreign)
             return
         }
 
@@ -212,6 +230,36 @@ final class BotSupervisor {
         // фактически, повторный start() должен видеть его и не поднимать второго
         // поллера того же токена.
         state = .stopped
+    }
+
+    /// Человек явно решил забрать бота у чужого процесса — это единственный способ
+    /// его погасить. При старте мы этого не делаем сами: чужой процесс мог быть
+    /// запущен намеренно, и гасить его без спроса нельзя (см. диалог доверия
+    /// каталогу в CLI — тот же принцип).
+    func takeOver() {
+        guard case .foreignBotRunning(let pid) = state else { return }
+        Log.app("takeOver: SIGTERM чужому pid \(pid)")
+        kill(pid, SIGTERM)
+        state = .starting
+        waitForForeignExit(pid: pid, attempt: 0)
+    }
+
+    /// SIGTERM не убивает мгновенно — если запустить своего бота раньше, чем чужой
+    /// правда исчез, получим двух поллеров одного токена. `kill(pid, 0)` сигнала не
+    /// шлёт, только проверяет, жив ли pid (ESRCH — нет).
+    private func waitForForeignExit(pid: Int32, attempt: Int) {
+        guard kill(pid, 0) == 0 else {
+            start()
+            return
+        }
+        guard attempt < 10 else {
+            Log.app("takeOver: чужой pid \(pid) всё ещё жив после SIGTERM, сдаёмся")
+            state = .foreignBotRunning(pid: pid)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.waitForForeignExit(pid: pid, attempt: attempt + 1)
+        }
     }
 
     private func handleTermination(_ finished: Process) {

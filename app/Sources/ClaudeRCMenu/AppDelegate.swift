@@ -10,12 +10,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let statusRow = NSMenuItem(title: "Bot: stopped", action: nil, keyEquivalent: "")
     private let toggleRow = NSMenuItem(title: "Start bot", action: nil, keyEquivalent: "")
+    private let takeOverRow = NSMenuItem(title: "Take over bot", action: nil, keyEquivalent: "")
     private let configRow = NSMenuItem(title: "Reveal config", action: nil, keyEquivalent: "")
     private let loginRow = NSMenuItem(title: "Launch at login", action: nil, keyEquivalent: "")
     private let loginNoteRow = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private var loginItemError: String?
+    private var signalSources: [DispatchSourceSignal] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installSignalHandlers()
         Log.app(
             "launch: pid=\(ProcessInfo.processInfo.processIdentifier)"
                 + " home=\(NSHomeDirectory())"
@@ -52,6 +55,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         supervisor?.stop()
     }
 
+    /// `applicationWillTerminate` не срабатывает при завершении сигналом (падение,
+    /// `pkill`, выход из системы) — Cocoa просто не успевает добежать до него.
+    /// Без этого ребёнок остаётся сиротой с ppid 1 и живёт дальше сам по себе.
+    ///
+    /// `signal(SIG_IGN)` обязателен перед `DispatchSource.makeSignalSource`:
+    /// иначе дефолтный обработчик убивает процесс раньше, чем источник успевает
+    /// сработать. SIGKILL сюда не попадает — его нельзя перехватить в принципе,
+    /// так что сирота при `kill -9` самого приложения всё ещё возможна. Это
+    /// осознанный компромисс: закрываем частые случаи, не все теоретические.
+    private func installSignalHandlers() {
+        for sig in [SIGTERM, SIGINT] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler { [weak self] in self?.terminateOnSignal(sig) }
+            source.resume()
+            signalSources.append(source)
+        }
+    }
+
+    private func terminateOnSignal(_ sig: Int32) {
+        Log.app("signal \(sig): гасим бота перед выходом")
+        supervisor?.stop()
+        exit(0)
+    }
+
     private var logURL: URL {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude-rc/claude-rc.log")
     }
@@ -66,6 +94,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleRow.action = #selector(toggleBot)
         toggleRow.target = self
         menu.addItem(toggleRow)
+
+        takeOverRow.action = #selector(takeOverBot)
+        takeOverRow.target = self
+        takeOverRow.isHidden = true
+        menu.addItem(takeOverRow)
 
         menu.addItem(.separator())
 
@@ -134,7 +167,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusRow.title = "Bot: \(reason)"
             toggleRow.title = "Start bot"
             toggleRow.isEnabled = cli != nil
+        case .foreignBotRunning(let pid):
+            statusRow.title = "Bot: уже запущен вне приложения, pid \(pid)"
+            toggleRow.title = "Start bot"
+            toggleRow.isEnabled = cli != nil
         }
+        takeOverRow.isHidden = !showsTakeOverRow(for: state)
+        takeOverRow.title = takeOverRowTitle(for: state) ?? takeOverRow.title
         statusItem?.button?.image = icon(alive: isAlive(state))
     }
 
@@ -164,6 +203,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             supervisor.start()
         }
+    }
+
+    @objc private func takeOverBot() {
+        supervisor?.takeOver()
     }
 
     @objc private func openLog() {

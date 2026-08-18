@@ -39,6 +39,7 @@ extension BotState: CustomStringConvertible {
         case .starting: return "starting"
         case .running(let since): return "running(since: \(since))"
         case .crashed(let reason): return "crashed(\(reason))"
+        case .foreignBotRunning(let pid): return "foreignBotRunning(pid: \(pid))"
         }
     }
 }
