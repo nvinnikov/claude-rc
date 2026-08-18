@@ -41,6 +41,7 @@ from clauderc.remote import (
 )
 from clauderc.repos import discover, resolve
 from clauderc.state import State
+from clauderc.watch import Died
 from clauderc.worktrees import Worktree, WorktreeError
 
 log = logging.getLogger("clauderc")
@@ -108,6 +109,23 @@ def _open_keyboard(url: str) -> InlineKeyboardMarkup | None:
         return None
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Open in Claude", url=url)]]
+    )
+
+
+def _resume_keyboard(items: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    """Кнопки выбора диалога: по строке на вариант, в callback_data — только токен."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=label, callback_data=f"res:{token}")]
+            for token, label in items
+        ]
+    )
+
+
+def _died_text(died: Died) -> str:
+    return (
+        f"⚠️ Сессия <b>{html.escape(died.name)}</b> завершилась\n"
+        f"<code>{html.escape(died.cwd)}</code>"
     )
 
 
