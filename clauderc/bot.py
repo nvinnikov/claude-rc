@@ -19,7 +19,7 @@ from aiogram.types import (
     User,
 )
 
-from clauderc import browse, worktrees
+from clauderc import browse, paths, worktrees
 from clauderc.browse import BrowseError
 from clauderc.config import Config, load_config
 from clauderc.remote import (
@@ -258,8 +258,7 @@ class Discovery:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    root = Path(__file__).resolve().parent.parent
-    config = load_config(root / "config.toml")
+    config = load_config(paths.config_file())
     if not tmux_available():
         raise SystemExit("tmux не найден в PATH — поставь через `brew install tmux`")
 

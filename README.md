@@ -145,11 +145,21 @@ remote; перебить отказ можно явным `/wtrm <имя> force`
 ## Установка
 
 1. `uv sync`
-2. `cp config.example.toml config.toml` и заполнить:
+2. Заполни `config.toml`, скопировав `config.example.toml`:
+   - работа в клоне репозитория — `cp config.example.toml config.toml` (файл рядом
+     с исходниками, для разработки без переменных окружения);
+   - установленная тулза — `cp config.example.toml ~/.config/claude-rc/config.toml`
+     (каталог создать заранее).
+
+   Заполнить:
    - `bot_token` — от @BotFather
    - `allowed_user_id` — твой Telegram user_id (узнать у @userinfobot)
    - `rc_roots` — где искать репозитории
 3. `chmod 600 config.toml`
+
+Конфиг ищется по цепочке: путь из `$CLAUDE_RC_CONFIG`, если задан; иначе
+`~/.config/claude-rc/config.toml`; иначе `config.toml` в текущем каталоге. Первый
+существующий файл и используется.
 
 ## Запуск
 
