@@ -70,12 +70,19 @@ final class BotSupervisor {
 
     /// pid бота, запущенного мимо приложения. Два поллера одного токена получают
     /// от Telegram конфликт и работают через раз, поэтому свой мы не поднимаем.
+    ///
+    /// Шаблон заякорён (`$`/границы слова), а не просто "содержит подстроку":
+    /// без якоря `claude-rc bot` матчит ЛЮБОЙ процесс, чья полная командная строка
+    /// просто упоминает эту фразу — например, собственный отладочный шелл-скрипт
+    /// с такими словами в аргументах. Настоящий процесс бота всегда завершается
+    /// именно на неё (`bot` — последний аргумент), поэтому `$` отсекает случайные
+    /// совпадения, не теряя настоящих.
     static func foreignBotPID() -> Int32? {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        // Точка в "clauderc.bot" экранирована: pgrep матчит паттерн как regex,
-        // и без экранирования она подошла бы под любой символ.
-        task.arguments = ["-f", "claude-rc bot|clauderc\\.bot"]
+        // Точка в "clauderc.bot" экранирована: без экранирования она подошла бы
+        // под любой символ.
+        task.arguments = ["-fl", "(^|[ /])claude-rc bot$|(^|[ ])clauderc\\.bot([ ]|$)"]
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = Pipe()
@@ -95,10 +102,23 @@ final class BotSupervisor {
         let output = String(
             data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
         ) ?? ""
-        return output
+        // "-l" даёт "pid имя_команды" — достаточно, чтобы при отказе запуска было видно,
+        // что именно приняли за чужого бота, не поднимая на это отдельный процесс.
+        let match = output
             .split(separator: "\n")
-            .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
-            .first { $0 != ProcessInfo.processInfo.processIdentifier }
+            .compactMap { line -> (pid: Int32, line: Substring)? in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard let firstSpace = trimmed.firstIndex(of: " "),
+                    let pid = Int32(trimmed[trimmed.startIndex..<firstSpace])
+                else { return nil }
+                return (pid, line)
+            }
+            .first { $0.pid != ProcessInfo.processInfo.processIdentifier }
+
+        if let match {
+            Log.app("foreignBotPID: matched \(match.line.trimmingCharacters(in: .whitespaces))")
+        }
+        return match?.pid
     }
 
     func start() {

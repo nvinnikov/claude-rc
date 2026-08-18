@@ -16,6 +16,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var loginItemError: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Log.app(
+            "launch: pid=\(ProcessInfo.processInfo.processIdentifier)"
+                + " home=\(NSHomeDirectory())"
+                + " path=\(ProcessInfo.processInfo.environment["PATH"] ?? "<nil>")"
+        )
+
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = icon(alive: false)
         item.menu = buildMenu()
@@ -26,11 +32,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             environmentPath: ProcessInfo.processInfo.environment["PATH"]
         )
         if let cli {
+            Log.app("cli found: \(cli.path)")
             let supervisor = BotSupervisor(cli: cli, logURL: logURL)
-            supervisor.onStateChange = { [weak self] state in self?.render(state) }
+            supervisor.onStateChange = { [weak self] state in
+                Log.app("bot state -> \(state)")
+                self?.render(state)
+            }
             self.supervisor = supervisor
             supervisor.start()
         } else {
+            Log.app("cli not found; searchPaths=\(CLILocator.defaultSearchPaths)")
             render(.crashed(reason: "CLI not found"))
         }
     }
