@@ -1262,7 +1262,6 @@ git commit -m "feat: карточки резюма и упавшей сесси�
     resume_pending: dict[str, tuple[Path, str | None, str | None]] = {}
 ```
 
-```python
 Добавь `history` в импорт модулей ядра: строка `from clauderc import browse, paths, worktrees`
 становится `from clauderc import browse, history, paths, worktrees`.
 
