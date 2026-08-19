@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -14,6 +15,13 @@ from pathlib import Path
 
 _SLUG = re.compile(r"[^A-Za-z0-9_-]+")
 _ERROR_TAIL = 400
+
+# Локальные вызовы (status, rev-parse, worktree add) укладываются в миллисекунды —
+# даже на большом репозитории это разовая операция с диском. Сетевые (fetch, pull)
+# на разумном канале отрабатывают за секунды, редко за десятки секунд; 30с — щедрый
+# запас для честного fetch, но не бесконечность, на которой зависнет хендлер бота,
+# пока человек ждёт ответа в телефоне.
+_GIT_TIMEOUT_S = 30.0
 
 
 class WorktreeError(RuntimeError):
@@ -56,6 +64,9 @@ def generate_branch(now: float | None = None) -> str:
 
 
 async def _git(cwd: Path, *args: str) -> tuple[int, str]:
+    # GIT_TERMINAL_PROMPT=0 — приватный репозиторий не должен ждать пароль, который
+    # никто не введёт: без него git завершится ошибкой сразу, а не молча повиснет.
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     proc = await asyncio.create_subprocess_exec(
         "git",
         "-C",
@@ -63,8 +74,14 @@ async def _git(cwd: Path, *args: str) -> tuple[int, str]:
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=env,
     )
-    out, _ = await proc.communicate()
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_GIT_TIMEOUT_S)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return 1, f"git не ответил за {_GIT_TIMEOUT_S:.0f}с — прерван"
     return proc.returncode or 0, out.decode("utf-8", "replace")
 
 

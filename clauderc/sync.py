@@ -89,18 +89,20 @@ async def sync(repo: Path, *, branch: str | None = None, fetch: bool = True) -> 
     if current is None:
         return SyncResult(repo, Outcome.skipped, "не рабочая копия git", "?")
 
-    if fetch:
-        code, out = await _git(repo, "fetch", "--quiet")
-        if code != 0:
-            return SyncResult(repo, Outcome.failed, _short(out), current.branch)
-        current = await status(repo) or current
-
+    # Дешёвые локальные проверки — до сети: нет смысла ходить в fetch ради
+    # репозитория, который следующей же строкой пропустим.
     if current.detached:
         return SyncResult(repo, Outcome.skipped, "отсоединённый HEAD", current.branch)
 
     if current.dirty:
         # Ни переключать, ни тянуть: и то и другое трогает рабочее дерево.
         return SyncResult(repo, Outcome.skipped, "незакоммиченные изменения", current.branch)
+
+    if fetch:
+        code, out = await _git(repo, "fetch", "--quiet")
+        if code != 0:
+            return SyncResult(repo, Outcome.failed, _short(out), current.branch)
+        current = await status(repo) or current
 
     if branch and branch != current.branch:
         switched = await _switch(repo, branch)
@@ -114,9 +116,18 @@ async def sync(repo: Path, *, branch: str | None = None, fetch: bool = True) -> 
     if current.behind == 0:
         return SyncResult(repo, Outcome.already, "уже актуально", current.branch)
 
+    if not fetch:
+        # `pull` сам полез бы в сеть — а без fetch обещано смотреть состояние, не трогая её.
+        # merge/rebase здесь недоступны (граница модуля), так что перемотать нечем без сети.
+        return SyncResult(
+            repo, Outcome.skipped, f"отстаёт на {current.behind}, нужен fetch", current.branch
+        )
+
     code, out = await _git(repo, "pull", "--ff-only", "--quiet")
     if code != 0:
-        return SyncResult(repo, Outcome.failed, _short(out), current.branch)
+        return SyncResult(
+            repo, Outcome.failed, f"остался на {current.branch}: {_short(out)}", current.branch
+        )
 
     return SyncResult(
         repo, Outcome.updated, f"подтянуто коммитов: {current.behind}", current.branch
@@ -139,8 +150,13 @@ async def _switch(repo: Path, branch: str) -> SyncResult | None:
 
 
 def _short(output: str) -> str:
-    """Первая содержательная строка вывода git: в отчёт лезет одна строка на репо."""
-    for line in output.splitlines():
-        if line.strip():
-            return line.strip()[:120]
-    return "git завершился с ошибкой"
+    """Строка вывода git для отчёта: одна на репо, по возможности содержательная.
+
+    Перед перемоткой git часто печатает несколько строк `hint:` и только потом
+    `fatal:`/`error:` — в отчёт должна попасть причина, а не подсказка.
+    """
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in lines:
+        if line.startswith(("fatal:", "error:")):
+            return line[:120]
+    return lines[0][:120] if lines else "git завершился с ошибкой"

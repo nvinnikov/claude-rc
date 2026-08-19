@@ -224,11 +224,15 @@ async def test_sync_skips_branch_without_upstream(tmp_path: Path) -> None:
 
 
 async def test_sync_without_fetch_does_not_reach_network(tmp_path: Path) -> None:
-    # --no-fetch нужен, чтобы посмотреть состояние, не трогая сеть.
+    # --no-fetch обязан не трогать сеть вообще, даже когда есть что перематывать.
     bare, clone = _make_origin_and_clone(tmp_path)
     _commit_to_origin(tmp_path, bare, "second")
+    _run(clone, "fetch", "-q")  # клон узнаёт о новом коммите обычным способом, не через sync
+    _run(clone, "remote", "set-url", "origin", str(tmp_path / "no-such-origin"))
 
     result = await sync.sync(clone, fetch=False)
 
-    # Без fetch клон ещё не знает о новом коммите — значит перематывать нечего.
-    assert result.outcome is sync.Outcome.already
+    # Полезь sync в сеть (например, через `pull --ff-only`), origin оказался бы
+    # недоступен и результат был бы failed, а не skipped.
+    assert result.outcome is sync.Outcome.skipped
+    assert "fetch" in result.detail.lower()
