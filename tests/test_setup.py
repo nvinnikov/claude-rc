@@ -111,3 +111,70 @@ def test_default_roots_prefers_documents(monkeypatch: pytest.MonkeyPatch, tmp_pa
 def test_default_roots_falls_back_to_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     assert setup.default_roots() == (tmp_path,)
+
+
+class _FakeMe:
+    def __init__(self, username: str) -> None:
+        self.username = username
+
+
+class _FakeBot:
+    """Заглушка aiogram.Bot: тесты не ходят в сеть."""
+
+    def __init__(self, token: str, behaviour: str = "ok") -> None:
+        self.token = token
+        self.behaviour = behaviour
+
+    async def get_me(self) -> _FakeMe:
+        if self.behaviour == "offline":
+            raise OSError("нет сети")
+        if self.behaviour == "bad":
+            raise RuntimeError("Unauthorized")
+        return _FakeMe("my_test_bot")
+
+    async def session_close(self) -> None:
+        return None
+
+
+async def test_verify_token_reports_bot_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeBot(token))
+    check = await setup.verify_token("123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890")
+    assert check.ok is True
+    assert check.bot_name == "my_test_bot"
+    assert check.offline is False
+
+
+async def test_verify_token_distinguishes_offline_from_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Различие важное: без сети продолжать можно, с неверным токеном — нет.
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeBot(token, "offline"))
+    offline = await setup.verify_token("123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890")
+    assert offline.ok is False
+    assert offline.offline is True
+
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeBot(token, "bad"))
+    rejected = await setup.verify_token("123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890")
+    assert rejected.ok is False
+    assert rejected.offline is False
+
+
+async def test_verify_token_rejects_bad_shape_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def explode(token: str) -> _FakeBot:
+        raise AssertionError("в сеть ходить не должны")
+
+    monkeypatch.setattr(setup, "_make_bot", explode)
+    check = await setup.verify_token("мусор")
+    assert check.ok is False
+    assert check.offline is False
+
+
+async def test_verify_token_never_echoes_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "123456:SECRETVALUEabcdefghijklmnopqrstuvwxyz"
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeBot(token, "bad"))
+    check = await setup.verify_token(secret)
+    assert "SECRETVALUE" not in check.detail

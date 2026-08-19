@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 _TOKEN = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
 _VISIBLE_TAIL = 4
@@ -83,6 +85,82 @@ def default_roots() -> tuple[Path, ...]:
     """
     documents = Path.home() / "Documents"
     return (documents,) if documents.is_dir() else (Path.home(),)
+
+
+@dataclass(frozen=True)
+class TokenCheck:
+    ok: bool
+    bot_name: str | None
+    offline: bool
+    detail: str
+
+
+def _make_bot(token: str) -> Any:
+    """Обёртка ради тестируемости: заглушка подменяет именно её."""
+    from aiogram import Bot
+
+    return Bot(token=token)
+
+
+async def verify_token(token: str) -> TokenCheck:
+    """Спрашивает Telegram, живой ли токен.
+
+    Опечатка в токене иначе превращается в крэш-луп бота, который разбирают
+    полчаса. Отсутствие сети и отказ Telegram различаются: в первом случае
+    настройку можно продолжать, во втором — бессмысленно.
+    """
+    if not looks_like_token(token):
+        return TokenCheck(False, None, False, "не похоже на токен от @BotFather")
+
+    bot = _make_bot(token)
+    try:
+        me = await bot.get_me()
+    except OSError as exc:
+        return TokenCheck(False, None, True, f"нет связи с Telegram: {exc}")
+    except Exception:
+        # Текст исключения от aiogram может содержать сам токен (он в URL) —
+        # наружу отдаём только факт отказа.
+        return TokenCheck(False, None, False, "Telegram отверг токен")
+    finally:
+        await _close(bot)
+
+    return TokenCheck(True, getattr(me, "username", None), False, "токен принят")
+
+
+async def catch_user_id(token: str, *, timeout_s: float = 120.0) -> int | None:
+    """Ждёт первое сообщение боту и возвращает id отправителя.
+
+    Иначе человеку пришлось бы искать @userinfobot и копировать число — самый
+    ошибкоёмкий шаг настройки.
+
+    Зовётся только пока бот не настроен, то есть заведомо не запущен: второй
+    поллер того же токена ломает работающего бота.
+    """
+    from aiogram import Bot
+
+    bot = Bot(token=token)
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    offset: int | None = None
+    try:
+        while asyncio.get_running_loop().time() < deadline:
+            updates = await bot.get_updates(offset=offset, timeout=5)
+            for update in updates:
+                offset = update.update_id + 1
+                message = getattr(update, "message", None)
+                sender = getattr(message, "from_user", None) if message else None
+                if sender is not None:
+                    return int(sender.id)
+    except Exception:
+        return None
+    finally:
+        await _close(bot)
+    return None
+
+
+async def _close(bot: Any) -> None:
+    session = getattr(bot, "session", None)
+    if session is not None:
+        await session.close()
 
 
 def _toml_string(value: str) -> str:
