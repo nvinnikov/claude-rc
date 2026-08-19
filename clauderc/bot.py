@@ -20,6 +20,7 @@ from aiogram.types import (
 )
 
 from clauderc import browse, history, paths, worktrees
+from clauderc import sync as sync_mod
 from clauderc.browse import BrowseError
 from clauderc.config import Config, load_config
 from clauderc.remote import (
@@ -240,6 +241,8 @@ def _browse_card(cwd: Path) -> tuple[str, InlineKeyboardMarkup]:
     if browse.is_repo(cwd):
         launch_row.append(InlineKeyboardButton(text="🌿 New worktree", callback_data="nav:newwt"))
     rows.append(launch_row)
+    if _has_repos(cwd):
+        rows.append([InlineKeyboardButton(text="🔄 Sync", callback_data="sync:open")])
 
     text = f"📁 <code>{html.escape(str(cwd))}</code>{mark}"
     if not children:
@@ -359,6 +362,13 @@ async def main() -> None:
     # Значение — (id карточки, выбор): выбор любого варианта гасит остальные
     # токены той же карточки, чтобы два тапа не подняли две сессии в одном каталоге.
     resume_pending: dict[str, tuple[str, ResumeChoice]] = {}
+    # Выбор живёт в памяти и привязан к сообщению: восстанавливать наполовину
+    # сделанный выбор после перезапуска опаснее, чем начать заново.
+    sync_selection: dict[int, set[int]] = {}
+    sync_listing: dict[int, list[Path]] = {}
+    sync_branch: dict[int, str] = {}
+    # Токен ждёт следующего текстового сообщения — там имя ветки, не кнопка.
+    branch_pending: dict[str, int] = {}
 
     async def start_session(
         message: Message, target: Path, branch: str | None, resume: str | None = None
@@ -515,6 +525,71 @@ async def main() -> None:
                 f"…и ещё {len(orphans) - MAX_TREE_CARDS} worktree без сессии — <code>/wt</code>",
                 parse_mode="HTML",
             )
+
+    async def sync_card(chat_id: int, message_id: int, cwd: Path) -> None:
+        """(Пере)рисовать карточку выбора репозиториев для конкретного сообщения."""
+        listing = [child for child in sorted(cwd.iterdir()) if browse.is_repo(child)]
+        if browse.is_repo(cwd):
+            listing.insert(0, cwd)
+        sync_listing[message_id] = listing
+        chosen = sync_selection.setdefault(message_id, set())
+
+        # Параллельно: на каждый репозиторий приходится несколько вызовов git,
+        # и десяток штук последовательно открывался бы заметно долго.
+        statuses = await asyncio.gather(*(sync_mod.status(path) for path in listing))
+
+        lines = [f"🔄 <code>{html.escape(str(cwd))}</code>"]
+        rows: list[list[InlineKeyboardButton]] = []
+        for index, (path, repo_status) in enumerate(zip(listing, statuses, strict=True)):
+            if repo_status is None:
+                continue
+            lines.append(_sync_line(repo_status, selected=index in chosen))
+            rows.append([InlineKeyboardButton(text=path.name, callback_data=f"sync:{index}")])
+
+        branch = sync_branch.get(message_id, "")
+        rows.append(
+            [
+                InlineKeyboardButton(text="Все", callback_data="sync:all"),
+                InlineKeyboardButton(text="Никого", callback_data="sync:none"),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"Ветка: {branch or 'текущая'}", callback_data="sync:branch"
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(text="⤵️ Подтянуть", callback_data="sync:run"),
+                InlineKeyboardButton(text="Отмена", callback_data="sync:cancel"),
+            ]
+        )
+        await bot.edit_message_text(
+            "\n".join(lines),
+            chat_id=chat_id,
+            message_id=message_id,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def run_sync(message: Message) -> None:
+        listing = sync_listing.get(message.message_id) or []
+        chosen = sorted(sync_selection.get(message.message_id, set()))
+        if not chosen:
+            await message.answer("Ничего не выбрано.")
+            return
+
+        targets = [listing[i] for i in chosen if i < len(listing)]
+        branch = sync_branch.get(message.message_id) or None
+        notice = await message.answer(f"⏳ Подтягиваю: {len(targets)}…")
+
+        results = await asyncio.gather(*(sync_mod.sync(path, branch=branch) for path in targets))
+        await notice.edit_text(
+            "\n".join(_sync_report_line(result) for result in results),
+            parse_mode="HTML",
+        )
 
     @dp.message(lambda event: not _is_authorized(event.from_user, config.allowed_user_id))
     async def reject_strangers(message: Message) -> None:
@@ -893,6 +968,71 @@ async def main() -> None:
         await message.edit_reply_markup(reply_markup=None)
         target, branch, resume = choice
         await start_session(message, target, branch, resume)
+
+    @dp.callback_query(F.data.startswith("sync:"))
+    async def on_sync(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        action = (query.data or "").removeprefix("sync:")
+        await query.answer()
+        message = _live_message(query)
+        if message is None:
+            return
+
+        listing = sync_listing.get(message.message_id)
+        if listing is None and action != "open":
+            await message.answer("Список устарел, повтори /pwd.")
+            return
+
+        if action == "open":
+            await sync_card(message.chat.id, message.message_id, state.cwd)
+            return
+
+        if action == "cancel":
+            sync_selection.pop(message.message_id, None)
+            sync_listing.pop(message.message_id, None)
+            sync_branch.pop(message.message_id, None)
+            text, keyboard = _browse_card(state.cwd)
+            await message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+            return
+
+        chosen = sync_selection.setdefault(message.message_id, set())
+        if action == "all":
+            chosen.update(range(len(listing or [])))
+        elif action == "none":
+            chosen.clear()
+        elif action == "branch":
+            token = uuid.uuid4().hex[:8]
+            branch_pending[token] = message.message_id
+            await message.answer(
+                "Пришли имя ветки одним сообщением или <code>-</code>, чтобы остаться на текущей.",
+                parse_mode="HTML",
+            )
+            return
+        elif action == "run":
+            await run_sync(message)
+            return
+        else:
+            try:
+                index = int(action)
+            except ValueError:
+                await message.answer("Список устарел, повтори /pwd.")
+                return
+            chosen.symmetric_difference_update({index})
+
+        await sync_card(message.chat.id, message.message_id, state.cwd)
+
+    @dp.message(F.text & ~F.text.startswith("/"))
+    async def on_plain_text(message: Message) -> None:
+        """Ждём имя ветки только когда карточка Sync его реально запросила."""
+        if not _is_authorized(message.from_user, config.allowed_user_id):
+            return
+        if not branch_pending:
+            return
+        _token, msg_id = branch_pending.popitem()
+        text = (message.text or "").strip()
+        sync_branch[msg_id] = "" if text == "-" else text
+        await sync_card(message.chat.id, msg_id, state.cwd)
 
     async def on_died(died: Died) -> None:
         # Watcher зовёт колбэк в цикле по всем упавшим за один опрос сессиям;
