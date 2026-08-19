@@ -394,10 +394,11 @@ def test_doctor_never_prints_the_token_on_broken_config(
 def test_doctor_reports_wrong_typed_field_instead_of_crashing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # int(raw.get("scan_depth", 3)) на списке кидает TypeError, не ValueError —
-    # doctor стал воротами приложения (по его ответу оно решает, показывать ли
-    # Run setup…): необработанное исключение здесь — тот самый тупик «не
-    # настроено» без способа настроить, который весь PR и закрывает.
+    # load_config сам проверяет тип каждого поля (config.py) и поднимает
+    # ValueError — но раньше, до этой проверки, такое значение долетало до
+    # int() и падало TypeError'ом. doctor стал воротами приложения (по его
+    # ответу оно решает, показывать ли Run setup…): необработанное исключение
+    # здесь — тот самый тупик «не настроено» без способа настроить.
     config = tmp_path / "config.toml"
     config.write_text('bot_token = "123456:x"\nallowed_user_id = 1\nscan_depth = ["a", "b"]\n')
     monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -973,8 +974,8 @@ def test_setup_warns_about_dropped_extra_key(
     #
     # Файл настоящий (bot_token на месте — иначе extras не переносятся вовсе,
     # см. test_setup_does_not_import_extras_from_a_foreign_file), но
-    # scan_depth в нём битого типа. load_config тоже споткнётся на int([...])
-    # (TypeError, который _current_answers теперь тоже ловит), так что current
+    # scan_depth в нём битого типа. load_config споткнётся на нём и поднимет
+    # ValueError (config.py сам проверяет тип каждого поля), так что current
     # будет None и все три вопроса требуют полного ручного ответа — это не
     # мешает: _current_extras читает сырым tomllib независимо от load_config.
     root = tmp_path / "code"
@@ -1473,10 +1474,9 @@ def test_setup_does_not_warn_about_comments_for_a_brand_new_config(
 
 
 def test_current_answers_survives_wrong_typed_technical_field(tmp_path: Path) -> None:
-    # int(raw.get("scan_depth", 3)) на списке падает TypeError, не ValueError —
-    # без явного отлова _current_answers ронял бы весь визард трейсбеком на
-    # конфиге с любым битым по типу техническим полем, не только с плохим
-    # rc_roots.
+    # load_config сам проверяет тип каждого поля (config.py) и поднимает
+    # ValueError на битом scan_depth — _current_answers обязан считать это
+    # тем же самым «конфиг не читается», что и плохой rc_roots.
     target = tmp_path / "config.toml"
     target.write_text('bot_token = "123456:x"\nallowed_user_id = 1\nscan_depth = ["a", "b"]\n')
     assert cli._current_answers(target) is None

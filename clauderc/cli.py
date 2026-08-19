@@ -142,7 +142,7 @@ class _Commands:
                 return EXIT_ENVIRONMENT
             try:
                 load_config(config_path)
-            except (ValueError, KeyError, OSError, TypeError) as exc:
+            except (ValueError, KeyError, OSError) as exc:
                 print(f"--branch нужен рабочий config.toml: {config_path}: {exc}", file=sys.stderr)
                 return EXIT_ENVIRONMENT
         try:
@@ -419,11 +419,9 @@ def _current_answers(target: Path) -> setup.Answers | None:
     """Что уже настроено. Битый конфиг — то же, что его отсутствие для этих трёх полей."""
     try:
         config = load_config(target)
-    except (OSError, ValueError, KeyError, TypeError):
-        # TypeError — например, scan_depth в файле оказался списком, а не
-        # числом: int(raw.get("scan_depth", 3)) падает не ValueError. Без
-        # этого визард крашился бы трейсбеком на файле с любым битым по типу
-        # техническим полем, а не только с плохим rc_roots.
+    except (OSError, ValueError, KeyError):
+        # load_config сам проверяет типы всех полей и поднимает ValueError с
+        # понятным текстом — TypeError оттуда больше не долетает (см. config.py).
         return None
     return setup.Answers(
         bot_token=config.bot_token,
@@ -678,12 +676,11 @@ def _diagnose() -> list[dict[str, Any]]:
 
     try:
         config = load_config(config_path)
-    except (ValueError, KeyError, OSError, TypeError) as exc:
-        # TypeError — например, scan_depth в файле оказался списком, а не
-        # числом (int(raw.get("scan_depth", 3)) кидает не ValueError). Тот же
-        # довод, что и в _current_answers: doctor теперь ворота приложения —
-        # именно по его ответу оно решает, показывать ли Run setup….
-        # Необработанное исключение здесь — тот самый тупик «не настроено»
+    except (ValueError, KeyError, OSError) as exc:
+        # load_config сам проверяет типы всех полей (см. config.py) — здесь
+        # достаточно ValueError/KeyError/OSError. doctor теперь ворота
+        # приложения: по его ответу оно решает, показывать ли Run setup…,
+        # необработанное исключение здесь — тот самый тупик «не настроено»
         # без способа настроить, который этот PR и закрывает.
         checks.append({"name": "config", "ok": False, "detail": f"{config_path}: {exc}"})
         return checks

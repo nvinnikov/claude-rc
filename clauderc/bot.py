@@ -297,7 +297,7 @@ async def main() -> None:
     config_path = paths.config_file()
     try:
         config = load_config(config_path)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError, KeyError) as exc:
         # Тот же контракт, что у doctor/--branch в cli.py: битый конфиг —
         # понятное сообщение и чистый выход, а не трейсбек в логе приложения.
         raise SystemExit(f"config.toml не годится: {config_path}: {exc}") from exc
