@@ -109,3 +109,126 @@ async def test_status_detects_detached_head(tmp_path: Path) -> None:
     _run(repo, "checkout", "-q", head)
     got = await sync.status(repo)
     assert got is not None and got.detached is True
+
+
+async def test_sync_fast_forwards_behind_repo(tmp_path: Path) -> None:
+    bare, clone = _make_origin_and_clone(tmp_path)
+    _commit_to_origin(tmp_path, bare, "second")
+
+    result = await sync.sync(clone)
+    assert result.outcome is sync.Outcome.updated
+    assert (clone / "file.txt").read_text() == "second\n"
+
+
+async def test_sync_reports_already_up_to_date(tmp_path: Path) -> None:
+    _, clone = _make_origin_and_clone(tmp_path)
+    result = await sync.sync(clone)
+    assert result.outcome is sync.Outcome.already
+
+
+async def test_sync_never_touches_dirty_repo(tmp_path: Path) -> None:
+    # Главное свойство модуля: незакоммиченная работа остаётся ровно как была.
+    bare, clone = _make_origin_and_clone(tmp_path)
+    _commit_to_origin(tmp_path, bare, "second")
+    (clone / "file.txt").write_text("моя работа\n")
+    before = _run(clone, "status", "--porcelain")
+
+    result = await sync.sync(clone)
+
+    assert result.outcome is sync.Outcome.skipped
+    assert (clone / "file.txt").read_text() == "моя работа\n"
+    assert _run(clone, "status", "--porcelain") == before
+
+
+async def test_sync_refuses_when_branches_diverged(tmp_path: Path) -> None:
+    bare, clone = _make_origin_and_clone(tmp_path)
+    _commit_to_origin(tmp_path, bare, "theirs")
+    (clone / "other.txt").write_text("mine\n")
+    _run(clone, "add", ".")
+    _run(clone, "commit", "-qm", "mine")
+    head_before = _run(clone, "rev-parse", "HEAD").strip()
+
+    result = await sync.sync(clone)
+
+    assert result.outcome is sync.Outcome.failed
+    # Перемотка невозможна — HEAD обязан остаться на месте.
+    assert _run(clone, "rev-parse", "HEAD").strip() == head_before
+
+
+async def test_sync_switches_to_existing_local_branch(tmp_path: Path) -> None:
+    _, clone = _make_origin_and_clone(tmp_path)
+    _run(clone, "branch", "dev")
+
+    result = await sync.sync(clone, branch="dev")
+
+    assert result.branch == "dev"
+    assert _run(clone, "rev-parse", "--abbrev-ref", "HEAD").strip() == "dev"
+
+
+async def test_sync_creates_branch_tracking_origin(tmp_path: Path) -> None:
+    bare, clone = _make_origin_and_clone(tmp_path)
+    helper = tmp_path / "helper-dev"
+    subprocess.run(["git", "clone", "-q", str(bare), str(helper)], check=True)
+    _run(helper, "config", "user.email", "t@e.com")
+    _run(helper, "config", "user.name", "t")
+    _run(helper, "checkout", "-qb", "dev")
+    (helper / "dev.txt").write_text("dev\n")
+    _run(helper, "add", ".")
+    _run(helper, "commit", "-qm", "dev")
+    _run(helper, "push", "-q", "origin", "dev")
+
+    result = await sync.sync(clone, branch="dev")
+
+    assert result.outcome in {sync.Outcome.updated, sync.Outcome.already}
+    assert _run(clone, "rev-parse", "--abbrev-ref", "HEAD").strip() == "dev"
+    assert (clone / "dev.txt").exists()
+
+
+async def test_sync_skips_when_branch_exists_nowhere(tmp_path: Path) -> None:
+    _, clone = _make_origin_and_clone(tmp_path)
+    before = _run(clone, "rev-parse", "--abbrev-ref", "HEAD").strip()
+
+    result = await sync.sync(clone, branch="no-such-branch")
+
+    assert result.outcome is sync.Outcome.skipped
+    assert _run(clone, "rev-parse", "--abbrev-ref", "HEAD").strip() == before
+
+
+async def test_sync_does_not_switch_dirty_repo(tmp_path: Path) -> None:
+    # `git switch` перенёс бы незакоммиченное на другую ветку — молча и не туда.
+    _, clone = _make_origin_and_clone(tmp_path)
+    _run(clone, "branch", "dev")
+    (clone / "file.txt").write_text("моя работа\n")
+
+    result = await sync.sync(clone, branch="dev")
+
+    assert result.outcome is sync.Outcome.skipped
+    assert _run(clone, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+    assert (clone / "file.txt").read_text() == "моя работа\n"
+
+
+async def test_sync_skips_detached_head(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    head = _run(repo, "rev-parse", "HEAD").strip()
+    _run(repo, "checkout", "-q", head)
+
+    result = await sync.sync(repo)
+    assert result.outcome is sync.Outcome.skipped
+
+
+async def test_sync_skips_branch_without_upstream(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    result = await sync.sync(repo)
+    assert result.outcome is sync.Outcome.skipped
+    assert "upstream" in result.detail.lower() or "origin" in result.detail.lower()
+
+
+async def test_sync_without_fetch_does_not_reach_network(tmp_path: Path) -> None:
+    # --no-fetch нужен, чтобы посмотреть состояние, не трогая сеть.
+    bare, clone = _make_origin_and_clone(tmp_path)
+    _commit_to_origin(tmp_path, bare, "second")
+
+    result = await sync.sync(clone, fetch=False)
+
+    # Без fetch клон ещё не знает о новом коммите — значит перематывать нечего.
+    assert result.outcome is sync.Outcome.already

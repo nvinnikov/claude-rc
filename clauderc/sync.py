@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from clauderc.worktrees import _git
@@ -61,3 +62,85 @@ async def status(repo: Path) -> RepoStatus | None:
         upstream=tracked,
         detached=branch == "HEAD",
     )
+
+
+class Outcome(StrEnum):
+    updated = "updated"
+    already = "already"
+    skipped = "skipped"
+    failed = "failed"
+
+
+@dataclass(frozen=True)
+class SyncResult:
+    path: Path
+    outcome: Outcome
+    detail: str
+    branch: str
+
+
+async def sync(repo: Path, *, branch: str | None = None, fetch: bool = True) -> SyncResult:
+    """Подтягивает изменения из origin, ничего не потеряв.
+
+    Порядок и отказы описаны в спеке. Коротко: грязный репозиторий не трогаем
+    вовсе, переключаем ветку только у чистого, тянем только перемоткой.
+    """
+    current = await status(repo)
+    if current is None:
+        return SyncResult(repo, Outcome.skipped, "не рабочая копия git", "?")
+
+    if fetch:
+        code, out = await _git(repo, "fetch", "--quiet")
+        if code != 0:
+            return SyncResult(repo, Outcome.failed, _short(out), current.branch)
+        current = await status(repo) or current
+
+    if current.detached:
+        return SyncResult(repo, Outcome.skipped, "отсоединённый HEAD", current.branch)
+
+    if current.dirty:
+        # Ни переключать, ни тянуть: и то и другое трогает рабочее дерево.
+        return SyncResult(repo, Outcome.skipped, "незакоммиченные изменения", current.branch)
+
+    if branch and branch != current.branch:
+        switched = await _switch(repo, branch)
+        if switched is not None:
+            return switched
+        current = await status(repo) or current
+
+    if current.upstream is None:
+        return SyncResult(repo, Outcome.skipped, "у ветки нет upstream в origin", current.branch)
+
+    if current.behind == 0:
+        return SyncResult(repo, Outcome.already, "уже актуально", current.branch)
+
+    code, out = await _git(repo, "pull", "--ff-only", "--quiet")
+    if code != 0:
+        return SyncResult(repo, Outcome.failed, _short(out), current.branch)
+
+    return SyncResult(
+        repo, Outcome.updated, f"подтянуто коммитов: {current.behind}", current.branch
+    )
+
+
+async def _switch(repo: Path, branch: str) -> SyncResult | None:
+    """Переключает ветку. Возвращает результат только при отказе."""
+    code, _ = await _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    if code == 0:
+        code, out = await _git(repo, "switch", "--quiet", branch)
+        return None if code == 0 else SyncResult(repo, Outcome.failed, _short(out), branch)
+
+    code, _ = await _git(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}")
+    if code != 0:
+        return SyncResult(repo, Outcome.skipped, "ветки нет ни локально, ни в origin", branch)
+
+    code, out = await _git(repo, "switch", "--quiet", "-c", branch, "--track", f"origin/{branch}")
+    return None if code == 0 else SyncResult(repo, Outcome.failed, _short(out), branch)
+
+
+def _short(output: str) -> str:
+    """Первая содержательная строка вывода git: в отчёт лезет одна строка на репо."""
+    for line in output.splitlines():
+        if line.strip():
+            return line.strip()[:120]
+    return "git завершился с ошибкой"
