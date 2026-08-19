@@ -20,7 +20,7 @@ import Testing
 @MainActor
 @Suite struct BotSupervisorLifecycleTests {
     @Test func startAfterStopReachesAnAttempt() async throws {
-        let supervisor = makeSupervisor(checkConfigured: { _ in true })
+        let supervisor = makeSupervisor(checkConfigured: { _ in .configured })
 
         supervisor.start()
         try await settle(supervisor)
@@ -49,7 +49,7 @@ import Testing
         let release = DispatchSemaphore(value: 0)
         let supervisor = makeSupervisor(checkConfigured: { _ in
             release.wait()
-            return true
+            return .configured
         })
         let recorder = TransitionRecorder()
         recorder.attach(to: supervisor)
@@ -73,11 +73,30 @@ import Testing
     }
 
     @Test func configurationCheckFailureGivesNotConfigured() async throws {
-        let supervisor = makeSupervisor(checkConfigured: { _ in false })
+        let supervisor = makeSupervisor(checkConfigured: { _ in .notConfigured })
 
         supervisor.start()
         try await settle(supervisor)
         #expect(isNotConfigured(supervisor.state))
+    }
+
+    /// Ревью PR: `checkConfigured == false` смешивало «доктор ответил — конфига нет»
+    /// и «доктор не поднялся / не ответил вовремя» в один и тот же исход — а это
+    /// разные вещи. Второе не должно отправлять человека проходить визард заново:
+    /// конфиг мог быть в полном порядке, проблема в tmux/claude/машине.
+    @Test func checkFailedGivesConfigurationCheckFailedNotNotConfigured() async throws {
+        let supervisor = makeSupervisor(checkConfigured: { _ in .checkFailed(reason: "doctor не запустился") })
+
+        supervisor.start()
+        try await settle(supervisor)
+
+        guard case .configurationCheckFailed(let reason) = supervisor.state else {
+            Issue.record("ожидали .configurationCheckFailed, получили \(supervisor.state)")
+            return
+        }
+        #expect(reason == "doctor не запустился")
+        // Не .notConfigured — иначе меню снова предложило бы визард без всякой пользы.
+        #expect(!isNotConfigured(supervisor.state))
     }
 
     @Test func repeatedStartDuringCheckDoesNotDoubleCheck() async throws {
@@ -86,7 +105,7 @@ import Testing
         let supervisor = makeSupervisor(checkConfigured: { _ in
             counter.increment()
             release.wait()
-            return true
+            return .configured
         })
 
         supervisor.start()
@@ -107,7 +126,7 @@ import Testing
     @Test func startReachesRunningWhenLaunchSucceeds() async throws {
         let script = try makeFakeBotScript()
         defer { try? FileManager.default.removeItem(at: script) }
-        let supervisor = makeSupervisor(cli: script, checkConfigured: { _ in true }, detectForeignBot: { nil })
+        let supervisor = makeSupervisor(cli: script, checkConfigured: { _ in .configured }, detectForeignBot: { nil })
 
         supervisor.start()
         try await settle(supervisor)
@@ -127,7 +146,7 @@ import Testing
     @Test func stopWhileRunningDoesNotScheduleRestart() async throws {
         let script = try makeFakeBotScript(duration: 5)
         defer { try? FileManager.default.removeItem(at: script) }
-        let supervisor = makeSupervisor(cli: script, checkConfigured: { _ in true }, detectForeignBot: { nil })
+        let supervisor = makeSupervisor(cli: script, checkConfigured: { _ in .configured }, detectForeignBot: { nil })
         let recorder = TransitionRecorder()
         recorder.attach(to: supervisor)
 
@@ -163,7 +182,7 @@ import Testing
     /// меню и делался.
     @Test func recheckClearsNotConfiguredWhenNowConfigured() async throws {
         let flag = ConfiguredFlag(false)
-        let supervisor = makeSupervisor(checkConfigured: { _ in flag.value })
+        let supervisor = makeSupervisor(checkConfigured: { _ in flag.value ? .configured : .notConfigured })
 
         supervisor.start()
         try await settle(supervisor)
@@ -177,12 +196,12 @@ import Testing
         try await recorder.wait(forCount: 1)
         // Именно .stopped, а не что-то ещё: перепроверка обязана только снять
         // .notConfigured, а не сама поднять бота — запуск по-прежнему за явным
-        // кликом Start bot.
+        // кликом Start bot (кроме случая с запомненным кликом — см. тесты ниже).
         #expect(supervisor.state == .stopped)
     }
 
     @Test func recheckLeavesNotConfiguredWhenStillNotConfigured() async throws {
-        let supervisor = makeSupervisor(checkConfigured: { _ in false })
+        let supervisor = makeSupervisor(checkConfigured: { _ in .notConfigured })
 
         supervisor.start()
         try await settle(supervisor)
@@ -192,60 +211,118 @@ import Testing
         recorder.attach(to: supervisor)
         supervisor.recheckConfigurationIfNeeded()
 
-        // Отсутствие перехода — это и есть ожидаемый результат; ждём с запасом и
-        // проверяем, что состояние действительно не двигалось, а не что мы просто
-        // не успели заметить смену.
-        try await Task.sleep(nanoseconds: 200_000_000)
-        #expect(recorder.states.isEmpty)
+        // Перепроверка честно переустанавливает .notConfigured (см. её комментарий —
+        // тем же путём снимается .starting от возможного проглоченного клика), так
+        // что переход происходит, просто ведёт туда же, откуда начали.
+        try await recorder.wait(forCount: 1)
         #expect(isNotConfigured(supervisor.state))
     }
 
-    /// Повторный клик по "Start bot" во время идущей пассивной перепроверки не
-    /// должен запускать вторую параллельную проверку — общий `isCheckingConfiguration`
-    /// (переиспользован, а не заведён отдельный флаг под пассивный путь).
-    @Test func recheckAndExplicitStartShareTheSameGuard() async throws {
-        let counter = CallCounter()
-        let release = DispatchSemaphore(value: 0)
-        // `blocking` разводит две фазы одной заглушки: сперва нужен обычный
-        // синхронный `false`, чтобы дойти до `.notConfigured` через настоящий
-        // `start()` (там state идёт через `.starting`, и `settle()` это отследит);
-        // затем — управляемая семафором фаза для самой проверки этого теста.
-        let blocking = ConfiguredFlag(false)
-        let supervisor = makeSupervisor(checkConfigured: { _ in
-            counter.increment()
-            guard blocking.value else { return false }
-            release.wait()
-            return true
-        })
+    /// Ревью PR: клик `Start bot`, пришедший пока летит пассивная перепроверка
+    /// (заводится при КАЖДОМ открытии меню в `.notConfigured` — то есть попасть в
+    /// это окно человеку легко: открыл меню, сразу нажал), терялся молча — ни следа
+    /// в логе, ни изменения на экране. Три вещи проверяются здесь по отдельности.
+    ///
+    /// Во всех трёх `checkConfigured` разводит две фазы через `blocking`: сперва
+    /// нужен обычный синхронный `.notConfigured`, чтобы дойти до этого состояния
+    /// через настоящий `start()` (там `state` идёт через `.starting`, и `settle()`
+    /// это отследит); затем — управляемая семафором фаза для собственно проверки.
+    /// Один и тот же блокирующийся с самого начала стаб уже один раз подводил
+    /// (см. `startAfterStopReachesAnAttempt` выше по истории правок) — первый же
+    /// `start()` навсегда виснул на `release.wait()`, которого некому было снять.
+    @MainActor
+    @Suite struct StartDuringPassiveRecheck {
+        /// 1. Видимая реакция — немедленно, синхронно, до того как сама проверка
+        /// вообще успела куда-то сходить.
+        @Test func showsVisibleReactionImmediately() async throws {
+            let release = DispatchSemaphore(value: 0)
+            let blocking = ConfiguredFlag(false)
+            let supervisor = makeSupervisor(checkConfigured: { _ in
+                guard blocking.value else { return .notConfigured }
+                release.wait()
+                return .configured
+            })
 
-        supervisor.start()
-        try await settle(supervisor)
-        #expect(isNotConfigured(supervisor.state))
+            supervisor.start()
+            try await settle(supervisor)
+            #expect(isNotConfigured(supervisor.state))
 
-        counter.reset()
-        blocking.value = true
-        let recorder = TransitionRecorder()
-        recorder.attach(to: supervisor)
+            blocking.value = true
+            supervisor.recheckConfigurationIfNeeded()
+            supervisor.start()
+            // Синхронно, без await: обе строчки — main-actor вызовы подряд без
+            // точки приостановки между ними.
+            #expect(supervisor.state == .starting)
 
-        supervisor.recheckConfigurationIfNeeded()
-        // Клик по кнопке, пока пассивная перепроверка ещё летит: start() должен
-        // увидеть занятый флаг и не выпустить второй запрос к doctor. Проверяем
-        // счётчик СРАЗУ, без ожидания: оба вызова синхронны и `isCheckingConfiguration`
-        // взводится синхронно внутри `dispatchConfigurationCheck`, до диспетча в фон —
-        // никакой гонки с фоновым потоком тут нет.
-        supervisor.start()
-        #expect(counter.value == 1)
+            release.signal()
+            try await settle(supervisor)
+        }
 
-        release.signal()
-        try await recorder.wait(forCount: 1)
-        #expect(supervisor.state == .stopped)
+        /// 2. Намерение выполняется — если перепроверка закончилась успехом, клик
+        /// не просто разблокировал кнопку, а довёл дело до попытки запуска.
+        @Test func isFulfilledWhenCheckSucceeds() async throws {
+            let counter = CallCounter()
+            let release = DispatchSemaphore(value: 0)
+            let blocking = ConfiguredFlag(false)
+            let supervisor = makeSupervisor(checkConfigured: { _ in
+                counter.increment()
+                guard blocking.value else { return .notConfigured }
+                release.wait()
+                return .configured
+            })
+
+            supervisor.start()
+            try await settle(supervisor)
+            #expect(isNotConfigured(supervisor.state))
+
+            counter.reset()
+            blocking.value = true
+            supervisor.recheckConfigurationIfNeeded()
+            supervisor.start()
+            // Один запрос к doctor на оба вызова — второй не должен его удвоить.
+            #expect(counter.value == 1)
+
+            release.signal()
+            try await settle(supervisor)
+            // .stopped означало бы, что перепроверка просто сняла .notConfigured
+            // и остановилась, — а запомненный клик обязан довести до попытки
+            // запуска (тот же результат, что доказывает startAfterStopReachesAnAttempt).
+            #expect(supervisor.state != .stopped)
+            #expect(!isNotConfigured(supervisor.state))
+        }
+
+        /// 3. Намерение не выполняется вслепую — если перепроверка так и не нашла
+        /// конфиг, бот не запускается, а видимая реакция (.starting) не подвисает
+        /// навсегда: состояние честно возвращается в .notConfigured.
+        @Test func isNotFulfilledWhenCheckStaysNotConfigured() async throws {
+            let release = DispatchSemaphore(value: 0)
+            let blocking = ConfiguredFlag(false)
+            let supervisor = makeSupervisor(checkConfigured: { _ in
+                guard blocking.value else { return .notConfigured }
+                release.wait()
+                return .notConfigured
+            })
+
+            supervisor.start()
+            try await settle(supervisor)
+            #expect(isNotConfigured(supervisor.state))
+
+            blocking.value = true
+            supervisor.recheckConfigurationIfNeeded()
+            supervisor.start()
+            #expect(supervisor.state == .starting)
+
+            release.signal()
+            try await settle(supervisor)
+            #expect(isNotConfigured(supervisor.state))
+        }
     }
 }
 
 @MainActor
 private func makeSupervisor(
     cli: URL = URL(fileURLWithPath: "/nonexistent/claude-rc-test-cli"),
-    checkConfigured: @escaping @Sendable (URL) -> Bool,
+    checkConfigured: @escaping @Sendable (URL) -> ConfigurationCheck,
     detectForeignBot: @escaping @MainActor () -> Int32? = { nil }
 ) -> BotSupervisor {
     let logURL = FileManager.default.temporaryDirectory

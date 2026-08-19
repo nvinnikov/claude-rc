@@ -225,6 +225,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // недоступна именно тут — единственный выход из .notConfigured был
             // перезапуск приложения, а ради этого весь визард и делался.
             toggleRow.isEnabled = cli != nil
+        case .configurationCheckFailed(let reason):
+            // Отдельная формулировка от .notConfigured: доктор не ответил или не
+            // запустился — конфиг тут ни при чём, а "not configured" отправило бы
+            // человека проходить визард заново без всякой пользы.
+            statusRow.title = "Bot: не удалось проверить конфиг (\(reason))"
+            toggleRow.title = "Retry"
+            toggleRow.isEnabled = cli != nil
         }
         takeOverRow.isHidden = !showsTakeOverRow(for: state)
         takeOverRow.title = takeOverRowTitle(for: state) ?? takeOverRow.title

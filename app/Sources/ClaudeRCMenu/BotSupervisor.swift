@@ -9,9 +9,25 @@ enum BotState: Equatable {
     /// текст внутри `crashed`: меню должно уметь показать пункт восстановления
     /// без разбора строки причины.
     case foreignBotRunning(pid: Int32)
-    /// Конфига нет или он неполон. Отдельный случай, а не `crashed`: крэш-луп
-    /// из трёх попыток не сообщает причину и выглядит как поломка.
+    /// Конфига нет или он неполон — `doctor` ответил и сказал это прямо. Отдельный
+    /// случай, а не `crashed`: крэш-луп из трёх попыток не сообщает причину и
+    /// выглядит как поломка.
     case notConfigured
+    /// `doctor` не запустился или не ответил за отведённое время — саму проверку
+    /// провести не удалось. Отдельно от `notConfigured`: там доктор ответил и
+    /// сказал прямо, что конфига нет, — там уместно предложение пройти визард.
+    /// Здесь конфиг мог быть в полном порядке, а проблема в tmux/claude/машине —
+    /// отправлять человека проходить визард заново означало бы врать о причине.
+    case configurationCheckFailed(reason: String)
+}
+
+/// Результат проверки `doctor` — не голый `Bool`: «конфига нет» и «проверить не
+/// удалось» смешивались в одно `false`, хотя это разные вещи и реагировать на них
+/// нужно по-разному (см. `BotState.notConfigured` / `.configurationCheckFailed`).
+enum ConfigurationCheck: Equatable {
+    case configured
+    case notConfigured
+    case checkFailed(reason: String)
 }
 
 /// Показывать ли в меню пункт «забрать бота себе» — только когда рядом реально
@@ -113,11 +129,17 @@ final class BotSupervisor {
     /// Пока `true`, `start()` не выпускает второй параллельный запрос к `doctor`
     /// (см. её комментарий).
     private var isCheckingConfiguration = false
+    /// Клик `Start bot`, пришедший, пока уже летит чья-то ещё проверка конфига
+    /// (например, пассивная `recheckConfigurationIfNeeded` при открытии меню) —
+    /// без этого флага такой клик просто терялся. Одноразовый: разбирается и
+    /// сбрасывается ровно там, где эта летящая проверка завершается, — см.
+    /// `dispatchConfigurationCheck`.
+    private var pendingStart = false
     /// Внедряемая зависимость, а не прямой вызов `checkConfigured(cli:)`: тесты
     /// подменяют её синхронной заглушкой и гоняют реальные `start()`/`stop()`
     /// БЕЗ настоящего `doctor` и без спавна настоящего бота — второе всё равно
     /// не запустится, `cli` в тестах указывает в никуда.
-    private let checkConfigured: @Sendable (URL) -> Bool
+    private let checkConfigured: @Sendable (URL) -> ConfigurationCheck
     /// Та же логика, что и у `checkConfigured`: без подмены тест на переход в
     /// `.running` недетерминирован на машине, где уже работает настоящий бот —
     /// реальный `pgrep` находит его первым, и продукт (правильно!) уходит в
@@ -126,7 +148,7 @@ final class BotSupervisor {
 
     init(
         cli: URL, logURL: URL,
-        checkConfigured: @escaping @Sendable (URL) -> Bool = BotSupervisor.checkConfigured,
+        checkConfigured: @escaping @Sendable (URL) -> ConfigurationCheck = BotSupervisor.checkConfigured,
         detectForeignBot: @escaping @MainActor () -> Int32? = BotSupervisor.foreignBotPID
     ) {
         self.cli = cli
@@ -239,7 +261,7 @@ final class BotSupervisor {
     /// `DispatchSemaphore.wait` под main actor изолировать нельзя — она не трогает
     /// состояние `self`. Таймаут 5с — как у остальных внешних вызовов, но здесь
     /// именно поэтому он и не блокирует главный поток, в отличие от `foreignBotPID`.
-    nonisolated private static func checkConfigured(cli: URL) -> Bool {
+    nonisolated private static func checkConfigured(cli: URL) -> ConfigurationCheck {
         let task = Process()
         task.executableURL = cli
         task.arguments = ["doctor", "--json"]
@@ -250,13 +272,15 @@ final class BotSupervisor {
 
         let exited = DispatchSemaphore(value: 0)
         task.terminationHandler = { _ in exited.signal() }
-        guard (try? task.run()) != nil else { return false }
+        guard (try? task.run()) != nil else {
+            return .checkFailed(reason: "doctor не запустился")
+        }
         guard exited.wait(timeout: .now() + 5) == .success else {
             task.terminate()
-            Log.app("isConfigured: doctor не ответил за 5с")
-            return false
+            return .checkFailed(reason: "doctor не ответил за 5с")
         }
-        return Doctor.isConfigured(in: Doctor.parse(pipe.fileHandleForReading.readDataToEndOfFile()))
+        let checks = Doctor.parse(pipe.fileHandleForReading.readDataToEndOfFile())
+        return Doctor.isConfigured(in: checks) ? .configured : .notConfigured
     }
 
     func start() {
@@ -269,10 +293,15 @@ final class BotSupervisor {
             return
         }
         guard !isCheckingConfiguration else {
-            // Проверка `doctor` уже летит (предыдущий вызов `start()`) — вторая
-            // параллельно ничего не ускорит, а два ответа могут прийти в любом
-            // порядке и перезаписать состояние друг за другом.
-            Log.app("start: проверка конфига уже идёт, повторный запуск игнорируем")
+            // Проверка `doctor` уже летит — своя или чужая (например, пассивная
+            // `recheckConfigurationIfNeeded` при открытии меню). Раньше клик тут
+            // просто терялся: ни следа в логе, ни изменения на экране. Теперь —
+            // видимая реакция (тот же `.starting`, что и у обычного запуска) и
+            // намерение, которое доведёт до конца летящая проверка, когда ответит:
+            // см. `dispatchConfigurationCheck`.
+            pendingStart = true
+            state = .starting
+            Log.app("start: проверка конфига уже идёт, запомнили клик — доведём до конца, когда она ответит")
             return
         }
         // Сброс здесь, а не в continueStart перед фактическим запуском: тот guard
@@ -285,8 +314,8 @@ final class BotSupervisor {
         // Проверку показываем как starting, а не молчим пять секунд: иначе клик по
         // кнопке выглядит так, будто ничего не произошло.
         state = .starting
-        dispatchConfigurationCheck { [weak self] configured in
-            self?.continueStart(configured: configured)
+        dispatchConfigurationCheck { [weak self] result in
+            self?.continueStart(result: result)
         }
     }
 
@@ -296,19 +325,34 @@ final class BotSupervisor {
     ///
     /// В отличие от `start()`, она НЕ поднимает бота, даже если конфиг оказался в
     /// порядке, — только снимает `.notConfigured`, а решение «запускать или нет»
-    /// по-прежнему за явным кликом `Start bot`. Тот же `isCheckingConfiguration`,
-    /// что и у `start()`, — второй параллельный запрос к `doctor` не нужен ни там,
-    /// ни здесь, поэтому флаг общий, а не заведён отдельно.
+    /// по-прежнему за явным кликом `Start bot` (если только он не пришёл, пока эта
+    /// проверка летела, — тогда `dispatchConfigurationCheck` доведёт его до конца
+    /// сам). Тот же `isCheckingConfiguration`, что и у `start()`, — второй
+    /// параллельный запрос к `doctor` не нужен ни там, ни здесь, поэтому флаг
+    /// общий, а не заведён отдельно.
     func recheckConfigurationIfNeeded() {
         guard case .notConfigured = state else { return }
         guard !isCheckingConfiguration else { return }
-        dispatchConfigurationCheck { [weak self] configured in
+        dispatchConfigurationCheck { [weak self] result in
             guard let self else { return }
-            // Пока проверка летела, стало не до нас (например, реальный клик
-            // start() уже что-то поменял) — не перетираем чужой результат.
-            guard case .notConfigured = self.state else { return }
-            if configured {
+            // `.notConfigured` — обычный случай, никто её не трогал. `.starting` —
+            // клик `Start bot`, проглоченный ПОКА ЛЕТЕЛА ИМЕННО ЭТА проверка (см.
+            // `start()`): раз мы вообще дошли до этого замыкания, а не до короткого
+            // пути в `dispatchConfigurationCheck`, `pendingStart` уже разобран и
+            // не был про «настроено» — эту видимую реакцию нужно снять таким же
+            // честным состоянием, а не оставлять подвешенной навсегда. Любое
+            // другое состояние — работа кого-то другого (например, настоящий
+            // launch где-то ещё успел случиться), его не перетираем.
+            guard self.state == .notConfigured || self.state == .starting else { return }
+            switch result {
+            case .configured:
                 self.state = .stopped
+            case .notConfigured, .checkFailed:
+                // Пассивная перепроверка не должна пугать нежданной ошибкой —
+                // `.checkFailed` тут не поднимаем до отдельного состояния, тот
+                // же исход, что и «конфига по-прежнему нет»: следующее открытие
+                // меню попробует снова.
+                self.state = .notConfigured
             }
         }
     }
@@ -316,19 +360,32 @@ final class BotSupervisor {
     /// Общий механизм постановки проверки `doctor` в фон с возвратом ответа на main
     /// actor — используется и в `start()`, и в пассивной перепроверке; `completion`
     /// вызывается уже после того, как `isCheckingConfiguration` сброшен обратно.
-    private func dispatchConfigurationCheck(completion: @escaping @MainActor (Bool) -> Void) {
+    private func dispatchConfigurationCheck(completion: @escaping @MainActor (ConfigurationCheck) -> Void) {
         isCheckingConfiguration = true
         let cli = self.cli
         let checkConfigured = self.checkConfigured
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let configured = checkConfigured(cli)
+            let result = checkConfigured(cli)
             // `Task { @MainActor in }`, а не `DispatchQueue.main.async`: возврат на
             // main actor через структурированную конкурентность не завязан на то,
             // крутится ли где-то настоящий run loop главного потока — это же делает
             // переход воспроизводимым в тестах.
             Task { @MainActor [weak self] in
-                self?.isCheckingConfiguration = false
-                completion(configured)
+                guard let self else { return }
+                self.isCheckingConfiguration = false
+                // Клик, запомненный в start() пока эта проверка летела: доводим до
+                // конца именно её результатом, не спрашивая `doctor` заново. Если
+                // результат не «настроено» — обычный `completion` его и покажет
+                // (notConfigured/checkFailed), запуск сам собой не понадобится.
+                if self.pendingStart {
+                    self.pendingStart = false
+                    if case .configured = result {
+                        Log.app("start: конфиг нашёлся, доводим запомненный клик до конца")
+                        self.continueStart(result: result)
+                        return
+                    }
+                }
+                completion(result)
             }
         }
     }
@@ -338,15 +395,22 @@ final class BotSupervisor {
     /// жив, он с этим конфигом и поднялся, спрашивать незачем. А спросить и не
     /// дождаться ответа `doctor` за 5с означало бы объявить «не настроено» поверх
     /// работающего бота — меню соврало бы о том, что человек видит своими глазами.
-    private func continueStart(configured: Bool) {
+    private func continueStart(result: ConfigurationCheck) {
         guard !stopRequested else {
             // Стоп нажали, пока `doctor` отвечал, — не поднимаем бота вопреки этому.
             state = .stopped
             return
         }
-        guard configured else {
+        switch result {
+        case .configured:
+            break
+        case .notConfigured:
             Log.app("start: конфига нет, бота не поднимаем")
             state = .notConfigured
+            return
+        case .checkFailed(let reason):
+            Log.app("start: проверка конфига не удалась (\(reason)), бота не поднимаем")
+            state = .configurationCheckFailed(reason: reason)
             return
         }
         guard process == nil else {

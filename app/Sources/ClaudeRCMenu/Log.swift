@@ -74,6 +74,7 @@ extension BotState: CustomStringConvertible {
         case .crashed(let reason): return "crashed(\(reason))"
         case .foreignBotRunning(let pid): return "foreignBotRunning(pid: \(pid))"
         case .notConfigured: return "notConfigured"
+        case .configurationCheckFailed(let reason): return "configurationCheckFailed(\(reason))"
         }
     }
 }
