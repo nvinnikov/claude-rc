@@ -110,6 +110,9 @@ final class BotSupervisor {
     private var startedAt: Date?
     private var stopRequested = false
     private var tally = RestartTally()
+    /// Пока `true`, `start()` не выпускает второй параллельный запрос к `doctor`
+    /// (см. её комментарий).
+    private var isCheckingConfiguration = false
 
     init(cli: URL, logURL: URL) {
         self.cli = cli
@@ -215,9 +218,12 @@ final class BotSupervisor {
         return "pid \(pid) ppid \(ppid) comm \(name)"
     }
 
-    /// Спрашивает `claude-rc doctor --json`. Таймаут — как у остальных внешних
-    /// вызовов: подвешенная тулза не должна морозить меню-бар.
-    func isConfigured() -> Bool {
+    /// Спрашивает `claude-rc doctor --json`. `nonisolated static`, а не метод
+    /// экземпляра: `start()` зовёт её с фонового потока (см. ниже), а `Process` и
+    /// `DispatchSemaphore.wait` под main actor изолировать нельзя — она не трогает
+    /// состояние `self`. Таймаут 5с — как у остальных внешних вызовов, но здесь
+    /// именно поэтому он и не блокирует главный поток, в отличие от `foreignBotPID`.
+    nonisolated private static func checkConfigured(cli: URL) -> Bool {
         let task = Process()
         task.executableURL = cli
         task.arguments = ["doctor", "--json"]
@@ -246,13 +252,44 @@ final class BotSupervisor {
             Log.app("start: бот уже поднят (pid \(process?.processIdentifier ?? -1)), повторный запуск игнорируем")
             return
         }
-        // Спрашиваем про конфиг только когда своего процесса ещё нет: если бот уже
-        // жив, он с этим конфигом и поднялся, спрашивать незачем. А спросить и не
-        // дождаться ответа `doctor` за 5с означало бы объявить «не настроено» поверх
-        // работающего бота — меню соврало бы о том, что человек видит своими глазами.
-        guard isConfigured() else {
+        guard !isCheckingConfiguration else {
+            // Проверка `doctor` уже летит (предыдущий вызов `start()`) — вторая
+            // параллельно ничего не ускорит, а два ответа могут прийти в любом
+            // порядке и перезаписать состояние друг за другом.
+            Log.app("start: проверка конфига уже идёт, повторный запуск игнорируем")
+            return
+        }
+        // Проверку показываем как starting, а не молчим пять секунд: иначе клик по
+        // кнопке выглядит так, будто ничего не произошло.
+        state = .starting
+        isCheckingConfiguration = true
+        let cli = self.cli
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let configured = BotSupervisor.checkConfigured(cli: cli)
+            DispatchQueue.main.async { self?.continueStart(configured: configured) }
+        }
+    }
+
+    /// Вторая половина `start()` после ответа `doctor`, снова на main actor.
+    /// Спрашиваем про конфиг только когда своего процесса ещё нет: если бот уже
+    /// жив, он с этим конфигом и поднялся, спрашивать незачем. А спросить и не
+    /// дождаться ответа `doctor` за 5с означало бы объявить «не настроено» поверх
+    /// работающего бота — меню соврало бы о том, что человек видит своими глазами.
+    private func continueStart(configured: Bool) {
+        isCheckingConfiguration = false
+        guard !stopRequested else {
+            // Стоп нажали, пока `doctor` отвечал, — не поднимаем бота вопреки этому.
+            state = .stopped
+            return
+        }
+        guard configured else {
             Log.app("start: конфига нет, бота не поднимаем")
             state = .notConfigured
+            return
+        }
+        guard process == nil else {
+            // Кто-то другой (например, таймер перезапуска после падения) успел
+            // поднять бота, пока мы ждали `doctor`.
             return
         }
         if let foreign = BotSupervisor.foreignBotPID() {

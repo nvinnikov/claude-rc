@@ -12,6 +12,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let toggleRow = NSMenuItem(title: "Start bot", action: nil, keyEquivalent: "")
     private let takeOverRow = NSMenuItem(title: "Take over bot", action: nil, keyEquivalent: "")
     private let setupRow = NSMenuItem(title: "Run setup…", action: nil, keyEquivalent: "")
+    private let setupNoteRow = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private var setupError: String?
     private let configRow = NSMenuItem(title: "Reveal config", action: nil, keyEquivalent: "")
     private let loginRow = NSMenuItem(title: "Launch at login", action: nil, keyEquivalent: "")
     private let loginNoteRow = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -117,6 +119,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupRow.isHidden = true
         menu.addItem(setupRow)
 
+        setupNoteRow.isEnabled = false
+        setupNoteRow.isHidden = true
+        menu.addItem(setupNoteRow)
+
         takeOverRow.action = #selector(takeOverBot)
         takeOverRow.target = self
         takeOverRow.isHidden = true
@@ -154,8 +160,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render(supervisor?.state ?? .crashed(reason: stalledReason))
         configRow.isEnabled = cli != nil
         setupRow.isHidden = !isNotConfigured(supervisor?.state)
+        renderSetupNote()
         loginRow.state = LoginItem.isEnabled ? .on : .off
         renderLoginNote()
+    }
+
+    /// Показывает причину, по которой попытка открыть визард не сработала. Привязана
+    /// к видимости `setupRow`, а не только к наличию ошибки: пункт про визард пропадает,
+    /// как только конфиг находится, и застрявшая под ним причина не должна пережить его.
+    private func renderSetupNote() {
+        guard !setupRow.isHidden, let setupError else {
+            setupNoteRow.isHidden = true
+            return
+        }
+        setupNoteRow.title = "⚠ \(setupError)"
+        setupNoteRow.isHidden = false
     }
 
     /// Показывает причину, по которой галочка не значит «автозапуск точно работает»:
@@ -249,18 +268,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func runSetup() {
-        guard let cli else { return }
+        setupError = nil
+        guard let cli else {
+            // Не должно случиться — пункт виден только когда cli уже найден при
+            // старте (см. render(.notConfigured)) — но молчать при этом хуже, чем
+            // сказать очевидное: человек нажал пункт меню и не увидел ничего.
+            setupError = "CLI не найден"
+            Log.app("runSetup: cli не найден, визард не открываем")
+            renderSetupNote()
+            return
+        }
         // Открываем Терминал, а не запускаем визард внутри: он интерактивный,
         // а у приложения нет ни stdin, ни места, где показать вопросы.
         let script = "clear; \(cli.path) setup"
         let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+        // Имя с UUID — второй клик до того, как первый скрипт дочитан Терминалом,
+        // не должен переписать файл, который тот ещё открывает.
         let temp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("claude-rc-setup.command")
-        try? "#!/bin/sh\n\(script)\n".write(to: temp, atomically: true, encoding: .utf8)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: temp.path)
+            .appendingPathComponent("claude-rc-setup-\(UUID().uuidString).command")
+        do {
+            try "#!/bin/sh\n\(script)\n".write(to: temp, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: temp.path)
+        } catch {
+            setupError = "не удалось подготовить скрипт визарда: \(error.localizedDescription)"
+            Log.app("runSetup: \(setupError!)")
+            renderSetupNote()
+            return
+        }
         NSWorkspace.shared.open(
             [temp], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration()
-        )
+        ) { [weak self] _, error in
+            DispatchQueue.main.async {
+                // Терминал успевает прочитать сам файл сразу при запуске — 2с с
+                // запасом на медленный старт приложения, дальше скрипт ему не нужен.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    try? FileManager.default.removeItem(at: temp)
+                }
+                guard let self else { return }
+                if let error {
+                    self.setupError = "не удалось открыть Терминал: \(error.localizedDescription)"
+                    Log.app("runSetup: \(self.setupError!)")
+                } else {
+                    self.setupError = nil
+                }
+                self.renderSetupNote()
+            }
+        }
     }
 
     @objc private func openLog() {
