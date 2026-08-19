@@ -1259,9 +1259,22 @@ shasum -a 256 /tmp/rel-v0.2.0/*
 
 - [ ] **Step 5: Собрать блоки `resource`**
 
-Если спайк задачи 0 показал, что `brew update-python-resources` работает — используй
-его. Если нет — собери блоки из вывода `uv export`, беря для каждого пакета sdist с
-PyPI:
+Спайк задачи 0 показал: `brew update-python-resources` работает и для формулы, чей
+`url` ведёт на GitHub Release — он резолвит зависимости по метаданным пакета, а не по
+адресу формулы. Сгенерировалось 18 блоков, столько же пакетов даёт `uv export`.
+
+Порядок такой (первый шаг обязателен на brew 6.x, иначе «Refusing to load formula
+from untrusted tap»):
+
+```bash
+TAP="$(brew --repository)/Library/Taps/nvinnikov/homebrew-tap"
+brew trust --formula "$TAP/Formula/claude-rc.rb"
+brew update-python-resources "$TAP/Formula/claude-rc.rb"
+grep -c "^  resource" "$TAP/Formula/claude-rc.rb"
+```
+
+Ожидание: 18 блоков. Если команда почему-то откажет, запасной путь — собрать блоки
+из вывода `uv export`, беря для каждого пакета sdist с PyPI:
 
 ```bash
 cd /Users/nvinnikov/Documents/tg-claude
