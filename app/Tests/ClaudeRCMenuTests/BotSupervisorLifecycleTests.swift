@@ -11,14 +11,12 @@ import Testing
 /// связанный `start()` доходил до `continueStart`, видел протухший флаг и молча оседал
 /// в `.stopped` — ни лога, ни попытки запуска. Лечилось только перезапуском приложения.
 ///
-/// Проверка конфигурации подменяется синхронной заглушкой через внедряемую зависимость
-/// `checkConfigured` — настоящий `doctor` не зовём. `cli` в тестах указывает в никуда:
-/// если проверка чужого бота (`foreignBotPID`, настоящий `pgrep`, только читает список
-/// процессов) никого не находит, попытка реального запуска процесса синхронно падает
-/// (`.crashed`) прежде, чем что-либо успевает запуститься; если на машине уже есть живой
-/// бот — вместо этого честно вернётся `.foreignBotRunning`. Оба исхода одинаково
-/// доказывают, что мы прошли `continueStart`, не застряв в `.stopped`, — только это тесты
-/// и проверяют.
+/// `checkConfigured` и `detectForeignBot` подменяются синхронными заглушками через
+/// внедряемые зависимости — настоящий `doctor` и настоящий `pgrep` не зовём, поведение
+/// не зависит от того, работает ли на машине живой бот. `cli` в тестах, где процесс
+/// запускаться не должен, указывает в никуда: реальный запуск (`task.run()`) синхронно
+/// падает в `.crashed`, не порождая ни одного настоящего процесса. Там, где важен именно
+/// переход в `.running`, `cli` — временный скрипт-заглушка (`sleep`), а не настоящий бот.
 @MainActor
 @Suite struct BotSupervisorLifecycleTests {
     @Test func startAfterStopReachesAnAttempt() async throws {
@@ -39,20 +37,39 @@ import Testing
         #expect(supervisor.state != .stopped)
     }
 
+    /// Прежняя версия этого теста проверяла состояние сразу после `release.signal()`,
+    /// когда `state` уже было `.stopped` (от ручного `stop()`) и просто НЕ УСПЕВАЛО
+    /// измениться обратно на что-то другое — `settle()` выходил первой же итерацией,
+    /// не дождавшись, чтобы `continueStart` вообще исполнился. Тест был бы зелёным и
+    /// без guard'а по `stopRequested` внутри `continueStart`: он не проверял ничего.
+    /// Здесь вместо этого считаем сами переходы `state` через `TransitionRecorder` и
+    /// явно ждём ТРЕТИЙ (тот, что делает — или не делает — сам guard), а не полагаемся
+    /// на совпадение итогового значения с тем, что было ещё до завершения проверки.
     @Test func stopDuringConfigurationCheckPreventsStart() async throws {
         let release = DispatchSemaphore(value: 0)
         let supervisor = makeSupervisor(checkConfigured: { _ in
             release.wait()
             return true
         })
+        let recorder = TransitionRecorder()
+        recorder.attach(to: supervisor)
 
         supervisor.start()
+        try await recorder.wait(forCount: 1)
+        #expect(recorder.states == [.starting])
+
         supervisor.stop()
+        #expect(recorder.states == [.starting, .stopped])
         #expect(supervisor.state == .stopped)
 
         release.signal()
-        try await settle(supervisor)
+        // Третий переход — это то, что решает guard внутри continueStart. Без него
+        // (или если бы guard был снят) этот вызов либо никогда не дождался бы своего
+        // элемента и упал по таймауту с сообщением, либо дождался бы перехода в
+        // .foreignBotRunning/.crashed — и тогда упала бы проверка ниже.
+        try await recorder.wait(forCount: 3)
         #expect(supervisor.state == .stopped)
+        #expect(recorder.states == [.starting, .stopped, .stopped])
     }
 
     @Test func configurationCheckFailureGivesNotConfigured() async throws {
@@ -82,26 +99,98 @@ import Testing
         try await settle(supervisor)
         #expect(counter.value == 1)
     }
+
+    /// Ранее не проверялось вообще: у `.running` не было ни одного теста. `detectForeignBot`
+    /// подменён на `{ nil }` — иначе на машине с уже работающим ботом реальный `pgrep`
+    /// нашёл бы его первым, и `continueStart` честно (и правильно) ушёл бы в
+    /// `.foreignBotRunning`, ни разу не дойдя до фактического запуска процесса.
+    @Test func startReachesRunningWhenLaunchSucceeds() async throws {
+        let script = try makeFakeBotScript()
+        defer { try? FileManager.default.removeItem(at: script) }
+        let supervisor = makeSupervisor(cli: script, checkConfigured: { _ in true }, detectForeignBot: { nil })
+
+        supervisor.start()
+        try await settle(supervisor)
+
+        guard case .running = supervisor.state else {
+            Issue.record("ожидали .running, получили \(supervisor.state)")
+            return
+        }
+        supervisor.stop()
+    }
+
+    /// `handleTermination` и таймер перезапуска относительно `stopRequested`: стоп
+    /// живого бота не должен читаться как падение и планировать перезапуск. Этот же
+    /// флаг двигал регрессию выше, поэтому граница «свой стоп vs настоящее падение»
+    /// здесь проверяется отдельно, на реальном (хоть и безобидном) дочернем процессе —
+    /// без него `handleTermination` никогда не позвался бы по-настоящему.
+    @Test func stopWhileRunningDoesNotScheduleRestart() async throws {
+        let script = try makeFakeBotScript(duration: 5)
+        defer { try? FileManager.default.removeItem(at: script) }
+        let supervisor = makeSupervisor(cli: script, checkConfigured: { _ in true }, detectForeignBot: { nil })
+        let recorder = TransitionRecorder()
+        recorder.attach(to: supervisor)
+
+        supervisor.start()
+        // .starting (start) → .starting (повтор в continueStart) → .running.
+        try await recorder.wait(forCount: 3)
+        guard case .running = supervisor.state else {
+            Issue.record("ожидали .running перед stop(), получили \(supervisor.state)")
+            return
+        }
+
+        supervisor.stop()
+        // 4-й переход — сам stop() (.stopped); 5-й — handleTermination настоящего
+        // процесса, получившего SIGTERM. Если бы stopRequested не удержался к этому
+        // моменту, handleTermination принял бы смерть процесса за настоящее падение
+        // и получили бы .crashed вместо повторного .stopped.
+        try await recorder.wait(forCount: 5)
+        #expect(supervisor.state == .stopped)
+        #expect(recorder.states.suffix(2) == [.stopped, .stopped])
+
+        // Самый быстрый backoff — 2с (см. backoffDelay(attempt: 1)). Если бы
+        // handleTermination всё-таки запланировал перезапуск, он проявился бы новым
+        // переходом здесь; отсутствие перехода — доказательство, что таймер не заведён.
+        try await Task.sleep(nanoseconds: 2_500_000_000)
+        #expect(recorder.states.count == 5)
+    }
 }
 
 @MainActor
-private func makeSupervisor(checkConfigured: @escaping @Sendable (URL) -> Bool) -> BotSupervisor {
+private func makeSupervisor(
+    cli: URL = URL(fileURLWithPath: "/nonexistent/claude-rc-test-cli"),
+    checkConfigured: @escaping @Sendable (URL) -> Bool,
+    detectForeignBot: @escaping @MainActor () -> Int32? = { nil }
+) -> BotSupervisor {
     let logURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("claude-rc-test-\(UUID().uuidString)")
         .appendingPathComponent("claude-rc.log")
     return BotSupervisor(
-        // Путь заведомо не существует: реальный запуск (`task.run()`) синхронно
-        // падает в `.crashed`, не порождая ни одного настоящего процесса.
-        cli: URL(fileURLWithPath: "/nonexistent/claude-rc-test-cli"),
+        cli: cli,
         logURL: logURL,
-        checkConfigured: checkConfigured
+        checkConfigured: checkConfigured,
+        detectForeignBot: detectForeignBot
     )
 }
 
+/// Скрипт-заглушка вместо настоящего бота: просто спит `duration` секунд. Safe
+/// stand-in, чтобы проверить переход в `.running` и его дальнейшую судьбу, не трогая
+/// ни tmux, ни Telegram, ни реального бота, который может уже работать на машине.
+@MainActor
+private func makeFakeBotScript(duration: Int = 5) throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("claude-rc-test-bot-\(UUID().uuidString)")
+    try "#!/bin/sh\nsleep \(duration)\n".write(to: url, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    return url
+}
+
 /// `.starting` — переходное состояние на время фоновой проверки; ждём, пока
-/// `continueStart` (уже на main actor) решит, во что она превратится. `await
-/// Task.sleep` — настоящая точка приостановки: не блокирует main actor и даёт
-/// доехать до него `Task { @MainActor in }` из `start()`.
+/// `continueStart` (уже на main actor) решит, во что она превратится. Годится только
+/// там, где итоговое состояние заведомо отличается от того, что было ДО запуска
+/// проверки, — иначе (см. `TransitionRecorder`) можно выйти раньше, чем проверка
+/// реально отработала. `await Task.sleep` — настоящая точка приостановки: не
+/// блокирует main actor и даёт доехать до него `Task { @MainActor in }` из `start()`.
 @MainActor
 private func settle(_ supervisor: BotSupervisor, timeout: TimeInterval = 3) async throws {
     let deadline = Date().addingTimeInterval(timeout)
@@ -111,6 +200,52 @@ private func settle(_ supervisor: BotSupervisor, timeout: TimeInterval = 3) asyn
             continue
         }
         return
+    }
+    // Раньше здесь молча возвращали управление, и `!= .stopped` после этого мог
+    // пройти на застрявшем `.starting` — помощник делал вид, что всё хорошо, хотя
+    // ничего не дождался. Явная ошибка вместо тихого успеха.
+    throw SettleTimeoutError(state: supervisor.state, timeout: timeout)
+}
+
+private struct SettleTimeoutError: Error, CustomStringConvertible {
+    let state: BotState
+    let timeout: TimeInterval
+    var description: String {
+        "не устоялось за \(timeout)с, застряло на \(state)"
+    }
+}
+
+/// Записывает переходы `state` по порядку и умеет дожидаться N-го из них — в отличие
+/// от `settle()`, не полагается на то, что итоговое значение отличается от исходного.
+/// Нужен там, где ожидаемый результат (например, повторный `.stopped`) может СОВПАСТЬ
+/// со значением, которое было ещё до того, как проверяемая логика вообще отработала.
+@MainActor
+private final class TransitionRecorder {
+    private(set) var states: [BotState] = []
+
+    func attach(to supervisor: BotSupervisor) {
+        supervisor.onStateChange = { [weak self] state in self?.states.append(state) }
+    }
+
+    /// Бросает по таймауту с тем, что успело накопиться, — а не молча отдаёт
+    /// управление дальше с недостоверным состоянием.
+    func wait(forCount count: Int, timeout: TimeInterval = 3) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while states.count < count {
+            guard Date() < deadline else {
+                throw RecorderTimeoutError(expected: count, states: states, timeout: timeout)
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+}
+
+private struct RecorderTimeoutError: Error, CustomStringConvertible {
+    let expected: Int
+    let states: [BotState]
+    let timeout: TimeInterval
+    var description: String {
+        "не дождались \(expected)-го перехода состояния за \(timeout)с; накоплено: \(states)"
     }
 }
 

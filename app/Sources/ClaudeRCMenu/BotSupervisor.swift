@@ -118,14 +118,21 @@ final class BotSupervisor {
     /// БЕЗ настоящего `doctor` и без спавна настоящего бота — второе всё равно
     /// не запустится, `cli` в тестах указывает в никуда.
     private let checkConfigured: @Sendable (URL) -> Bool
+    /// Та же логика, что и у `checkConfigured`: без подмены тест на переход в
+    /// `.running` недетерминирован на машине, где уже работает настоящий бот —
+    /// реальный `pgrep` находит его первым, и продукт (правильно!) уходит в
+    /// `.foreignBotRunning`, ни разу не дойдя до фактического запуска процесса.
+    private let detectForeignBot: @MainActor () -> Int32?
 
     init(
         cli: URL, logURL: URL,
-        checkConfigured: @escaping @Sendable (URL) -> Bool = BotSupervisor.checkConfigured
+        checkConfigured: @escaping @Sendable (URL) -> Bool = BotSupervisor.checkConfigured,
+        detectForeignBot: @escaping @MainActor () -> Int32? = BotSupervisor.foreignBotPID
     ) {
         self.cli = cli
         self.logURL = logURL
         self.checkConfigured = checkConfigured
+        self.detectForeignBot = detectForeignBot
     }
 
     /// pid бота, запущенного мимо приложения. Два поллера одного токена получают
@@ -315,7 +322,7 @@ final class BotSupervisor {
             // поднять бота, пока мы ждали `doctor`.
             return
         }
-        if let foreign = BotSupervisor.foreignBotPID() {
+        if let foreign = detectForeignBot() {
             state = .foreignBotRunning(pid: foreign)
             return
         }
@@ -383,7 +390,7 @@ final class BotSupervisor {
     /// заново и гасим только если это буквально тот же pid.
     func takeOver() {
         guard case .foreignBotRunning(let pid) = state else { return }
-        let current = BotSupervisor.foreignBotPID()
+        let current = detectForeignBot()
         switch takeOverDecision(remembered: pid, current: current) {
         case .killThenStart(let pid):
             Log.app("takeOver: SIGTERM чужому pid \(pid)")
