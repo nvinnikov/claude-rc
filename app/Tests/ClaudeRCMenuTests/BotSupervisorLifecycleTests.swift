@@ -152,6 +152,49 @@ import Testing
         }
     }
 
+    /// Critical-регресс, найденный ревью: `doctor` контрактно завершается кодом 2
+    /// именно когда конфига нет — это его нормальный, ожидаемый ответ, а не сбой.
+    /// Guard по коду возврата, поставленный раньше разбора вывода, ловил ровно этот
+    /// случай и делал `.notConfigured` недостижимым — том самом сценарии, ради
+    /// которого весь этот пункт меню и делался: у КАЖДОГО нового человека `doctor`
+    /// на свежей машине отвечает именно так.
+    @Test func doctorExitCode2WithValidNotConfiguredJSONGivesNotConfigured() async throws {
+        let json = #"{"checks": [{"name": "config", "ok": false, "detail": "нет файла /x/config.toml"}]}"#
+        let cli = try makeFakeDoctorCLI(doctorBody: "echo '\(json)'; exit 2")
+        defer { try? FileManager.default.removeItem(at: cli) }
+        let supervisor = makeSupervisorWithRealDoctorCheck(cli: cli)
+
+        supervisor.start()
+        try await settle(supervisor)
+
+        #expect(isNotConfigured(supervisor.state))
+    }
+
+    /// Симметрия к тесту выше: разбираемому ответу верим независимо от кода
+    /// возврата вообще, не только в контрактном "конфига нет" (код 2).
+    @Test func doctorNonZeroExitCodeWithValidConfiguredJSONIsTrusted() async throws {
+        let json = #"""
+            {"checks": [
+              {"name": "config", "ok": true, "detail": "/x/config.toml"},
+              {"name": "bot_token", "ok": true, "detail": "задан"}
+            ]}
+            """#
+        let cli = try makeFakeDoctorCLI(doctorBody: "echo '\(json)'; exit 1")
+        defer { try? FileManager.default.removeItem(at: cli) }
+        let supervisor = makeSupervisorWithRealDoctorCheck(cli: cli)
+
+        supervisor.start()
+        try await settle(supervisor)
+        defer { supervisor.stop() }
+
+        switch supervisor.state {
+        case .notConfigured, .configurationCheckFailed:
+            Issue.record("валидный JSON должен быть доверен независимо от кода возврата, получили \(supervisor.state)")
+        default:
+            break
+        }
+    }
+
     @Test func repeatedStartDuringCheckDoesNotDoubleCheck() async throws {
         let counter = CallCounter()
         let release = DispatchSemaphore(value: 0)
@@ -196,10 +239,21 @@ import Testing
     /// флаг двигал регрессию выше, поэтому граница «свой стоп vs настоящее падение»
     /// здесь проверяется отдельно, на реальном (хоть и безобидном) дочернем процессе —
     /// без него `handleTermination` никогда не позвался бы по-настоящему.
+    /// Раньше здесь ждали 2.5с (дольше самого быстрого backoff в 2с,
+    /// `backoffDelay(attempt: 1)`) и проверяли отсутствие 6-го перехода —
+    /// доказательство "отсутствие события" истечением фиксированного срока, а не
+    /// самим событием: под нагрузкой (CI) такой запас не гарантия ни в одну, ни в
+    /// другую сторону. `scheduleRestart` — внедряемая зависимость специально для
+    /// этого: заглушка перехватывает сам факт "перезапуск запланирован" синхронно,
+    /// настоящую задержку ждать не нужно вовсе.
     @Test func stopWhileRunningDoesNotScheduleRestart() async throws {
         let script = try makeFakeBotScript(duration: 5)
         defer { try? FileManager.default.removeItem(at: script) }
-        let supervisor = makeSupervisor(cli: script, checkConfigured: { _ in .configured }, detectForeignBot: { nil })
+        var restartWasScheduled = false
+        let supervisor = makeSupervisor(
+            cli: script, checkConfigured: { _ in .configured }, detectForeignBot: { nil },
+            scheduleRestart: { _, _ in restartWasScheduled = true }
+        )
         let recorder = TransitionRecorder()
         recorder.attach(to: supervisor)
 
@@ -220,11 +274,11 @@ import Testing
         #expect(supervisor.state == .stopped)
         #expect(recorder.states.suffix(2) == [.stopped, .stopped])
 
-        // Самый быстрый backoff — 2с (см. backoffDelay(attempt: 1)). Если бы
-        // handleTermination всё-таки запланировал перезапуск, он проявился бы новым
-        // переходом здесь; отсутствие перехода — доказательство, что таймер не заведён.
-        try await Task.sleep(nanoseconds: 2_500_000_000)
-        #expect(recorder.states.count == 5)
+        // Проверяем сразу, без единой точки ожидания: к моменту 5-го перехода
+        // handleTermination уже отработал целиком синхронно (внутри неё самой нет
+        // ни одного await) — если бы перезапуск планировался, scheduleRestart был
+        // бы вызван уже в этот момент, а не когда-то позже.
+        #expect(!restartWasScheduled)
     }
 
     /// Регресс из ревью PR: `.notConfigured` был тупиком — кнопка недоступна, а
@@ -332,11 +386,21 @@ import Testing
             blocking.value = true
             supervisor.recheckConfigurationIfNeeded()
             supervisor.start()
-            // Один запрос к doctor на оба вызова — второй не должен его удвоить.
-            #expect(counter.value == 1)
 
             release.signal()
             try await settle(supervisor)
+            // Один запрос к doctor на оба вызова — второй не должен его удвоить.
+            // Проверяем ПОСЛЕ settle(), а не сразу после вызовов: `counter.increment()`
+            // происходит на фоновом потоке внутри диспетчнутого замыкания, а не
+            // синхронно в момент вызова `start()`/`recheckConfigurationIfNeeded()` —
+            // между dispatch и реальным исполнением на `DispatchQueue.global` нет
+            // никакой гарантии по времени. Раньше здесь читали счётчик сразу после
+            // вызовов без единой точки ожидания: локально фон обычно успевал
+            // отработать за микросекунды до следующей строки, а под нагрузкой (CI)
+            // — не всегда, что и давало красный `counter.value → 0`. `settle()`
+            // ждёт настоящего события (state перестал быть `.starting`), а не
+            // фиксированного срока, — к этому моменту фон гарантированно отработал.
+            #expect(counter.value == 1)
             // .stopped означало бы, что перепроверка просто сняла .notConfigured
             // и остановилась, — а запомненный клик обязан довести до попытки
             // запуска (тот же результат, что доказывает startAfterStopReachesAnAttempt).
@@ -376,7 +440,16 @@ import Testing
 private func makeSupervisor(
     cli: URL = URL(fileURLWithPath: "/nonexistent/claude-rc-test-cli"),
     checkConfigured: @escaping @Sendable (URL) -> ConfigurationCheck,
-    detectForeignBot: @escaping @MainActor () -> Int32? = { nil }
+    detectForeignBot: @escaping @MainActor () -> Int32? = { nil },
+    // Дублирует настоящую реализацию (`BotSupervisor.scheduleRealRestart`), а не
+    // ссылается на неё — та `private`, `@testable` доступа к ней не даёт. Только
+    // один тест (`stopWhileRunningDoesNotScheduleRestart`) подменяет это значение;
+    // остальным реальный таймер не мешает — на их сценариях он не планируется.
+    scheduleRestart: @escaping (TimeInterval, @escaping @MainActor () -> Void) -> Void = { delay, work in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            Task { @MainActor in work() }
+        }
+    }
 ) -> BotSupervisor {
     let logURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("claude-rc-test-\(UUID().uuidString)")
@@ -385,7 +458,8 @@ private func makeSupervisor(
         cli: cli,
         logURL: logURL,
         checkConfigured: checkConfigured,
-        detectForeignBot: detectForeignBot
+        detectForeignBot: detectForeignBot,
+        scheduleRestart: scheduleRestart
     )
 }
 

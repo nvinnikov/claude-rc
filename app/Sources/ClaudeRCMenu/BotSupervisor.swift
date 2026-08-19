@@ -145,16 +145,33 @@ final class BotSupervisor {
     /// реальный `pgrep` находит его первым, и продукт (правильно!) уходит в
     /// `.foreignBotRunning`, ни разу не дойдя до фактического запуска процесса.
     private let detectForeignBot: @MainActor () -> Int32?
+    /// Тоже внедряемая: тест на ОТСУТСТВИЕ перезапуска после `stop()` иначе обязан
+    /// был бы спать не меньше самого быстрого backoff (2с, `backoffDelay(attempt:
+    /// 1)`) с запасом на загруженную машину — то есть доказывать отсутствие события
+    /// истечением срока, а не самим событием. С подменой тест видит сам факт
+    /// «перезапуск запланирован» синхронно, не дожидаясь настоящей задержки.
+    private let scheduleRestart: (TimeInterval, @escaping @MainActor () -> Void) -> Void
 
     init(
         cli: URL, logURL: URL,
         checkConfigured: @escaping @Sendable (URL) -> ConfigurationCheck = BotSupervisor.checkConfigured,
-        detectForeignBot: @escaping @MainActor () -> Int32? = BotSupervisor.foreignBotPID
+        detectForeignBot: @escaping @MainActor () -> Int32? = BotSupervisor.foreignBotPID,
+        scheduleRestart: @escaping (TimeInterval, @escaping @MainActor () -> Void) -> Void = BotSupervisor.scheduleRealRestart
     ) {
         self.cli = cli
         self.logURL = logURL
         self.checkConfigured = checkConfigured
         self.detectForeignBot = detectForeignBot
+        self.scheduleRestart = scheduleRestart
+    }
+
+    /// Настоящая реализация `scheduleRestart` — просто `DispatchQueue.main.asyncAfter`,
+    /// вынесенный за пределы `handleTermination`, чтобы тесты могли подменить его
+    /// синхронной заглушкой (см. комментарий у свойства).
+    nonisolated private static func scheduleRealRestart(delay: TimeInterval, work: @escaping @MainActor () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            Task { @MainActor in work() }
+        }
     }
 
     /// pid бота, запущенного мимо приложения. Два поллера одного токена получают
@@ -281,11 +298,26 @@ final class BotSupervisor {
             return .checkFailed(reason: "doctor не ответил за 5с")
         }
 
+        // Сначала вывод, потом код возврата. У `doctor` код 2 — контрактный сигнал
+        // «не с чем работать» (конфига нет), а не сбой: если stdout разобрался в
+        // непустой список проверок, ответу верим независимо от того, каким кодом
+        // процесс завершился. Кодом объясняем только то, что вывод сам объяснить
+        // не смог, — а этот случай («доктор ответил и сказал, что конфига нет» —
+        // отличается от «доктор сломан») и есть самый частый: у каждого нового
+        // человека `doctor` на свежей машине именно так и отвечает.
         let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-        // Отработал, но не так, как ожидалось, — тоже «проверить не удалось», а не
-        // «конфига нет»: ненулевой код, пустой stdout и мусор вместо JSON смешивались
-        // с честным ответом доктора в один и тот же .notConfigured, отправляя человека
-        // проходить визард заново там, где сломан не конфиг, а сама тулза.
+        let checks = Doctor.parse(outData)
+        if !checks.isEmpty {
+            return Doctor.isConfigured(in: checks) ? .configured : .notConfigured
+        }
+        guard outData.isEmpty else {
+            // Что-то напечатал, но не JSON (или JSON без единой проверки) — не
+            // разобрать. Секретов тут по построению нет — doctor печатает про
+            // токен только «задан/пуст», не сам токен (см. Doctor.Check) —
+            // обрезаем по объёму, а не вычищаем содержимое.
+            let raw = String(data: outData, encoding: .utf8) ?? "<не UTF-8>"
+            return .checkFailed(reason: truncated("doctor вернул нераспознанный ответ: \(raw)"))
+        }
         guard task.terminationStatus == 0 else {
             let detail = firstLines(of: stderr.fileHandleForReading.readDataToEndOfFile())
             let reason = detail.isEmpty
@@ -293,18 +325,7 @@ final class BotSupervisor {
                 : "doctor завершился с кодом \(task.terminationStatus): \(detail)"
             return .checkFailed(reason: truncated(reason))
         }
-        guard !outData.isEmpty else {
-            return .checkFailed(reason: "doctor вернул пустой ответ")
-        }
-        let checks = Doctor.parse(outData)
-        guard !checks.isEmpty else {
-            // Секретов тут по построению нет — doctor печатает про токен только
-            // «задан/пуст», не сам токен (см. Doctor.Check) — обрезаем по объёму,
-            // а не вычищаем содержимое.
-            let raw = String(data: outData, encoding: .utf8) ?? "<не UTF-8>"
-            return .checkFailed(reason: truncated("doctor вернул нераспознанный ответ: \(raw)"))
-        }
-        return Doctor.isConfigured(in: checks) ? .configured : .notConfigured
+        return .checkFailed(reason: "doctor вернул пустой ответ")
     }
 
     /// Первые несколько строк вывода для причины в логе/меню — не весь вывод: он
@@ -593,7 +614,7 @@ final class BotSupervisor {
         }
 
         state = .crashed(reason: "упал, перезапуск через \(Int(delay)) с")
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        scheduleRestart(delay) { [weak self] in
             guard let self, self.process == nil, !self.stopRequested else { return }
             self.start()
         }
