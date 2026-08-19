@@ -238,17 +238,21 @@ final class BotSupervisor {
     }
 
     func start() {
-        guard isConfigured() else {
-            Log.app("start: конфига нет, бота не поднимаем")
-            state = .notConfigured
-            return
-        }
         guard process == nil else {
             // `stop()` намеренно не зануляет `process` сразу (см. её комментарий) —
             // окно между «стоп нажали» и `handleTermination` миллисекундное, но
             // повторный клик `Start bot` в это окно не должен молчать: раньше
             // здесь не оставалось ни следа в логе, ни изменения состояния.
             Log.app("start: бот уже поднят (pid \(process?.processIdentifier ?? -1)), повторный запуск игнорируем")
+            return
+        }
+        // Спрашиваем про конфиг только когда своего процесса ещё нет: если бот уже
+        // жив, он с этим конфигом и поднялся, спрашивать незачем. А спросить и не
+        // дождаться ответа `doctor` за 5с означало бы объявить «не настроено» поверх
+        // работающего бота — меню соврало бы о том, что человек видит своими глазами.
+        guard isConfigured() else {
+            Log.app("start: конфига нет, бота не поднимаем")
+            state = .notConfigured
             return
         }
         if let foreign = BotSupervisor.foreignBotPID() {
