@@ -196,10 +196,12 @@ class _Commands:
             return EXIT_ENVIRONMENT
         try:
             return asyncio.run(_run_setup(paths.config_file()))
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
             # Ctrl+C во время asyncio.run прилетает в кадр цикла, а не в
             # приостановленную корутину — try/except внутри неё это не ловит.
-            # Ловим тут, чтобы человек увидел сообщение, а не трейсбек.
+            # Ctrl+D — EOFError прямо из input()/getpass.getpass, у пяти
+            # вопросов визарда; человек, привыкший выходить им, иначе получил
+            # бы трейсбек вместо «Прервано». Ловим оба тут одним сообщением.
             print("\nПрервано.", file=sys.stderr)
             return EXIT_ENVIRONMENT
 
@@ -657,6 +659,14 @@ async def _stop(target: str) -> str | None:
     return None
 
 
+def _allowed_user_id_detail(value: int) -> str:
+    if value > 0:
+        return "задан"
+    if value == 0:
+        return "не задан"
+    return "должен быть положительным числом"
+
+
 def _diagnose() -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     for binary in ("tmux", "claude"):
@@ -697,8 +707,13 @@ def _diagnose() -> list[dict[str, Any]]:
     checks.append(
         {
             "name": "allowed_user_id",
-            "ok": config.allowed_user_id != 0,
-            "detail": "задан" if config.allowed_user_id else "не задан",
+            # То же правило, что и в визарде (_ask_user_id): Telegram user_id
+            # всегда положительный. Расхождение здесь означало, что doctor
+            # признавал конфиг с отрицательным id годным, приложение поднимало
+            # бота — а _is_authorized не совпадал никогда, и бот молча никому
+            # не отвечал.
+            "ok": config.allowed_user_id > 0,
+            "detail": _allowed_user_id_detail(config.allowed_user_id),
         }
     )
     checks.append(

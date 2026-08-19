@@ -356,6 +356,43 @@ def test_doctor_all_green(
     assert all(check["ok"] for check in payload["checks"])
 
 
+def test_doctor_rejects_negative_allowed_user_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Тот же критерий, что и у визарда (_ask_user_id): Telegram user_id всегда
+    # положительный. Расхождение означало бы, что doctor признаёт конфиг
+    # годным, приложение поднимает бота, а _is_authorized не совпадает
+    # никогда — бот молча никому не отвечает.
+    config = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    config.write_text(f'bot_token = "x"\nallowed_user_id = -100500\nrc_roots = ["{root}"]\n')
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli.paths, "config_file", lambda: config)
+
+    assert cli.main(["doctor", "--json"]) == 2
+    payload: dict[str, Any] = json.loads(capsys.readouterr().out)
+    names = {check["name"]: check for check in payload["checks"]}
+    assert names["allowed_user_id"]["ok"] is False
+
+
+def test_doctor_zero_allowed_user_id_still_reported_as_not_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    config.write_text(f'bot_token = "x"\nallowed_user_id = 0\nrc_roots = ["{root}"]\n')
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli.paths, "config_file", lambda: config)
+
+    assert cli.main(["doctor", "--json"]) == 2
+    payload: dict[str, Any] = json.loads(capsys.readouterr().out)
+    names = {check["name"]: check for check in payload["checks"]}
+    assert names["allowed_user_id"]["ok"] is False
+    assert names["allowed_user_id"]["detail"] == "не задан"
+
+
 def test_doctor_never_prints_the_token(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -693,6 +730,57 @@ def test_setup_ctrl_c_during_autopickup_exits_cleanly(
 
     assert cli.main(["setup"]) == cli.EXIT_ENVIRONMENT
     assert "Traceback" not in capsys.readouterr().err
+    assert not target.exists()
+
+
+def test_setup_ctrl_d_on_token_prompt_exits_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # input()/getpass.getpass бросают EOFError на Ctrl+D — человек, привыкший
+    # выходить им, иначе получил бы трейсбек вместо "Прервано".
+    target = tmp_path / "config.toml"
+
+    def eof(prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli.getpass, "getpass", eof)
+
+    assert cli.main(["setup"]) == cli.EXIT_ENVIRONMENT
+    err = capsys.readouterr().err
+    assert "Прервано" in err
+    assert "Traceback" not in err
+    assert not target.exists()
+
+
+def test_setup_ctrl_d_on_user_id_prompt_exits_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    # Бот "найден" — автоподхват не предложится, input() дойдёт прямо до
+    # вопроса про user_id.
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(4242, True))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": token)
+
+    def eof(prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == cli.EXIT_ENVIRONMENT
+    err = capsys.readouterr().err
+    assert "Прервано" in err
+    assert "Traceback" not in err
     assert not target.exists()
 
 
