@@ -589,12 +589,24 @@ async def _ask_user_id(current: int | None, token: str, *, config_exists: bool) 
     hint = f" [{current}]" if current else ""
     for _ in range(_ATTEMPTS):
         raw = input(f"Твой Telegram user_id{hint}: ").strip()
-        if not raw and current:
+        # current > 0: сохранённое значение тоже могло быть 0 или отрицательным
+        # (правки руками, старая версия визарда без этой проверки) — Enter не
+        # должен молча увековечить уже битое значение.
+        if not raw and current is not None and current > 0:
             return current
         try:
-            return int(raw)
+            value = int(raw)
         except ValueError:
             print("  ✗ нужно число. Узнать своё: напиши @userinfobot.")
+            continue
+        # Telegram user_id всегда положительный. int(raw) охотно принял бы и 0,
+        # и отрицательное число — визард сказал бы «Готово», а бот с таким
+        # id никогда бы не ответил владельцу: человек не узнал бы, что что-то
+        # не так, до следующего письма в поддержку.
+        if value <= 0:
+            print("  ✗ Telegram id всегда положительный. Узнать своё: напиши @userinfobot.")
+            continue
+        return value
     print("user_id не получен.", file=sys.stderr)
     return None
 

@@ -1446,3 +1446,113 @@ def test_current_answers_survives_wrong_typed_technical_field(tmp_path: Path) ->
     target = tmp_path / "config.toml"
     target.write_text('bot_token = "123456:x"\nallowed_user_id = 1\nscan_depth = ["a", "b"]\n')
     assert cli._current_answers(target) is None
+
+
+def test_setup_rejects_zero_user_id_then_accepts_valid_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # int(raw) охотно принял бы 0: doctor считает allowed_user_id == 0
+    # непригодным конфигом — визард сказал бы "Готово" про заведомо
+    # нерабочий результат.
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    # токен, «n» на автоподхват, «0» (первая из _ATTEMPTS=2 попыток отвергнута),
+    # настоящий id второй попыткой, каталоги
+    answers = iter([token, "n", "0", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_setup_rejects_negative_user_id_then_accepts_valid_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # int(raw) охотно принял бы и отрицательное число — с ним бот просто
+    # никогда не ответит владельцу, а человек об этом не узнает.
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    answers = iter([token, "n", "-5", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_setup_zero_user_id_exhausts_attempts_without_writing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    # токен, «n» на автоподхват, «0», «-5» — обе попытки (_ATTEMPTS = 2) битые
+    answers = iter([token, "n", "0", "-5"])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == cli.EXIT_ENVIRONMENT
+    assert not target.exists()
+    assert "положительный" in capsys.readouterr().out.lower()
+
+
+def test_setup_does_not_keep_a_previously_stored_invalid_user_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Конфиг с allowed_user_id = 0 мог появиться до этой правки (или руками) —
+    # пустой ответ ("оставить как было") не должен увековечивать уже битое
+    # значение молча.
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+    target.write_text(f'bot_token = "{token}"\nallowed_user_id = 0\nrc_roots = ["{root}"]\n')
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    # токен пустой (оставить), пустой ответ на user_id (не должен пройти,
+    # т.к. current=0 не положительный), настоящий id, каталоги — пусто (оставить)
+    answers = iter(["", "", "42", ""])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert cli.load_config(target).allowed_user_id == 42

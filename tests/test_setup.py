@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 from aiogram.exceptions import (
+    ClientDecodeError,
     TelegramConflictError,
     TelegramNetworkError,
     TelegramRetryAfter,
@@ -212,6 +213,13 @@ class _FakeBot:
             raise TelegramRetryAfter(method=GetMe(), message="Too Many Requests", retry_after=30)
         if self.behaviour == "server_error":
             raise TelegramServerError(method=GetMe(), message="Internal Server Error")
+        if self.behaviour == "captive_portal":
+            # Реальный случай: гостиничный/кафешный вайфай с формой входа или
+            # прокси отдаёт HTML вместо JSON-ответа Telegram — aiogram заворачивает
+            # это в ClientDecodeError (client/session/base.py:check_response).
+            raise ClientDecodeError(
+                "Failed to decode object", ValueError("Expecting value"), "<html>captive</html>"
+            )
         return _FakeMe("my_test_bot")
 
     async def session_close(self) -> None:
@@ -272,6 +280,21 @@ async def test_verify_token_does_not_blame_the_token_for_server_error(
     # 5xx (TelegramServerError, включая RestartingTelegram) — тоже не про
     # токен, а про временную неполадку на стороне Telegram.
     monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeBot(token, "server_error"))
+    check = await setup.verify_token("123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890")
+    assert check.ok is False
+    assert check.offline is True
+    assert "отверг" not in check.detail.lower()
+
+
+async def test_verify_token_treats_undecodable_response_as_no_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Captive portal (гостиничный/кафешный вайфай с формой входа) или прокси,
+    # отдающий HTML вместо JSON, — самая обычная ситуация при настройке не
+    # дома. aiogram заворачивает такой ответ в ClientDecodeError, который не
+    # наследует ни TelegramNetworkError, ни OSError — раньше падал в
+    # catch-all и человеку говорили "Telegram отверг токен".
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeBot(token, "captive_portal"))
     check = await setup.verify_token("123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890")
     assert check.ok is False
     assert check.offline is True

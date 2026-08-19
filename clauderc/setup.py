@@ -145,6 +145,7 @@ async def verify_token(token: str) -> TokenCheck:
     # Ленивый импорт: aiogram — самая тяжёлая часть импорта этого модуля
     # (~1.5с), а verify_token зовут не всегда, что этот вызов и оправдывает.
     from aiogram.exceptions import (
+        ClientDecodeError,
         TelegramNetworkError,
         TelegramRetryAfter,
         TelegramServerError,
@@ -157,12 +158,18 @@ async def verify_token(token: str) -> TokenCheck:
     bot = _make_bot(token)
     try:
         me = await bot.get_me()
-    except (TelegramNetworkError, OSError):
-        # aiogram заворачивает обрыв сети (таймаут, ClientError) в
-        # TelegramNetworkError — голый OSError он не пропускает никогда, но
-        # ловим и его на случай других версий и подмен в тестах. Текст
-        # исключения в сообщение не кладём по той же причине, что и ниже:
-        # он может содержать токен.
+    except (TelegramNetworkError, ClientDecodeError, OSError):
+        # Разобрал по исходникам aiogram (client/session/{aiohttp,base}.py) весь
+        # путь get_me(), а не угадал — это третий раз, когда чиним один и тот же
+        # класс ошибки. TelegramNetworkError — aiohttp.ClientError/TimeoutError
+        # уже завёрнуты aiogram'ом. ClientDecodeError — HTTP-ответ пришёл, но
+        # это не протокол Telegram: captive portal (вайфай отеля/кафе с формой
+        # входа вместо ответа), прокси, отдающий HTML вместо JSON. В обоих
+        # случаях поговорить с настоящим Telegram не вышло — та же природа, что
+        # и обрыв связи, а не отказ токена. OSError голым aiogram не бросает
+        # никогда, но ловим на случай других версий и подмен в тестах. Текст
+        # исключения не кладём в сообщение по той же причине, что и ниже: он
+        # может содержать токен.
         return TokenCheck(False, None, True, "нет связи с Telegram")
     except TelegramRetryAfter as exc:
         # 429 — сам Telegram ограничил частоту запросов, токен ни при чём.
