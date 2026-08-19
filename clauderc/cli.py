@@ -21,6 +21,7 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from clauderc import browse as browse  # is_repo — общая проверка «это git-репозиторий»
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
 from clauderc import setup as setup  # тесты подменяют cli.setup.verify_token/catch_user_id
 from clauderc import sync as clauderc_sync  # _Commands.sync затенил бы модуль sync
@@ -223,8 +224,11 @@ class _Commands:
             print("Репозиториев не нашлось.", file=sys.stderr)
             return EXIT_ENVIRONMENT
         results = asyncio.run(_sync_all(targets, args.branch, args.fetch))
+        labels = _display_names([r.path for r in results])
         for result in results:
-            print(f"{_MARK[result.outcome]} {result.path.name}\t{result.branch}\t{result.detail}")
+            print(
+                f"{_MARK[result.outcome]} {labels[result.path]}\t{result.branch}\t{result.detail}"
+            )
         failed = sum(1 for r in results if r.outcome is clauderc_sync.Outcome.failed)
         return EXIT_FAILED if failed else 0
 
@@ -250,15 +254,41 @@ _MARK = {
 
 
 def _sync_targets(paths: list[Path]) -> list[Path]:
-    """Что синхронизировать: явные пути или репозитории в текущем каталоге."""
+    """Что синхронизировать: явные пути или репозитории в текущем каталоге.
+
+    И явные пути, и найденные сами резолвятся одинаково (`resolve()` идёт по
+    симлинкам, как `os.path.realpath` в `_stop`) — иначе символическая ссылка
+    на уже перечисленный репозиторий дала бы второй `Path` на ту же цель, и
+    `sync` прошёл бы по нему дважды под разными именами. Дубликаты по
+    физическому пути отбрасываем, сохраняя порядок первого упоминания.
+    """
     if paths:
-        return [p.expanduser().resolve() for p in paths if (p / ".git").exists()]
-    here = Path.cwd()
-    found = [child for child in sorted(here.iterdir()) if (child / ".git").exists()]
-    # Сам каталог тоже цель, если он репозиторий: `sync` внутри проекта осмыслен.
-    if (here / ".git").exists():
-        found.insert(0, here)
-    return found
+        candidates = [p.expanduser().resolve() for p in paths if browse.is_repo(p)]
+    else:
+        here = Path.cwd()
+        candidates = [child.resolve() for child in sorted(here.iterdir()) if browse.is_repo(child)]
+        # Сам каталог тоже цель, если он репозиторий: `sync` внутри проекта осмыслен.
+        if browse.is_repo(here):
+            candidates.insert(0, here.resolve())
+
+    seen: set[Path] = set()
+    targets: list[Path] = []
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            targets.append(candidate)
+    return targets
+
+
+async def _sync_one(target: Path, branch: str | None, fetch: bool) -> clauderc_sync.SyncResult:
+    """Оборачивает `sync` одного репозитория так, чтобы неожиданное исключение
+    стало `failed` только для него — иначе `asyncio.gather` уронил бы весь
+    обход, и человек не узнал бы результат по уже отработавшим репозиториям.
+    """
+    try:
+        return await clauderc_sync.sync(target, branch=branch, fetch=fetch)
+    except Exception as exc:
+        return clauderc_sync.SyncResult(target, clauderc_sync.Outcome.failed, str(exc)[:120], "?")
 
 
 async def _sync_all(
@@ -266,9 +296,29 @@ async def _sync_all(
 ) -> list[clauderc_sync.SyncResult]:
     # Параллельно: каждый репозиторий — несколько вызовов git, последовательно
     # десяток штук ждать заметно дольше.
-    return list(
-        await asyncio.gather(*(clauderc_sync.sync(t, branch=branch, fetch=fetch) for t in targets))
-    )
+    return list(await asyncio.gather(*(_sync_one(t, branch, fetch) for t in targets)))
+
+
+def _display_names(paths: list[Path]) -> dict[Path, str]:
+    """Метка на строку отчёта: имя каталога, а при совпадении с другим — плюс
+    столько родительских каталогов, сколько нужно для однозначности. Имя
+    репозитория в дереве не уникально (два клона одного репо, см. CLAUDE.md) —
+    голое `path.name` дало бы две неотличимые строки.
+    """
+    labels: dict[Path, str] = {}
+    for path in paths:
+        depth = 1
+        while True:
+            suffix = path.parts[-depth:]
+            unique = (
+                depth >= len(path.parts)
+                or sum(1 for other in paths if other.parts[-depth:] == suffix) == 1
+            )
+            if unique:
+                labels[path] = str(Path(*suffix))
+                break
+            depth += 1
+    return labels
 
 
 def _as_dict(session: RemoteSession) -> dict[str, Any]:

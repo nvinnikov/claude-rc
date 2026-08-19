@@ -1751,3 +1751,60 @@ def test_sync_accepts_explicit_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     monkeypatch.setattr(cli.sync, "sync", fake_sync)
     assert cli.main(["sync", str(repo)]) == 0
     assert seen == [repo]
+
+
+def test_sync_exception_in_one_repo_does_not_lose_the_others(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for name in ("alpha", "beta", "gamma"):
+        (tmp_path / name / ".git").mkdir(parents=True)
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        if target.name == "beta":
+            raise RuntimeError("boom")
+        return cli.sync.SyncResult(target, cli.sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["sync"]) == 1
+    out = capsys.readouterr().out
+    assert "alpha" in out and "gamma" in out
+    assert "boom" in out
+
+
+def test_sync_disambiguates_repos_with_the_same_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = tmp_path / "dirA" / "repo"
+    second = tmp_path / "dirB" / "repo"
+    for path in (first, second):
+        (path / ".git").mkdir(parents=True)
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        return cli.sync.SyncResult(target, cli.sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+
+    assert cli.main(["sync", str(first), str(second)]) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert lines[0] != lines[1]
+    assert "dirA" in lines[0] and "repo" in lines[0]
+    assert "dirB" in lines[1] and "repo" in lines[1]
+
+
+def test_sync_deduplicates_symlinked_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    (real / ".git").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    seen: list[Path] = []
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        seen.append(target)
+        return cli.sync.SyncResult(target, cli.sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    assert cli.main(["sync", str(real), str(link)]) == 0
+    assert seen == [real.resolve()]
