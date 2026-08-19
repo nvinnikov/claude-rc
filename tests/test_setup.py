@@ -3,9 +3,10 @@ from pathlib import Path
 
 import pytest
 from aiogram.exceptions import (
-    TelegramAPIError,
     TelegramConflictError,
     TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
     TelegramUnauthorizedError,
 )
 from aiogram.methods import GetMe, GetUpdates
@@ -206,7 +207,11 @@ class _FakeBot:
             # никогда не пропускает наружу.
             raise TelegramNetworkError(method=GetMe(), message="нет сети")
         if self.behaviour == "bad":
-            raise TelegramAPIError(method=GetMe(), message="Unauthorized")
+            raise TelegramUnauthorizedError(method=GetMe(), message="Unauthorized")
+        if self.behaviour == "rate_limited":
+            raise TelegramRetryAfter(method=GetMe(), message="Too Many Requests", retry_after=30)
+        if self.behaviour == "server_error":
+            raise TelegramServerError(method=GetMe(), message="Internal Server Error")
         return _FakeMe("my_test_bot")
 
     async def session_close(self) -> None:
@@ -234,6 +239,43 @@ async def test_verify_token_distinguishes_offline_from_rejected(
     rejected = await setup.verify_token("123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890")
     assert rejected.ok is False
     assert rejected.offline is False
+
+
+async def test_verify_token_rejects_only_on_real_unauthorized_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Регрессия: раньше отказ проверялся общей TelegramAPIError, а не тем
+    # классом, который реально означает "токен неверный" (401).
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeBot(token, "bad"))
+    check = await setup.verify_token("123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890")
+    assert check.ok is False
+    assert check.offline is False
+
+
+async def test_verify_token_does_not_blame_the_token_for_rate_limiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 429 (TelegramRetryAfter) — сам Telegram ограничил частоту, токен ни при
+    # чём. Раньше это тоже уходило в "Telegram отверг токен", и человек шёл
+    # перевыпускать рабочий токен у @BotFather.
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeBot(token, "rate_limited"))
+    check = await setup.verify_token("123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890")
+    assert check.ok is False
+    assert check.offline is True
+    assert "отверг" not in check.detail.lower()
+    assert "ни при чём" in check.detail.lower()
+
+
+async def test_verify_token_does_not_blame_the_token_for_server_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 5xx (TelegramServerError, включая RestartingTelegram) — тоже не про
+    # токен, а про временную неполадку на стороне Telegram.
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeBot(token, "server_error"))
+    check = await setup.verify_token("123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890")
+    assert check.ok is False
+    assert check.offline is True
+    assert "отверг" not in check.detail.lower()
 
 
 async def test_verify_token_recognizes_real_aiogram_network_error(

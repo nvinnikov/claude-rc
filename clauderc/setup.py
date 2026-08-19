@@ -135,12 +135,21 @@ async def verify_token(token: str) -> TokenCheck:
     """Спрашивает Telegram, живой ли токен.
 
     Опечатка в токене иначе превращается в крэш-луп бота, который разбирают
-    полчаса. Отсутствие сети и отказ Telegram различаются: в первом случае
-    настройку можно продолжать, во втором — бессмысленно.
+    полчаса. Различаем три исхода, не два: нет сети, временный сбой на
+    стороне Telegram (5xx, 429 — не про токен вовсе) и явный отказ токена.
+    Смешать второе с третьим — та же ошибка, что уже чинили с
+    `TelegramNetworkError`, только этажом выше: временный сбой самого
+    Telegram выглядел бы как «неверный токен», и человек шёл бы перевыпускать
+    рабочий у @BotFather.
     """
     # Ленивый импорт: aiogram — самая тяжёлая часть импорта этого модуля
     # (~1.5с), а verify_token зовут не всегда, что этот вызов и оправдывает.
-    from aiogram.exceptions import TelegramNetworkError
+    from aiogram.exceptions import (
+        TelegramNetworkError,
+        TelegramRetryAfter,
+        TelegramServerError,
+        TelegramUnauthorizedError,
+    )
 
     if not looks_like_token(token):
         return TokenCheck(False, None, False, "не похоже на токен от @BotFather")
@@ -155,9 +164,27 @@ async def verify_token(token: str) -> TokenCheck:
         # исключения в сообщение не кладём по той же причине, что и ниже:
         # он может содержать токен.
         return TokenCheck(False, None, True, "нет связи с Telegram")
+    except TelegramRetryAfter as exc:
+        # 429 — сам Telegram ограничил частоту запросов, токен ни при чём.
+        # offline=True: та же семантика, что у обрыва сети — не блокируем
+        # настройку, но говорим прямо, что дело не в токене.
+        detail = (
+            f"Telegram ограничил частоту запросов (подождать {exc.retry_after}с) — токен ни при чём"
+        )
+        return TokenCheck(False, None, True, detail)
+    except TelegramServerError:
+        # 5xx, включая RestartingTelegram — временный сбой на стороне Telegram.
+        return TokenCheck(
+            False, None, True, "Telegram сейчас отвечает ошибкой сервера — попробуй позже"
+        )
+    except TelegramUnauthorizedError:
+        # Явный и однозначный отказ токена — продолжать бессмысленно.
+        return TokenCheck(False, None, False, "Telegram отверг токен")
     except Exception:
         # Текст исключения от aiogram может содержать сам токен (он в URL) —
-        # наружу отдаём только факт отказа.
+        # наружу отдаём только факт отказа. Прочие ответы Telegram (Conflict,
+        # BadRequest и т.п.) сюда же — для getMe они не ожидаются, но раз
+        # пришли, безопаснее считать отказом, чем продолжать вслепую.
         return TokenCheck(False, None, False, "Telegram отверг токен")
     finally:
         await _close(bot)
