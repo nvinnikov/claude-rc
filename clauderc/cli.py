@@ -10,8 +10,9 @@ import argparse
 import asyncio
 import getpass as getpass  # тесты подменяют cli.getpass.getpass — см. ниже
 import json
-import os
+import os as os  # тесты подменяют cli.os.path.lexists — реэкспорт для mypy --strict
 import shutil as shutil  # тесты подменяют cli.shutil/cli.sys.stdin — реэкспорт для mypy --strict
+import subprocess
 import sys as sys
 import tomllib
 from importlib.metadata import PackageNotFoundError
@@ -260,8 +261,14 @@ async def _run_setup(target: Path) -> int:
     # Файла может не быть — тогда автоподхват user_id уместен, это первый запуск.
     # А может быть, но не читаться (например, каталог из rc_roots исчез) — тогда
     # это не первый запуск: бот, скорее всего, настроен и работает, и предлагать
-    # автоподхват нельзя (см. _ask_user_id).
-    config_exists = target.exists()
+    # автоподхват нельзя (см. _ask_user_id). lexists, а не exists: битый симлинк
+    # exists() посчитал бы отсутствующим, а O_CREAT потом запишет прямо сквозь
+    # него в цель симлинка — то есть, возможно, в чужой файл.
+    try:
+        config_exists = os.path.lexists(target)
+    except OSError as exc:
+        print(f"не удалось проверить {target}: {exc}", file=sys.stderr)
+        return EXIT_ENVIRONMENT
 
     token = await _ask_token(current.bot_token if current else None)
     if token is None:
@@ -294,13 +301,19 @@ async def _run_setup(target: Path) -> int:
 
 
 def _write_config(target: Path, content: str) -> None:
-    """Пишет файл сразу с правами 600 — без окна между записью и chmod.
+    """Пишет файл сразу с правами 600 и дожимает их, даже если файл уже был.
 
     `write_text` создаёт файл по umask (обычно 0644): до отдельного `chmod`
-    токен в нём читаем любым пользователем машины.
+    токен в нём читаем любым пользователем машины. Но и `0o600` в `os.open`
+    не панацея: этот режим действует только при *создании* файла — если
+    `config.toml` уже лежал с более широкими правами (например, от версии
+    без этой правки), `O_CREAT` их не тронет. Поэтому дожимаем `os.fchmod` по
+    дескриптору — не `os.chmod` по пути, чтобы между открытием и сужением
+    прав путь не успел подмениться (например, на симлинк).
     """
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        os.fchmod(fh.fileno(), 0o600)
         fh.write(content)
 
 
@@ -320,7 +333,7 @@ def _current_answers(target: Path) -> setup.Answers | None:
 _EXTRA_KEYS = ("worktree_root", "state_path", "scan_depth", "launch_timeout_s")
 
 
-def _current_extras(target: Path) -> dict[str, str | int | float]:
+def _current_extras(target: Path) -> dict[str, object]:
     """Поля, которые визард не спрашивает, но не должен стирать при перезаписи.
 
     Читаем сырым `tomllib`, а не через `load_config`: если `rc_roots` указывает
@@ -359,21 +372,58 @@ async def _ask_token(current: str | None) -> str | None:
     return None
 
 
+# Тот же якорь, что и в Swift-части (BotSupervisor.foreignBotPID): левая граница
+# сужена до начала строки или "/" — иначе шаблон подошёл бы под что угодно с
+# этими словами внутри, а точка в "clauderc.bot" экранирована.
+_BOT_PROCESS_PATTERN = r"(^|/)claude-rc bot$|-m clauderc\.bot$"
+
+
+def _foreign_bot_pid() -> int | None:
+    """PID уже работающего `claude-rc bot`, если такой процесс есть.
+
+    `config_exists`/`current is None` — только прокси для «бот, скорее всего,
+    работает». Это прямая проверка того факта, который на самом деле опасен:
+    поллинг рядом с живым ботом того же токена.
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-fl", _BOT_PROCESS_PATTERN],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # Тот же выбор, что в Swift-части: на решение "поднять поллинг рядом с
+        # ботом" отвечаем консервативно только когда проверка вообще сработала.
+        # Если pgrep не ответил или его нет — считаем, что чужого бота нет.
+        return None
+
+    own_pid = os.getpid()
+    for line in result.stdout.splitlines():
+        token = line.split(maxsplit=1)
+        if not token or not token[0].isdigit():
+            continue
+        pid = int(token[0])
+        if pid != own_pid:
+            return pid
+    return None
+
+
 async def _ask_user_id(current: int | None, token: str, *, config_exists: bool) -> int | None:
     # Автоподхват предлагаем только на действительно первом запуске: если файл
     # уже есть (пусть даже не читается), бот, скорее всего, настроен и работает,
     # и поллинг рядом с ним поднимет второго поллера того же токена.
-    if (
-        current is None
-        and not config_exists
-        and _agrees("Узнать твой user_id автоматически? Напишешь боту любое сообщение.")
-    ):
-        print("  Жду сообщение боту… до 2 минут, Ctrl+C — прервать.")
-        caught = await setup.catch_user_id(token)
-        if caught is not None:
-            print(f"  ✓ user_id: {caught}")
-            return caught
-        print("  Не дождался — введи вручную.")
+    if current is None and not config_exists:
+        foreign_pid = _foreign_bot_pid()
+        if foreign_pid is not None:
+            print(f"  Бот уже запущен (pid {foreign_pid}) — введи user_id вручную.")
+        elif _agrees("Узнать твой user_id автоматически? Напишешь боту любое сообщение."):
+            print("  Жду сообщение боту… до 2 минут, Ctrl+C — прервать.")
+            caught = await setup.catch_user_id(token)
+            if caught is not None:
+                print(f"  ✓ user_id: {caught}")
+                return caught
+            print("  Не дождался — введи вручную.")
 
     hint = f" [{current}]" if current else ""
     for _ in range(_ATTEMPTS):

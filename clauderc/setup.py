@@ -30,7 +30,7 @@ class Answers:
     rc_roots: tuple[Path, ...]
 
 
-def render_config(answers: Answers, *, extra: dict[str, str | int | float] | None = None) -> str:
+def render_config(answers: Answers, *, extra: dict[str, object] | None = None) -> str:
     """Текст config.toml. Значения экранируются как строки TOML.
 
     В токене есть двоеточие, а в путях может быть что угодно — склейка через
@@ -38,7 +38,9 @@ def render_config(answers: Answers, *, extra: dict[str, str | int | float] | Non
 
     `extra` — поля, которых визард не спрашивает (`worktree_root`, `scan_depth`
     и т.п.), но которые могли быть правлены руками в прежнем файле. Без них
-    повторный запуск визарда молча стирал бы такую правку.
+    повторный запуск визарда молча стирал бы такую правку. Тип каждого значения
+    неизвестен заранее (читается сырым `tomllib` в cli.py) — `_toml_value`
+    отбрасывает то, что не умеет закодировать обратно.
     """
     roots = ", ".join(_toml_string(str(root)) for root in answers.rc_roots)
     base = (
@@ -52,8 +54,12 @@ def render_config(answers: Answers, *, extra: dict[str, str | int | float] | Non
     )
     if not extra:
         return base
-    tail = "".join(f"\n{key} = {_toml_value(value)}\n" for key, value in extra.items())
-    return base + tail
+    lines = []
+    for key, value in extra.items():
+        literal = _toml_value(value)
+        if literal is not None:
+            lines.append(f"\n{key} = {literal}\n")
+    return base + "".join(lines)
 
 
 def parse_roots(raw: str, *, default: tuple[Path, ...]) -> tuple[Path, ...]:
@@ -178,11 +184,24 @@ async def _close(bot: Any) -> None:
         await session.close()
 
 
-def _toml_value(value: str | int | float) -> str:
-    """Литерал TOML для поля из `extra` — тип сохраняем как в исходном файле."""
+def _toml_value(value: object) -> str | None:
+    """Литерал TOML для поля из `extra` — тип сохраняем как в исходном файле.
+
+    `None` — значение неизвестного типа (список, таблица, дата и т.п.), которое
+    не переносим вовсе: `str(value)` дал бы синтаксис, который `tomllib` не
+    читает обратно, — лучше потерять один непонятный ключ, чем весь файл после
+    этого перестанет разбираться.
+    """
+    if isinstance(value, bool):
+        # bool — подкласс int в Python, поэтому проверяем раньше него: иначе
+        # `scan_depth = true` ушло бы как `str(True)` → `scan_depth = True`,
+        # а это не валидный TOML.
+        return "true" if value else "false"
     if isinstance(value, str):
         return _toml_string(value)
-    return str(value)
+    if isinstance(value, (int, float)):
+        return str(value)
+    return None
 
 
 def _toml_string(value: str) -> str:

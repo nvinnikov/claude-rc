@@ -394,6 +394,9 @@ def test_setup_writes_config_with_tight_permissions(
 
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    # Тесты идут вслепую относительно того, крутится ли на машине настоящий бот —
+    # без этой заглушки «n» на автоподхват уехало бы не туда, если pgrep его найдёт.
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: None)
     answers = iter([token, "n", "42", str(root)])
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
@@ -424,6 +427,7 @@ def test_setup_never_prints_the_token(
 
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: None)
     answers = iter([secret, "n", "42", str(root)])
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
@@ -476,6 +480,7 @@ def test_setup_rejects_missing_directory(
 
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: None)
     # Каталог не существует, и человек повторяет ответ — визард переспрашивает,
     # а не пишет заведомо нерабочий конфиг.
     answers = iter([token, "n", "42", str(tmp_path / "nope"), str(tmp_path / "nope")])
@@ -539,6 +544,7 @@ def test_setup_falls_back_to_manual_user_id(
     monkeypatch.setattr(cli.setup, "catch_user_id", explode)
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: None)
     # токен, «n» на автоподхват, user_id, каталоги
     answers = iter([token, "n", "42", str(root)])
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
@@ -597,6 +603,7 @@ def test_setup_ctrl_c_during_autopickup_exits_cleanly(
 
     monkeypatch.setattr(cli.setup, "catch_user_id", interrupted)
     monkeypatch.setattr(cli, "_agrees", lambda question: True)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: None)
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": token)
@@ -669,3 +676,118 @@ def test_setup_does_not_poll_when_config_exists_but_unreadable(
 
     assert cli.main(["setup"]) == 0
     assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_setup_narrows_permissions_of_preexisting_loose_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # os.open(..., O_CREAT, 0o600) выставляет режим только при СОЗДАНИИ файла —
+    # если config.toml уже лежал с более широкими правами (например, от версии
+    # до этой правки), повторный setup обязан их сузить, а не оставить как есть.
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+    target.write_text(
+        cli.setup.render_config(
+            cli.setup.Answers(bot_token=token, allowed_user_id=7, rc_roots=(root,))
+        )
+    )
+    target.chmod(0o644)
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": "")
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+def test_setup_reports_permission_error_instead_of_traceback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Каталог конфига без права на обход (`x`) роняет `Path.exists()` наружу
+    # `PermissionError` — человек должен увидеть сообщение, а не трейсбек.
+    target = tmp_path / "config.toml"
+
+    def explode(path: object) -> bool:
+        raise PermissionError("нет доступа к каталогу")
+
+    monkeypatch.setattr(cli.os.path, "lexists", explode)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+
+    assert cli.main(["setup"]) == cli.EXIT_ENVIRONMENT
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert str(target) in err
+
+
+def test_setup_skips_autopickup_when_bot_process_is_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Прокси («файла нет») недостаточно: CLAUDE_RC_CONFIG может указывать на
+    # несуществующий путь, пока бот работает с другим конфигом. Прямая проверка —
+    # найден ли живой процесс — не должна поллить, даже если бы человек согласился.
+    target = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    def explode(value: str, **kwargs: object) -> int:
+        raise AssertionError("бот уже работает — поллинг недопустим")
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", explode)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: 4242)
+    monkeypatch.setattr(cli, "_agrees", lambda question: True)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    answers = iter([token, "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_setup_offers_autopickup_when_no_bot_process_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+    called: list[str] = []
+
+    async def fake_catch(value: str, **kwargs: object) -> int:
+        called.append(value)
+        return 99
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", fake_catch)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: None)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    # токен, «y» на автоподхват, каталоги — user_id ловится автоподхватом
+    answers = iter([token, "y", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert called == [token]
+    assert cli.load_config(target).allowed_user_id == 99

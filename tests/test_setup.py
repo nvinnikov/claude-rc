@@ -77,6 +77,30 @@ def test_render_config_without_extra_matches_plain_call(tmp_path: Path) -> None:
     assert setup.render_config(_answers(root)) == setup.render_config(_answers(root), extra={})
 
 
+def test_render_config_encodes_bools_as_lowercase_toml(tmp_path: Path) -> None:
+    # bool — подкласс int в Python: наивный str(value) дал бы "True"/"False",
+    # а это не валидный TOML. Регрессия: раньше scan_depth=True ломал файл.
+    root = tmp_path / "code"
+    root.mkdir()
+    text = setup.render_config(_answers(root), extra={"scan_depth": True})
+    assert "scan_depth = true" in text
+    assert tomllib.loads(text)["scan_depth"] is True
+
+
+def test_render_config_drops_values_of_unknown_type(tmp_path: Path) -> None:
+    # Значение неизвестного типа (список, таблица и т.п.) не переносим вовсе —
+    # str(value) дал бы синтаксис, который tomllib не читает обратно, то есть
+    # визард, запущенный поправить каталоги, сделал бы файл нечитаемым насмерть.
+    root = tmp_path / "code"
+    root.mkdir()
+    text = setup.render_config(
+        _answers(root), extra={"scan_depth": 5, "rc_roots_backup": ["a", "b"]}
+    )
+    parsed = tomllib.loads(text)  # не должно бросать — файл обязан разбираться
+    assert parsed["scan_depth"] == 5
+    assert "rc_roots_backup" not in parsed
+
+
 def test_parse_roots_splits_on_comma(tmp_path: Path) -> None:
     first = tmp_path / "a"
     second = tmp_path / "b"
