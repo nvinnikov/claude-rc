@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
-from clauderc import worktrees
+from clauderc import worktrees as worktrees  # тесты подменяют cli.worktrees.ensure
 from clauderc.config import load_config
 from clauderc.remote import (
     LaunchError,
@@ -121,6 +121,18 @@ class _Commands:
         if args.resume == "":
             print("--resume не может быть пустой строкой.", file=sys.stderr)
             return EXIT_ENVIRONMENT
+        if args.branch:
+            # _start дальше зовёт load_config напрямую — без этой проверки
+            # отсутствие конфига долетает наружу как FileNotFoundError с
+            # трейсбеком вместо внятного сообщения (см. _diagnose).
+            config_path = paths.config_file()
+            if not config_path.is_file():
+                print(
+                    f"--branch нужен config.toml, а его нет: {config_path}\n"
+                    "Скопируй config.example.toml и заполни (см. README).",
+                    file=sys.stderr,
+                )
+                return EXIT_ENVIRONMENT
         try:
             session = asyncio.run(_start(target, args.branch, args.resume))
         except (LaunchError, WorktreeError) as exc:

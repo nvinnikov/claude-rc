@@ -96,7 +96,10 @@ jobs:
           echo "Скопируй в формулу и cask:"
           find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print0 \
             | xargs -0 --no-run-if-empty shasum -a 256
-      - uses: softprops/action-gh-release@v2
+      # Пин по коммиту, не по тегу: это единственная job с contents: write,
+      # и подвижный тег v2 мог бы в любой момент указать на другой код,
+      # который выполнится с правом записи в этот репозиторий.
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
         with:
           files: |
             artifacts/app-bundle/ClaudeRC.app.zip
