@@ -130,8 +130,8 @@ class _Commands:
             return EXIT_ENVIRONMENT
         if args.branch:
             # _start дальше зовёт load_config напрямую — без этой проверки
-            # отсутствие конфига долетает наружу как FileNotFoundError с
-            # трейсбеком вместо внятного сообщения (см. _diagnose).
+            # отсутствие или порча конфига долетает наружу трейсбеком вместо
+            # внятного сообщения (тот же контракт, что и в _diagnose).
             config_path = paths.config_file()
             if not config_path.is_file():
                 print(
@@ -139,6 +139,11 @@ class _Commands:
                     "Скопируй config.example.toml и заполни (см. README).",
                     file=sys.stderr,
                 )
+                return EXIT_ENVIRONMENT
+            try:
+                load_config(config_path)
+            except (ValueError, KeyError, OSError, TypeError) as exc:
+                print(f"--branch нужен рабочий config.toml: {config_path}: {exc}", file=sys.stderr)
                 return EXIT_ENVIRONMENT
         try:
             session = asyncio.run(_start(target, args.branch, args.resume))
@@ -673,7 +678,13 @@ def _diagnose() -> list[dict[str, Any]]:
 
     try:
         config = load_config(config_path)
-    except (ValueError, KeyError, OSError) as exc:
+    except (ValueError, KeyError, OSError, TypeError) as exc:
+        # TypeError — например, scan_depth в файле оказался списком, а не
+        # числом (int(raw.get("scan_depth", 3)) кидает не ValueError). Тот же
+        # довод, что и в _current_answers: doctor теперь ворота приложения —
+        # именно по его ответу оно решает, показывать ли Run setup….
+        # Необработанное исключение здесь — тот самый тупик «не настроено»
+        # без способа настроить, который этот PR и закрывает.
         checks.append({"name": "config", "ok": False, "detail": f"{config_path}: {exc}"})
         return checks
 

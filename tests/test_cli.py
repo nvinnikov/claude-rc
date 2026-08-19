@@ -137,6 +137,22 @@ def test_start_branch_without_config_fails_cleanly(
     assert "Traceback" not in err
 
 
+def test_start_branch_with_broken_config_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Файл есть (проходит is_file()), но load_config на нём падает — тот же
+    # класс дыры, что и с отсутствующим файлом, просто чуть дальше: без явной
+    # проверки исключение из _start долетает наружу трейсбеком.
+    config = tmp_path / "config.toml"
+    config.write_text('bot_token = "123456:x"\nallowed_user_id = 1\nscan_depth = ["a", "b"]\n')
+    monkeypatch.setattr(cli.paths, "config_file", lambda: config)
+
+    assert cli.main(["start", str(tmp_path), "--branch", "feature/x"]) == 2
+    err = capsys.readouterr().err
+    assert str(config) in err
+    assert "Traceback" not in err
+
+
 def test_start_branch_with_config_creates_worktree(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -373,6 +389,24 @@ def test_doctor_never_prints_the_token_on_broken_config(
     captured = capsys.readouterr()
     assert "SECRET_VALUE" not in captured.out
     assert "SECRET_VALUE" not in captured.err
+
+
+def test_doctor_reports_wrong_typed_field_instead_of_crashing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # int(raw.get("scan_depth", 3)) на списке кидает TypeError, не ValueError —
+    # doctor стал воротами приложения (по его ответу оно решает, показывать ли
+    # Run setup…): необработанное исключение здесь — тот самый тупик «не
+    # настроено» без способа настроить, который весь PR и закрывает.
+    config = tmp_path / "config.toml"
+    config.write_text('bot_token = "123456:x"\nallowed_user_id = 1\nscan_depth = ["a", "b"]\n')
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli.paths, "config_file", lambda: config)
+
+    assert cli.main(["doctor", "--json"]) == 2
+    payload: dict[str, Any] = json.loads(capsys.readouterr().out)
+    names = {check["name"]: check for check in payload["checks"]}
+    assert names["config"]["ok"] is False
 
 
 def test_agrees_default_true_accepts_empty_answer(monkeypatch: pytest.MonkeyPatch) -> None:
