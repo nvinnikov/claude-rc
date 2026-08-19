@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify version and gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-groups --frozen
+      # Единственная защита от релиза, в котором `claude-rc version` печатает
+      # не то, что написано на странице релиза.
+      - name: Tag must match pyproject version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
+          if [ "$tag" != "$version" ]; then
+            echo "Тег $GITHUB_REF_NAME не совпадает с версией $version в pyproject.toml" >&2
+            exit 1
+          fi
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Configure git
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+      - name: Format check
+        run: uv run ruff format --check .
+      - name: Lint
+        run: uv run ruff check .
+      - name: mypy --strict
+        run: uv run mypy
+      - name: pytest
+        run: uv run pytest
+
+  package:
+    name: Build python package
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-package
+          path: dist/*
+
+  bundle:
+    name: Build app bundle
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make app-test
+      - run: make app
+      # ditto, а не zip: обычный zip теряет права и симлинки бандла, и подпись
+      # после распаковки перестаёт проверяться.
+      - name: Zip bundle
+        run: ditto -c -k --keepParent app/build/ClaudeRC.app ClaudeRC.app.zip
+      # Проверяем само утверждение из комментария выше, а не полагаемся на
+      # него: распаковываем во временный каталог и валидируем подпись так же,
+      # как это сделает Gatekeeper после xattr -dr на машине пользователя.
+      - name: Verify signature survives the zip round-trip
+        run: |
+          rm -rf /tmp/verify-bundle && mkdir /tmp/verify-bundle
+          ditto -x -k ClaudeRC.app.zip /tmp/verify-bundle
+          codesign --verify --deep --strict /tmp/verify-bundle/ClaudeRC.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-bundle
+          path: ClaudeRC.app.zip
+
+  publish:
+    name: Publish release
+    needs: [package, bundle]
+    runs-on: ubuntu-latest
+    # Write-токен нужен только здесь, чтобы создать релиз. verify/package/bundle
+    # гоняют сторонние действия и всю сборку — им запись не нужна.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Checksums for the Homebrew tap
+        run: |
+          echo "Скопируй в формулу и cask:"
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print0 \
+            | xargs -0 --no-run-if-empty shasum -a 256
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/app-bundle/ClaudeRC.app.zip
+            artifacts/python-package/*
+          generate_release_notes: true

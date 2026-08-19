@@ -48,6 +48,18 @@ jobs:
       - name: pytest
         run: uv run pytest
 
+  app:
+    name: App
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Весь остальной CI живёт на ubuntu и про Swift ничего не знает: без этой
+      # job приложение ломалось бы незаметно.
+      - name: Swift tests
+        run: make app-test
+      - name: Build bundle
+        run: make app
+
   secret-scan:
     name: Secret scan
     runs-on: ubuntu-latest

@@ -1,29 +1,31 @@
 # Всё гоняется через `uv run`, чтобы окружение совпадало с локом.
 # `check` — локальное зеркало CI-гейта.
-.PHONY: install run lint format typecheck test check app app-test
+.PHONY: sync run lint format typecheck test check app app-test install install-tool install-app
 
-install:
+# Раньше называлась install, но это имя понадобилось под цель для конечного
+# пользователя (поставить тулзу и приложение) — семантика другая, совмещать нельзя.
+sync:
 	uv sync --all-groups
 
-# Цели зависят от install, чтобы на свежем клоне `make test` работал без
+# Цели зависят от sync, чтобы на свежем клоне `make test` работал без
 # отдельного шага: сам по себе `uv run` тянет только основные зависимости,
 # и ruff/mypy/pytest не нашлись бы. Повторный `uv sync` — быстрый no-op,
 # а make выполняет зависимость один раз за вызов.
-run: install
+run: sync
 	uv run claude-rc bot
 
-lint: install
+lint: sync
 	uv run ruff format --check .
 	uv run ruff check .
 
-format: install
+format: sync
 	uv run ruff format .
 	uv run ruff check --fix .
 
-typecheck: install
+typecheck: sync
 	uv run mypy
 
-test: install
+test: sync
 	uv run pytest
 
 check: lint typecheck test
@@ -42,3 +44,28 @@ app-test:
 	else \
 		swift test --package-path app; \
 	fi
+
+# Тулза нужна и сама по себе (например, на машине без графики), приложение без
+# неё бессмысленно — отсюда разделение и зависимость.
+install-tool:
+	uv tool install --force .
+
+# Шаблон заякорён так же, как в BotSupervisor.swift (foreignBotPID): голое
+# 'ClaudeRCMenu' ловит любой процесс, чья командная строка просто содержит
+# это слово — на этом классе дефекта уже теряли время. `/ClaudeRCMenu$`
+# требует, чтобы командная строка заканчивалась ровно на имя исполняемого
+# файла бандла, а не на произвольный текст с этой подстрокой. Держится на
+# допущении, что приложение стартует без аргументов (сейчас так и у Finder,
+# и у SMAppService, и у запасного LaunchAgent) — если когда-нибудь появится
+# аргумент запуска, этот `pgrep` перестанет находить процесс молча, и `cp`
+# ляжет под живой процесс.
+install-app: install-tool app
+	@if pgrep -f '/ClaudeRCMenu$$' >/dev/null; then \
+		echo "Гашу запущенное приложение: иначе cp положит файлы под работающим процессом."; \
+		pkill -f '/ClaudeRCMenu$$'; sleep 2; \
+	fi
+	rm -rf /Applications/ClaudeRC.app
+	cp -R app/build/ClaudeRC.app /Applications/ClaudeRC.app
+	@echo "Готово: /Applications/ClaudeRC.app"
+
+install: install-app
