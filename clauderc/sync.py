@@ -16,6 +16,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from clauderc.browse import is_repo
+from clauderc.remote import find as _find_session
 from clauderc.worktrees import _git
 
 
@@ -107,6 +108,14 @@ async def sync(repo: Path, *, branch: str | None = None, fetch: bool = True) -> 
         current = await status(repo) or current
 
     if branch and branch != current.branch:
+        # Живая RC-сессия работает в этом каталоге прямо сейчас: переключить
+        # под ней ветку — значит подменить рабочее дерево так, что сессия
+        # этого не заметит (mtime спасает не от всего, см. CLAUDE.md). Обычная
+        # перемотка без смены ветки сюда не попадает — ветка не меняется.
+        if await _find_session(str(repo)) is not None:
+            return SyncResult(
+                repo, Outcome.skipped, "живая RC-сессия — ветку не трогаю", current.branch
+            )
         switched = await _switch(repo, branch)
         if switched is not None:
             return switched

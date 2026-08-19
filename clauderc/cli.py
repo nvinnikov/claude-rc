@@ -16,6 +16,7 @@ import subprocess as subprocess  # тесты подменяют cli.subprocess.
 import sys as sys
 import tempfile
 import tomllib
+from collections import Counter
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
@@ -228,7 +229,14 @@ class _Commands:
             print(
                 f"{_MARK[result.outcome]} {labels[result.path]}\t{result.branch}\t{result.detail}"
             )
-        failed = sum(1 for r in results if r.outcome is clauderc_sync.Outcome.failed)
+        counts = Counter(r.outcome for r in results)
+        summary = ", ".join(
+            f"{_OUTCOME_LABEL[outcome]}: {counts[outcome]}"
+            for outcome in clauderc_sync.Outcome
+            if counts[outcome]
+        )
+        print(f"Итого — {summary}." if summary else "Итого: пусто.")
+        failed = counts[clauderc_sync.Outcome.failed]
         return EXIT_FAILED if failed else 0
 
 
@@ -249,6 +257,13 @@ _MARK = {
     clauderc_sync.Outcome.already: "=",
     clauderc_sync.Outcome.skipped: "·",
     clauderc_sync.Outcome.failed: "✗",
+}
+
+_OUTCOME_LABEL = {
+    clauderc_sync.Outcome.updated: "подтянуто",
+    clauderc_sync.Outcome.already: "актуально",
+    clauderc_sync.Outcome.skipped: "пропущено",
+    clauderc_sync.Outcome.failed: "не получилось",
 }
 
 

@@ -8,6 +8,7 @@ from collections import Counter
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -51,6 +52,7 @@ MAX_CHOICES = 8
 MAX_PROJECT_BUTTONS = 60
 MAX_TREE_CARDS = 10
 MAX_SYNC_TARGETS = 20
+MAX_BRANCH_NAME_LEN = 100
 HELP = (
     "Поднимаю сессии Claude Code с Remote Control — дальше работа в приложении Claude.\n\n"
     "<b>Куда идём</b>\n"
@@ -63,6 +65,10 @@ HELP = (
     "<b>🌿 New worktree</b> — сессия в свежем worktree, ветка по времени; "
     "так работают параллельно с уже запущенной\n"
     "<code>/rc</code> &lt;репо&gt; [ветка] — то же по имени, без хождения\n\n"
+    "<b>Синхронизация</b>\n"
+    "<b>🔄 Sync</b> на карточке <code>/pwd</code> — режим выбора репозиториев в "
+    "каталоге: галочки, «Все»/«Никого», ветка перед подтягиванием, отчёт строкой "
+    "на репозиторий\n\n"
     "<b>Что запущено</b>\n"
     "<b>💬 Chats</b> (<code>/rc</code>) — живые сессии с кнопками "
     "<b>Open in Claude</b> и <b>⏹ Stop</b>, а следом worktree, оставшиеся без сессии: "
@@ -280,6 +286,32 @@ def _projects_card(
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+_REPORT_CHUNK_CHARS = 4000  # запас от лимита Telegram в 4096 символов на сообщение
+
+
+def _chunk_report(lines: list[str], limit: int = _REPORT_CHUNK_CHARS) -> list[str]:
+    """Режет строки отчёта на части ≤`limit` символов, не разрывая строку пополам.
+
+    Двадцать репозиториев без сети дают по строке `fatal: unable to access …`
+    каждый — вместе они переваливают за лимит Telegram, и неразрезанный отчёт
+    не отправился бы вовсе.
+    """
+    chunks: list[str] = []
+    current: list[str] = []
+    length = 0
+    for line in lines:
+        added = len(line) + (1 if current else 0)  # +1 за перевод строки от join
+        if current and length + added > limit:
+            chunks.append("\n".join(current))
+            current, length = [], 0
+            added = len(line)
+        current.append(line)
+        length += added
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
 def _selected_targets(listing: list[Path], chosen: set[int]) -> list[Path]:
     """Пути, которые выбор `chosen` называет в `listing` — по возрастанию индекса.
 
@@ -302,12 +334,18 @@ def _has_repos(cwd: Path) -> bool:
         return False
 
 
-def _sync_line(status: RepoStatus, *, selected: bool, label: str) -> str:
+def _sync_line(
+    status: RepoStatus, *, selected: bool, label: str, live_session: bool = False
+) -> str:
     """Строка репозитория в режиме выбора: имя, ветка и в каком он состоянии.
 
     `label` — не `status.path.name`: при одноимённых репозиториях (два клона,
     каталог с ребёнком того же имени) имя без разрешения неоднозначности дало
     бы две неотличимые строки — тем же способом, что и в CLI (`sync.display_names`).
+
+    `live_session` — тут прямо сейчас работает RC-сессия: `sync.sync` не станет
+    переключать ей ветку из-под ног (см. clauderc/sync.py), и об этом стоит
+    предупредить до тапа «Ветка», а не после тихого пропуска в отчёте.
     """
     box = "☑" if selected else "☐"
     marks = []
@@ -318,6 +356,8 @@ def _sync_line(status: RepoStatus, *, selected: bool, label: str) -> str:
     if status.ahead:
         marks.append(f"↑{status.ahead}")
     marks.append("✎" if status.dirty else "✓")
+    if live_session:
+        marks.append("🔒")
     return (
         f"{box} <b>{html.escape(label)}</b> "
         f"<code>{html.escape(status.branch)}</code> {' '.join(marks)}"
@@ -561,15 +601,39 @@ async def main() -> None:
         for token in [t for t, mid in branch_pending.items() if mid == message_id]:
             branch_pending.pop(token, None)
 
+    def _migrate_sync_state(old_id: int, new_id: int) -> None:
+        """Переносит состояние карточки на новый message_id — теми же значениями.
+
+        Нужно, когда `_sync_render` не смог отредактировать исходное сообщение
+        (не «не изменилось» — настоящая ошибка) и прислал карточку заново: без
+        переноса кнопки нового сообщения отвечали бы «Список устарел», включая
+        «Отмена».
+        """
+        if old_id == new_id:
+            return
+        if old_id in sync_selection:
+            sync_selection[new_id] = sync_selection.pop(old_id)
+        if old_id in sync_listing:
+            sync_listing[new_id] = sync_listing.pop(old_id)
+        if old_id in sync_branch:
+            sync_branch[new_id] = sync_branch.pop(old_id)
+        if old_id in sync_cwd:
+            sync_cwd[new_id] = sync_cwd.pop(old_id)
+        for token, mid in list(branch_pending.items()):
+            if mid == old_id:
+                branch_pending[token] = new_id
+
     async def _sync_render(
         chat_id: int, message_id: int, text: str, keyboard: InlineKeyboardMarkup | None
-    ) -> None:
-        """Отрисовать карточку, а не промолчать при сбое.
+    ) -> int:
+        """Отрисовать карточку. Возвращает id сообщения, где она реально оказалась.
 
-        Второй тап по уже отражённому состоянию (например «Никого» при пустом
-        выборе) даёт от Telegram `message is not modified` — тем же способом,
-        что и в `on_nav`, в этом случае просто присылаем карточку новым
-        сообщением вместо падения без следа.
+        «Не изменилось» (второй тап по уже показанному состоянию, например
+        «Никого» при пустом выборе) — штатный случай, не ошибка: Telegram
+        отказывает редактировать тем же содержимым, и здесь просто ничего не
+        делаем — на экране и так верно. При настоящей ошибке редактирования
+        шлём карточку новым сообщением; вызывающий обязан перенести состояние
+        на вернувшийся id, если оно ведётся по message_id (см. `sync_card`).
         """
         try:
             await bot.edit_message_text(
@@ -579,8 +643,12 @@ async def main() -> None:
                 parse_mode="HTML",
                 reply_markup=keyboard,
             )
-        except Exception:
-            await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+            return message_id
+        except Exception as exc:
+            if isinstance(exc, TelegramBadRequest) and "not modified" in exc.message.lower():
+                return message_id
+            sent = await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+            return sent.message_id
 
     async def sync_card(chat_id: int, message_id: int, cwd: Path) -> None:
         """(Пере)рисовать карточку выбора репозиториев для конкретного сообщения."""
@@ -613,15 +681,30 @@ async def main() -> None:
             )
             return
 
+        # Один вызов tmux на всю карточку, не на репозиторий: `sync` не станет
+        # переключать ветку там, где сессия уже работает (clauderc/sync.py),
+        # и это стоит показать до тапа «Ветка», а не после тихого skip в отчёте.
+        occupied = {os.path.realpath(s.cwd) for s in await list_sessions()}
+
         labels = sync_mod.display_names(listing)
         lines = [f"🔄 <code>{html.escape(str(cwd))}</code>"]
         rows: list[list[InlineKeyboardButton]] = []
+        shown = False
         for index, (path, repo_status) in enumerate(zip(listing, statuses, strict=True)):
             if repo_status is None:
                 continue
+            shown = True
             label = labels[path]
-            lines.append(_sync_line(repo_status, selected=index in chosen, label=label))
+            live = os.path.realpath(str(path)) in occupied
+            lines.append(
+                _sync_line(repo_status, selected=index in chosen, label=label, live_session=live)
+            )
             rows.append([InlineKeyboardButton(text=label, callback_data=f"sync:{index}")])
+        if shown:
+            # ↓/↑ считаются по последнему известному origin/* — без fetch они
+            # не свежее последнего похода в сеть, и это главное, ради чего
+            # карточку открывают.
+            lines.append("<i>↓/↑ — на момент последнего fetch, не сейчас.</i>")
         if truncated:
             lines.append(f"…показал первые {MAX_SYNC_TARGETS}.")
 
@@ -645,9 +728,10 @@ async def main() -> None:
                 InlineKeyboardButton(text="Отмена", callback_data="sync:cancel"),
             ]
         )
-        await _sync_render(
+        rendered_id = await _sync_render(
             chat_id, message_id, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
         )
+        _migrate_sync_state(message_id, rendered_id)
 
     async def run_sync(message: Message) -> None:
         listing = sync_listing.get(message.message_id) or []
@@ -660,17 +744,25 @@ async def main() -> None:
         branch = sync_branch.get(message.message_id) or None
         notice = await message.answer(f"⏳ Подтягиваю: {len(targets)}…")
 
-        # sync_one, а не sync: одно исключение не должно уронить весь gather и
-        # оставить «⏳ Подтягиваю…» висеть навсегда без отчёта по остальным.
-        results = await asyncio.gather(
-            *(sync_mod.sync_one(path, branch=branch) for path in targets)
-        )
-        labels = sync_mod.display_names(targets)
-        await notice.edit_text(
-            "\n".join(_sync_report_line(r, label=labels[r.path]) for r in results),
-            parse_mode="HTML",
-        )
-        _drop_sync_state(message.message_id)
+        try:
+            # sync_one, а не sync: одно исключение не должно уронить весь gather
+            # и оставить «⏳ Подтягиваю…» висеть навсегда без отчёта по остальным.
+            results = await asyncio.gather(
+                *(sync_mod.sync_one(path, branch=branch) for path in targets)
+            )
+            labels = sync_mod.display_names(targets)
+            lines = [_sync_report_line(r, label=labels[r.path]) for r in results]
+            # Без сети 15-20 репозиториев дают по строке `fatal: unable to
+            # access …` каждый и переваливают за лимит Telegram в 4096 символов
+            # на сообщение — тогда отчёт режем на части, а не теряем целиком.
+            chunks = _chunk_report(lines) or ["Пусто."]
+            await _sync_render(notice.chat.id, notice.message_id, chunks[0], None)
+            for extra in chunks[1:]:
+                await bot.send_message(notice.chat.id, extra, parse_mode="HTML")
+        finally:
+            # Отчёт мог не дойти (сеть, Telegram) — но работа уже сделана, и
+            # держать карточку с галочками ради недоставленного текста не за чем.
+            _drop_sync_state(message.message_id)
 
     @dp.message(lambda event: not _is_authorized(event.from_user, config.allowed_user_id))
     async def reject_strangers(message: Message) -> None:
@@ -1090,7 +1182,8 @@ async def main() -> None:
             chosen.clear()
         elif action == "branch":
             prompt = await message.answer(
-                "Пришли имя ветки одним сообщением или <code>-</code>, чтобы остаться на текущей.",
+                "Пришли имя ветки <b>ответом на это сообщение</b> "
+                "или <code>-</code>, чтобы остаться на текущей.",
                 parse_mode="HTML",
                 reply_markup=ForceReply(
                     force_reply=True, selective=True, input_field_placeholder="имя ветки или -"
@@ -1129,7 +1222,9 @@ async def main() -> None:
         if card_id is None:
             return
         text = (message.text or "").strip()
-        sync_branch[card_id] = "" if text == "-" else text
+        # Без обрезки длинное имя уезжает в текст кнопки «Ветка: …», и Telegram
+        # отвергает отрисовку карточки целиком.
+        sync_branch[card_id] = "" if text == "-" else text[:MAX_BRANCH_NAME_LEN]
         await sync_card(message.chat.id, card_id, state.cwd)
 
     async def on_died(died: Died) -> None:

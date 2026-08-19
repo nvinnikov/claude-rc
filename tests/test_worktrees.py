@@ -97,6 +97,20 @@ async def test_git_disables_terminal_prompt(monkeypatch: pytest.MonkeyPatch, rep
     assert env.get("GIT_TERMINAL_PROMPT") == "0"
 
 
+async def test_ensure_worktree_add_uses_its_own_longer_timeout(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, tmp_path: Path
+) -> None:
+    # `worktree add` — полный чекаут дерева, не короткий локальный запрос;
+    # общий _GIT_TIMEOUT_S (30с) для него мал на крупном репозитории. Раз
+    # укоротив _GIT_TIMEOUT_S до микроскопического значения, убеждаемся, что
+    # `ensure` от этого не пострадал — значит, add идёт по отдельному таймауту.
+    monkeypatch.setattr(worktrees, "_GIT_TIMEOUT_S", 0.001)
+
+    path = await worktrees.ensure(repo, "feature-x", tmp_path / "wt")
+
+    assert (path / "README.md").exists()
+
+
 async def test_ensure_creates_worktree_on_new_branch(repo: Path, tmp_path: Path) -> None:
     root = tmp_path / "wt"
 

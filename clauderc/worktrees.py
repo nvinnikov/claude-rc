@@ -16,12 +16,18 @@ from pathlib import Path
 _SLUG = re.compile(r"[^A-Za-z0-9_-]+")
 _ERROR_TAIL = 400
 
-# Локальные вызовы (status, rev-parse, worktree add) укладываются в миллисекунды —
-# даже на большом репозитории это разовая операция с диском. Сетевые (fetch, pull)
-# на разумном канале отрабатывают за секунды, редко за десятки секунд; 30с — щедрый
+# Локальные вызовы (status, rev-parse) укладываются в миллисекунды — даже на
+# большом репозитории это разовая операция с диском. Сетевые (fetch, pull) на
+# разумном канале отрабатывают за секунды, редко за десятки секунд; 30с — щедрый
 # запас для честного fetch, но не бесконечность, на которой зависнет хендлер бота,
 # пока человек ждёт ответа в телефоне.
 _GIT_TIMEOUT_S = 30.0
+
+# `worktree add` — не «локальный» вызов в смысле выше: это полный чекаут дерева,
+# и на крупном репозитории 30с не всегда хватает. Таймаут там убивает процесс
+# посреди чекаута и оставляет полусозданный worktree, зарегистрированный в git —
+# поэтому у записывающей операции свой, куда более щедрый запас.
+_WORKTREE_ADD_TIMEOUT_S = 180.0
 
 
 class WorktreeError(RuntimeError):
@@ -63,7 +69,11 @@ def generate_branch(now: float | None = None) -> str:
     return "wt/" + time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
 
 
-async def _git(cwd: Path, *args: str) -> tuple[int, str]:
+async def _git(cwd: Path, *args: str, timeout_s: float | None = None) -> tuple[int, str]:
+    # timeout_s=None — не значение по умолчанию в сигнатуре: значение читается
+    # из _GIT_TIMEOUT_S на каждом вызове, а не один раз при загрузке модуля —
+    # иначе monkeypatch по имени константы (см. тест на таймаут) не сработал бы.
+    effective_timeout = _GIT_TIMEOUT_S if timeout_s is None else timeout_s
     # GIT_TERMINAL_PROMPT=0 — приватный репозиторий не должен ждать пароль, который
     # никто не введёт: без него git завершится ошибкой сразу, а не молча повиснет.
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
@@ -77,11 +87,11 @@ async def _git(cwd: Path, *args: str) -> tuple[int, str]:
         env=env,
     )
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_GIT_TIMEOUT_S)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=effective_timeout)
     except TimeoutError:
         proc.kill()
         await proc.wait()
-        return 1, f"git не ответил за {_GIT_TIMEOUT_S:.0f}с — прерван"
+        return 1, f"git не ответил за {effective_timeout:.0f}с — прерван"
     return proc.returncode or 0, out.decode("utf-8", "replace")
 
 
@@ -96,10 +106,15 @@ async def ensure(repo: Path, branch: str, root: Path) -> Path:
 
     root.mkdir(parents=True, exist_ok=True)
     # Сначала пробуем существующую ветку — git сам подхватит remote-only через DWIM.
-    # Не вышло — создаём новую от текущего HEAD.
-    code, out_existing = await _git(repo, "worktree", "add", str(path), branch)
+    # Не вышло — создаём новую от текущего HEAD. Свой, больший таймаут: это полный
+    # чекаут дерева, а не короткий локальный запрос (см. _WORKTREE_ADD_TIMEOUT_S).
+    code, out_existing = await _git(
+        repo, "worktree", "add", str(path), branch, timeout_s=_WORKTREE_ADD_TIMEOUT_S
+    )
     if code != 0:
-        code, out_new = await _git(repo, "worktree", "add", "-b", branch, str(path))
+        code, out_new = await _git(
+            repo, "worktree", "add", "-b", branch, str(path), timeout_s=_WORKTREE_ADD_TIMEOUT_S
+        )
         if code != 0:
             detail = out_new.strip() or out_existing.strip()
             raise WorktreeError(detail[-_ERROR_TAIL:])

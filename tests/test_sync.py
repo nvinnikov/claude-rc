@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 from clauderc import sync
+from clauderc.remote import RemoteSession
 
 
 def _run(cwd: Path, *args: str) -> str:
@@ -163,6 +164,44 @@ async def test_sync_switches_to_existing_local_branch(tmp_path: Path) -> None:
     result = await sync.sync(clone, branch="dev")
 
     assert result.branch == "dev"
+    assert _run(clone, "rev-parse", "--abbrev-ref", "HEAD").strip() == "dev"
+
+
+async def test_sync_skips_branch_switch_when_live_session_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Живая RC-сессия могла бы не заметить подмену рабочего дерева под собой —
+    # branch-switch там тихо переключал бы репозиторий мимо панели tmux, и
+    # (см. И-2 в ревью) через worktree это ещё и снимало бы блокировку wtrm.
+    _, clone = _make_origin_and_clone(tmp_path)
+    _run(clone, "branch", "dev")
+
+    async def fake_find(cwd: str) -> RemoteSession | None:
+        return RemoteSession(name="x", tmux_name="rc-x", cwd=cwd, url="", created_at=0)
+
+    monkeypatch.setattr(sync, "_find_session", fake_find)
+
+    result = await sync.sync(clone, branch="dev")
+
+    assert result.outcome is sync.Outcome.skipped
+    assert "сесси" in result.detail.lower()
+    assert _run(clone, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+
+
+async def test_sync_switches_branch_when_no_live_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Обычный случай (без живой сессии) не должен пострадать от нового чека.
+    _, clone = _make_origin_and_clone(tmp_path)
+    _run(clone, "branch", "dev")
+
+    async def fake_find(cwd: str) -> RemoteSession | None:
+        return None
+
+    monkeypatch.setattr(sync, "_find_session", fake_find)
+
+    await sync.sync(clone, branch="dev")
+
     assert _run(clone, "rev-parse", "--abbrev-ref", "HEAD").strip() == "dev"
 
 

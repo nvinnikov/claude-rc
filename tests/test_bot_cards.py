@@ -4,6 +4,7 @@ from pathlib import Path
 from clauderc import bot as bot_module
 from clauderc.bot import (
     ResumeChoice,
+    _chunk_report,
     _died_text,
     _has_repos,
     _pop_resume_group,
@@ -88,7 +89,7 @@ def test_no_direct_kill_calls_bypass_watcher() -> None:
     """
     source = Path(bot_module.__file__).read_text(encoding="utf-8")
     offenders = _DIRECT_KILL.findall(source)
-    assert not offenders, offenders
+    assert not offenders, f"нашёл гашение мимо watcher: {offenders}"
 
 
 def _status(**kwargs: object) -> RepoStatus:
@@ -183,3 +184,34 @@ def test_selected_targets_drops_indices_the_listing_no_longer_has() -> None:
 def test_selected_targets_empty_selection_or_listing() -> None:
     assert _selected_targets([], {0, 1}) == []
     assert _selected_targets([Path("/repos/a")], set()) == []
+
+
+def test_sync_line_marks_live_session() -> None:
+    line = _sync_line(_status(), selected=False, label="alpha", live_session=True)
+    assert "🔒" in line
+    assert "🔒" not in _sync_line(_status(), selected=False, label="alpha")
+
+
+def test_chunk_report_keeps_short_report_in_one_chunk() -> None:
+    lines = ["a" * 10, "b" * 10, "c" * 10]
+    assert _chunk_report(lines) == ["\n".join(lines)]
+
+
+def test_chunk_report_splits_by_char_limit() -> None:
+    lines = ["x" * 30 for _ in range(5)]
+    chunks = _chunk_report(lines, limit=70)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert len(chunk) <= 70
+
+
+def test_chunk_report_never_splits_a_single_line() -> None:
+    # Строка длиннее лимита не имеет права разорваться пополам — целиком в
+    # свой собственный кусок, даже если этот кусок сам переваливает лимит.
+    long_line = "y" * 200
+    chunks = _chunk_report(["short", long_line, "short2"], limit=50)
+    assert long_line in chunks
+
+
+def test_chunk_report_empty_input() -> None:
+    assert _chunk_report([]) == []

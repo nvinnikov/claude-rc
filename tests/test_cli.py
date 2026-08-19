@@ -1707,6 +1707,29 @@ def test_sync_reports_one_line_per_repo(
     assert "alpha" in out and "beta" in out
 
 
+def test_sync_prints_summary_at_the_end(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Спека («CLI»): «вывод — строка на репозиторий, в конце сводка».
+    alpha, beta, gamma = tmp_path / "alpha", tmp_path / "beta", tmp_path / "gamma"
+    for path in (alpha, beta, gamma):
+        (path / ".git").mkdir(parents=True)
+
+    async def fake_sync(repo: Path, **kwargs: object) -> cli.sync.SyncResult:
+        outcome = cli.sync.Outcome.failed if repo.name == "gamma" else cli.sync.Outcome.updated
+        return cli.sync.SyncResult(repo, outcome, "ok", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["sync"]) == 1
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(lines) == 4  # три репозитория плюс сводка
+    assert "Итого" in lines[-1]
+    assert "подтянуто: 2" in lines[-1]
+    assert "не получилось: 1" in lines[-1]
+
+
 def test_sync_returns_one_when_something_failed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1788,10 +1811,11 @@ def test_sync_disambiguates_repos_with_the_same_name(
 
     assert cli.main(["sync", str(first), str(second)]) == 0
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    assert len(lines) == 2
-    assert lines[0] != lines[1]
-    assert "dirA" in lines[0] and "repo" in lines[0]
-    assert "dirB" in lines[1] and "repo" in lines[1]
+    repo_lines, summary_lines = lines[:2], lines[2:]
+    assert repo_lines[0] != repo_lines[1]
+    assert "dirA" in repo_lines[0] and "repo" in repo_lines[0]
+    assert "dirB" in repo_lines[1] and "repo" in repo_lines[1]
+    assert summary_lines and "Итого" in summary_lines[0]
 
 
 def test_sync_deduplicates_symlinked_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
