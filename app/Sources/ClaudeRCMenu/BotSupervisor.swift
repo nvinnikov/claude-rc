@@ -9,6 +9,9 @@ enum BotState {
     /// текст внутри `crashed`: меню должно уметь показать пункт восстановления
     /// без разбора строки причины.
     case foreignBotRunning(pid: Int32)
+    /// Конфига нет или он неполон. Отдельный случай, а не `crashed`: крэш-луп
+    /// из трёх попыток не сообщает причину и выглядит как поломка.
+    case notConfigured
 }
 
 /// Показывать ли в меню пункт «забрать бота себе» — только когда рядом реально
@@ -212,7 +215,34 @@ final class BotSupervisor {
         return "pid \(pid) ppid \(ppid) comm \(name)"
     }
 
+    /// Спрашивает `claude-rc doctor --json`. Таймаут — как у остальных внешних
+    /// вызовов: подвешенная тулза не должна морозить меню-бар.
+    func isConfigured() -> Bool {
+        let task = Process()
+        task.executableURL = cli
+        task.arguments = ["doctor", "--json"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        task.environment = CLILocator.childEnvironment(base: ProcessInfo.processInfo.environment)
+
+        let exited = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in exited.signal() }
+        guard (try? task.run()) != nil else { return false }
+        guard exited.wait(timeout: .now() + 5) == .success else {
+            task.terminate()
+            Log.app("isConfigured: doctor не ответил за 5с")
+            return false
+        }
+        return Doctor.isConfigured(in: Doctor.parse(pipe.fileHandleForReading.readDataToEndOfFile()))
+    }
+
     func start() {
+        guard isConfigured() else {
+            Log.app("start: конфига нет, бота не поднимаем")
+            state = .notConfigured
+            return
+        }
         guard process == nil else {
             // `stop()` намеренно не зануляет `process` сразу (см. её комментарий) —
             // окно между «стоп нажали» и `handleTermination` миллисекундное, но

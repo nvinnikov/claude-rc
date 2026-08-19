@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusRow = NSMenuItem(title: "Bot: stopped", action: nil, keyEquivalent: "")
     private let toggleRow = NSMenuItem(title: "Start bot", action: nil, keyEquivalent: "")
     private let takeOverRow = NSMenuItem(title: "Take over bot", action: nil, keyEquivalent: "")
+    private let setupRow = NSMenuItem(title: "Run setup…", action: nil, keyEquivalent: "")
     private let configRow = NSMenuItem(title: "Reveal config", action: nil, keyEquivalent: "")
     private let loginRow = NSMenuItem(title: "Launch at login", action: nil, keyEquivalent: "")
     private let loginNoteRow = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -111,6 +112,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleRow.target = self
         menu.addItem(toggleRow)
 
+        setupRow.action = #selector(runSetup)
+        setupRow.target = self
+        setupRow.isHidden = true
+        menu.addItem(setupRow)
+
         takeOverRow.action = #selector(takeOverBot)
         takeOverRow.target = self
         takeOverRow.isHidden = true
@@ -147,6 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         render(supervisor?.state ?? .crashed(reason: stalledReason))
         configRow.isEnabled = cli != nil
+        setupRow.isHidden = !isNotConfigured(supervisor?.state)
         loginRow.state = LoginItem.isEnabled ? .on : .off
         renderLoginNote()
     }
@@ -187,6 +194,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusRow.title = "Bot: уже запущен вне приложения, pid \(pid)"
             toggleRow.title = "Start bot"
             toggleRow.isEnabled = cli != nil
+        case .notConfigured:
+            statusRow.title = "Bot: not configured"
+            toggleRow.title = "Start bot"
+            toggleRow.isEnabled = false
         }
         takeOverRow.isHidden = !showsTakeOverRow(for: state)
         takeOverRow.title = takeOverRowTitle(for: state) ?? takeOverRow.title
@@ -235,6 +246,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func takeOverBot() {
         supervisor?.takeOver()
+    }
+
+    @objc private func runSetup() {
+        guard let cli else { return }
+        // Открываем Терминал, а не запускаем визард внутри: он интерактивный,
+        // а у приложения нет ни stdin, ни места, где показать вопросы.
+        let script = "clear; \(cli.path) setup"
+        let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-rc-setup.command")
+        try? "#!/bin/sh\n\(script)\n".write(to: temp, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: temp.path)
+        NSWorkspace.shared.open(
+            [temp], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration()
+        )
     }
 
     @objc private func openLog() {
@@ -314,4 +340,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginRow.state = LoginItem.isEnabled ? .on : .off
         renderLoginNote()
     }
+}
+
+func isNotConfigured(_ state: BotState?) -> Bool {
+    if case .notConfigured = state { return true }
+    return false
 }
