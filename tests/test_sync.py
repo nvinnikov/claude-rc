@@ -1,6 +1,7 @@
 import subprocess
 from pathlib import Path
 
+import pytest
 from clauderc import sync
 
 
@@ -236,3 +237,105 @@ async def test_sync_without_fetch_does_not_reach_network(tmp_path: Path) -> None
     # недоступен и результат был бы failed, а не skipped.
     assert result.outcome is sync.Outcome.skipped
     assert "fetch" in result.detail.lower()
+
+
+def test_list_repos_includes_cwd_itself_when_repo(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "child" / ".git").mkdir(parents=True)
+
+    result = sync.list_repos(tmp_path)
+
+    assert result[0] == tmp_path.resolve()
+    assert tmp_path.resolve() / "child" in result
+
+
+def test_list_repos_dedupes_symlink_to_already_listed_repo(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / ".git").mkdir()
+    (tmp_path / "link").symlink_to(real)
+
+    result = sync.list_repos(tmp_path)
+
+    assert result == [real.resolve()]
+
+
+def test_resolve_targets_falls_back_to_process_cwd(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "alpha" / ".git").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    assert sync.resolve_targets([]) == [tmp_path.resolve() / "alpha"]
+
+
+def test_resolve_targets_filters_and_dedupes_explicit_paths(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    not_repo = tmp_path / "plain"
+    not_repo.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(repo)
+
+    result = sync.resolve_targets([repo, not_repo, link])
+
+    assert result == [repo.resolve()]
+
+
+def test_display_names_disambiguates_same_named_repos() -> None:
+    paths = [Path("/x/dirA/repo"), Path("/x/dirB/repo")]
+    labels = sync.display_names(paths)
+    assert labels[paths[0]] != labels[paths[1]]
+    assert "repo" in labels[paths[0]] and "repo" in labels[paths[1]]
+
+
+def test_display_names_keeps_bare_name_when_unique() -> None:
+    labels = sync.display_names([Path("/x/alpha"), Path("/y/beta")])
+    assert labels[Path("/x/alpha")] == "alpha"
+    assert labels[Path("/y/beta")] == "beta"
+
+
+async def test_sync_one_turns_exception_into_failed_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def boom(repo: Path, **kwargs: object) -> sync.SyncResult:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(sync, "sync", boom)
+
+    result = await sync.sync_one(tmp_path)
+
+    assert result.outcome is sync.Outcome.failed
+    assert "boom" in result.detail
+
+
+async def test_sync_all_keeps_other_results_when_one_repo_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def flaky(repo: Path, **kwargs: object) -> sync.SyncResult:
+        if repo.name == "beta":
+            raise RuntimeError("boom")
+        return sync.SyncResult(repo, sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(sync, "sync", flaky)
+    targets = [Path("/repos/alpha"), Path("/repos/beta"), Path("/repos/gamma")]
+
+    results = await sync.sync_all(targets)
+
+    outcomes = {r.path.name: r.outcome for r in results}
+    assert outcomes["alpha"] is sync.Outcome.already
+    assert outcomes["beta"] is sync.Outcome.failed
+    assert outcomes["gamma"] is sync.Outcome.already
+
+
+def test_resolve_targets_expands_tilde_before_checking_is_repo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Раньше is_repo проверялся до expanduser() — `sync ~/repo` не находил цель,
+    # хотя `~/repo/.git` реально существовал.
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert sync.resolve_targets([Path("~/repo")]) == [repo.resolve()]

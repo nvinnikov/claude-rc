@@ -8,6 +8,7 @@ from clauderc.bot import (
     _has_repos,
     _pop_resume_group,
     _resume_keyboard,
+    _selected_targets,
     _sync_line,
     _sync_report_line,
 )
@@ -105,34 +106,41 @@ def _status(**kwargs: object) -> RepoStatus:
 
 
 def test_sync_line_marks_selection() -> None:
-    assert _sync_line(_status(), selected=True).startswith("☑")
-    assert _sync_line(_status(), selected=False).startswith("☐")
+    assert _sync_line(_status(), selected=True, label="alpha").startswith("☑")
+    assert _sync_line(_status(), selected=False, label="alpha").startswith("☐")
 
 
 def test_sync_line_shows_behind_and_ahead() -> None:
-    assert "↓3" in _sync_line(_status(behind=3), selected=False)
-    assert "↑2" in _sync_line(_status(ahead=2), selected=False)
+    assert "↓3" in _sync_line(_status(behind=3), selected=False, label="alpha")
+    assert "↑2" in _sync_line(_status(ahead=2), selected=False, label="alpha")
 
 
 def test_sync_line_marks_dirty_and_clean() -> None:
-    assert "✎" in _sync_line(_status(dirty=True), selected=False)
-    assert "✓" in _sync_line(_status(), selected=False)
+    assert "✎" in _sync_line(_status(dirty=True), selected=False, label="alpha")
+    assert "✓" in _sync_line(_status(), selected=False, label="alpha")
 
 
 def test_sync_line_marks_missing_upstream() -> None:
-    assert "⚠" in _sync_line(_status(upstream=None), selected=False)
+    assert "⚠" in _sync_line(_status(upstream=None), selected=False, label="alpha")
 
 
 def test_sync_line_escapes_html() -> None:
-    line = _sync_line(_status(path=Path("/repos/a&b"), branch="<x>"), selected=False)
+    line = _sync_line(_status(branch="<x>"), selected=False, label="a&b")
     assert "&amp;" in line
     assert "<x>" not in line
+
+
+def test_sync_line_uses_disambiguated_label_not_bare_name() -> None:
+    # Одноимённые репозитории (два клона, ребёнок с тем же именем) неотличимы
+    # по `path.name` — строка обязана показывать переданный label, а не имя.
+    line = _sync_line(_status(path=Path("/repos/dirA/repo")), selected=False, label="dirA/repo")
+    assert "dirA/repo" in line
 
 
 def test_sync_report_line_covers_every_outcome() -> None:
     for outcome in Outcome:
         result = SyncResult(Path("/repos/alpha"), outcome, "причина", "main")
-        assert "alpha" in _sync_report_line(result)
+        assert "alpha" in _sync_report_line(result, label="alpha")
 
 
 def test_has_repos_detects_repo_child(tmp_path: Path) -> None:
@@ -150,3 +158,28 @@ def test_has_repos_sees_worktree_gitfile(tmp_path: Path) -> None:
     (child / ".git").write_text("gitdir: /elsewhere\n")
 
     assert _has_repos(tmp_path) is True
+
+
+def test_has_repos_true_when_cwd_itself_is_a_repo(tmp_path: Path) -> None:
+    # Карточка Sync показывает и сам каталог, если он репозиторий (см. list_repos) —
+    # кнопка должна появляться и тогда, даже без единого репозитория-ребёнка.
+    (tmp_path / ".git").mkdir()
+
+    assert _has_repos(tmp_path) is True
+
+
+def test_selected_targets_maps_indices_in_order() -> None:
+    listing = [Path("/repos/a"), Path("/repos/b"), Path("/repos/c")]
+    assert _selected_targets(listing, {2, 0}) == [Path("/repos/a"), Path("/repos/c")]
+
+
+def test_selected_targets_drops_indices_the_listing_no_longer_has() -> None:
+    # Листинг мог измениться между отрисовкой карточки и тапом (другой каталог,
+    # исчезнувший репозиторий) — индексы вне диапазона не должны попасть в цели.
+    listing = [Path("/repos/a")]
+    assert _selected_targets(listing, {0, 1, 5}) == [Path("/repos/a")]
+
+
+def test_selected_targets_empty_selection_or_listing() -> None:
+    assert _selected_targets([], {0, 1}) == []
+    assert _selected_targets([Path("/repos/a")], set()) == []

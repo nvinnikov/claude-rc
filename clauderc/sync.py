@@ -10,10 +10,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from clauderc.browse import is_repo
 from clauderc.worktrees import _git
 
 
@@ -147,6 +149,81 @@ async def _switch(repo: Path, branch: str) -> SyncResult | None:
 
     code, out = await _git(repo, "switch", "--quiet", "-c", branch, "--track", f"origin/{branch}")
     return None if code == 0 else SyncResult(repo, Outcome.failed, _short(out), branch)
+
+
+async def sync_one(repo: Path, *, branch: str | None = None, fetch: bool = True) -> SyncResult:
+    """Оборачивает `sync` одного репозитория так, чтобы неожиданное исключение
+    стало `failed` только для него — иначе `asyncio.gather` уронил бы весь
+    обход, и ни бот, ни CLI не показали бы результат по уже отработавшим репо.
+    """
+    try:
+        return await sync(repo, branch=branch, fetch=fetch)
+    except Exception as exc:
+        return SyncResult(repo, Outcome.failed, str(exc)[:120], "?")
+
+
+async def sync_all(
+    targets: list[Path], *, branch: str | None = None, fetch: bool = True
+) -> list[SyncResult]:
+    # Параллельно: каждый репозиторий — несколько вызовов git, последовательно
+    # десяток штук ждать заметно дольше.
+    return list(await asyncio.gather(*(sync_one(t, branch=branch, fetch=fetch) for t in targets)))
+
+
+def _dedupe(paths: list[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in paths:
+        if path not in seen:
+            seen.add(path)
+            result.append(path)
+    return result
+
+
+def list_repos(cwd: Path) -> list[Path]:
+    """Репозитории в каталоге: он сам (если репозиторий) и его прямые дети.
+
+    Резолвится и дедуплицируется по физическому пути тем же способом, что
+    `resolve_targets` — иначе бот и CLI показали бы разные списки для одного
+    и того же дерева (символическая ссылка на уже перечисленный репозиторий
+    дала бы второй `Path` на ту же цель).
+    """
+    candidates = [child.resolve() for child in sorted(cwd.iterdir()) if is_repo(child)]
+    if is_repo(cwd):
+        candidates.insert(0, cwd.resolve())
+    return _dedupe(candidates)
+
+
+def resolve_targets(paths: list[Path]) -> list[Path]:
+    """Что синхронизировать: явные пути или репозитории в текущем каталоге процесса."""
+    if paths:
+        # is_repo — после expanduser: иначе `sync ~/repo` проверял бы буквальный
+        # путь `~/repo` (без `.git` в нём) и молча выбрасывал бы цель из списка.
+        expanded = [p.expanduser() for p in paths]
+        return _dedupe([p.resolve() for p in expanded if is_repo(p)])
+    return list_repos(Path.cwd())
+
+
+def display_names(paths: list[Path]) -> dict[Path, str]:
+    """Метка на строку отчёта: имя каталога, а при совпадении с другим — плюс
+    столько родительских каталогов, сколько нужно для однозначности. Имя
+    репозитория в дереве не уникально (два клона одного репо, см. CLAUDE.md) —
+    голое `path.name` дало бы две неотличимые строки.
+    """
+    labels: dict[Path, str] = {}
+    for path in paths:
+        depth = 1
+        while True:
+            suffix = path.parts[-depth:]
+            unique = (
+                depth >= len(path.parts)
+                or sum(1 for other in paths if other.parts[-depth:] == suffix) == 1
+            )
+            if unique:
+                labels[path] = str(Path(*suffix))
+                break
+            depth += 1
+    return labels
 
 
 def _short(output: str) -> str:
