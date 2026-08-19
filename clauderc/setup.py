@@ -30,14 +30,18 @@ class Answers:
     rc_roots: tuple[Path, ...]
 
 
-def render_config(answers: Answers) -> str:
+def render_config(answers: Answers, *, extra: dict[str, str | int | float] | None = None) -> str:
     """Текст config.toml. Значения экранируются как строки TOML.
 
     В токене есть двоеточие, а в путях может быть что угодно — склейка через
     кавычки рано или поздно даст файл, который не читается.
+
+    `extra` — поля, которых визард не спрашивает (`worktree_root`, `scan_depth`
+    и т.п.), но которые могли быть правлены руками в прежнем файле. Без них
+    повторный запуск визарда молча стирал бы такую правку.
     """
     roots = ", ".join(_toml_string(str(root)) for root in answers.rc_roots)
-    return (
+    base = (
         "# Создан `claude-rc setup`. Правь руками, если нужно.\n\n"
         "# Токен бота от @BotFather.\n"
         f"bot_token = {_toml_string(answers.bot_token)}\n\n"
@@ -46,6 +50,10 @@ def render_config(answers: Answers) -> str:
         "# Где искать репозитории. Сами корни тоже валидные цели.\n"
         f"rc_roots = [{roots}]\n"
     )
+    if not extra:
+        return base
+    tail = "".join(f"\n{key} = {_toml_value(value)}\n" for key, value in extra.items())
+    return base + tail
 
 
 def parse_roots(raw: str, *, default: tuple[Path, ...]) -> tuple[Path, ...]:
@@ -168,6 +176,13 @@ async def _close(bot: Any) -> None:
     session = getattr(bot, "session", None)
     if session is not None:
         await session.close()
+
+
+def _toml_value(value: str | int | float) -> str:
+    """Литерал TOML для поля из `extra` — тип сохраняем как в исходном файле."""
+    if isinstance(value, str):
+        return _toml_string(value)
+    return str(value)
 
 
 def _toml_string(value: str) -> str:

@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass as getpass  # тесты подменяют cli.getpass.getpass — см. ниже
 import json
 import os
 import shutil as shutil  # тесты подменяют cli.shutil/cli.sys.stdin — реэкспорт для mypy --strict
 import sys as sys
+import tomllib
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
@@ -185,7 +187,14 @@ class _Commands:
                 file=sys.stderr,
             )
             return EXIT_ENVIRONMENT
-        return asyncio.run(_run_setup(paths.config_file()))
+        try:
+            return asyncio.run(_run_setup(paths.config_file()))
+        except KeyboardInterrupt:
+            # Ctrl+C во время asyncio.run прилетает в кадр цикла, а не в
+            # приостановленную корутину — try/except внутри неё это не ловит.
+            # Ловим тут, чтобы человек увидел сообщение, а не трейсбек.
+            print("\nПрервано.", file=sys.stderr)
+            return EXIT_ENVIRONMENT
 
 
 class _TrustDeclined(RuntimeError):
@@ -248,12 +257,19 @@ _ATTEMPTS = 2
 async def _run_setup(target: Path) -> int:
     """Спрашивает три значения и пишет config.toml."""
     current = _current_answers(target)
+    # Файла может не быть — тогда автоподхват user_id уместен, это первый запуск.
+    # А может быть, но не читаться (например, каталог из rc_roots исчез) — тогда
+    # это не первый запуск: бот, скорее всего, настроен и работает, и предлагать
+    # автоподхват нельзя (см. _ask_user_id).
+    config_exists = target.exists()
 
     token = await _ask_token(current.bot_token if current else None)
     if token is None:
-        return EXIT_FAILED
+        return EXIT_ENVIRONMENT
 
-    user_id = await _ask_user_id(current.allowed_user_id if current else None, token)
+    user_id = await _ask_user_id(
+        current.allowed_user_id if current else None, token, config_exists=config_exists
+    )
     if user_id is None:
         return EXIT_ENVIRONMENT
 
@@ -266,9 +282,8 @@ async def _run_setup(target: Path) -> int:
     answers = setup.Answers(bot_token=token, allowed_user_id=user_id, rc_roots=roots)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(setup.render_config(answers))
-        # 0600: в файле боевой токен бота.
-        target.chmod(0o600)
+        target.parent.chmod(0o700)
+        _write_config(target, setup.render_config(answers, extra=_current_extras(target)))
     except OSError as exc:
         print(f"не удалось записать {target}: {exc}", file=sys.stderr)
         return EXIT_FAILED
@@ -278,8 +293,19 @@ async def _run_setup(target: Path) -> int:
     return 0
 
 
+def _write_config(target: Path, content: str) -> None:
+    """Пишет файл сразу с правами 600 — без окна между записью и chmod.
+
+    `write_text` создаёт файл по umask (обычно 0644): до отдельного `chmod`
+    токен в нём читаем любым пользователем машины.
+    """
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(content)
+
+
 def _current_answers(target: Path) -> setup.Answers | None:
-    """Что уже настроено. Битый конфиг — то же, что его отсутствие."""
+    """Что уже настроено. Битый конфиг — то же, что его отсутствие для этих трёх полей."""
     try:
         config = load_config(target)
     except (OSError, ValueError, KeyError):
@@ -291,10 +317,31 @@ def _current_answers(target: Path) -> setup.Answers | None:
     )
 
 
+_EXTRA_KEYS = ("worktree_root", "state_path", "scan_depth", "launch_timeout_s")
+
+
+def _current_extras(target: Path) -> dict[str, str | int | float]:
+    """Поля, которые визард не спрашивает, но не должен стирать при перезаписи.
+
+    Читаем сырым `tomllib`, а не через `load_config`: если `rc_roots` указывает
+    на исчезнувший каталог, `load_config` падает целиком, а эти поля к
+    `rc_roots` отношения не имеют и читаются нормально.
+    """
+    try:
+        with target.open("rb") as fh:
+            raw = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return {key: raw[key] for key in _EXTRA_KEYS if key in raw}
+
+
 async def _ask_token(current: str | None) -> str | None:
     hint = f" [{setup.mask_token(current)}]" if current else ""
     for _ in range(_ATTEMPTS):
-        raw = input(f"Токен бота от @BotFather{hint}: ").strip()
+        # getpass, а не input: обычный ввод остаётся в scrollback панели и в
+        # tmux capture-pane — а весь проект как раз построен вокруг чтения
+        # панелей через tmux.
+        raw = getpass.getpass(f"Токен бота от @BotFather{hint}: ").strip()
         token = raw or (current or "")
         if not token:
             print("Токен нужен: заведи бота у @BotFather и вставь сюда.")
@@ -312,15 +359,17 @@ async def _ask_token(current: str | None) -> str | None:
     return None
 
 
-async def _ask_user_id(current: int | None, token: str) -> int | None:
-    if current is None and _agrees(
-        "Узнать твой user_id автоматически? Напишешь боту любое сообщение."
+async def _ask_user_id(current: int | None, token: str, *, config_exists: bool) -> int | None:
+    # Автоподхват предлагаем только на действительно первом запуске: если файл
+    # уже есть (пусть даже не читается), бот, скорее всего, настроен и работает,
+    # и поллинг рядом с ним поднимет второго поллера того же токена.
+    if (
+        current is None
+        and not config_exists
+        and _agrees("Узнать твой user_id автоматически? Напишешь боту любое сообщение.")
     ):
-        print("  Жду сообщение боту… до 2 минут, Ctrl+C — ввести вручную.")
-        try:
-            caught = await setup.catch_user_id(token)
-        except KeyboardInterrupt:
-            caught = None
+        print("  Жду сообщение боту… до 2 минут, Ctrl+C — прервать.")
+        caught = await setup.catch_user_id(token)
         if caught is not None:
             print(f"  ✓ user_id: {caught}")
             return caught

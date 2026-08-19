@@ -47,6 +47,36 @@ def test_render_config_keeps_several_roots(tmp_path: Path) -> None:
     assert parsed["rc_roots"] == [str(first), str(second)]
 
 
+def test_render_config_appends_extra_fields_with_toml_types(tmp_path: Path) -> None:
+    # extra — поля, которых визард не спрашивает (worktree_root, scan_depth и
+    # т.п.), но которые визард обязан переносить из прежнего файла при
+    # перезаписи. Строки и числа должны остаться строками и числами в TOML,
+    # а не превратиться друг в друга.
+    root = tmp_path / "code"
+    root.mkdir()
+    text = setup.render_config(
+        _answers(root),
+        extra={
+            "worktree_root": "~/.claude-rc/worktrees",
+            "scan_depth": 5,
+            "launch_timeout_s": 45.0,
+        },
+    )
+    parsed = tomllib.loads(text)
+    assert parsed["worktree_root"] == "~/.claude-rc/worktrees"
+    assert parsed["scan_depth"] == 5
+    assert parsed["launch_timeout_s"] == 45.0
+
+
+def test_render_config_without_extra_matches_plain_call(tmp_path: Path) -> None:
+    # extra=None и отсутствие аргумента вовсе обязаны давать один и тот же файл —
+    # старые вызовы (cli.py до этой правки, тесты) не должны почувствовать разницу.
+    root = tmp_path / "code"
+    root.mkdir()
+    assert setup.render_config(_answers(root)) == setup.render_config(_answers(root), extra=None)
+    assert setup.render_config(_answers(root)) == setup.render_config(_answers(root), extra={})
+
+
 def test_parse_roots_splits_on_comma(tmp_path: Path) -> None:
     first = tmp_path / "a"
     second = tmp_path / "b"

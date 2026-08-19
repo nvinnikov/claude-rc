@@ -395,6 +395,7 @@ def test_setup_writes_config_with_tight_permissions(
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
     answers = iter([token, "n", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
     async def fake_verify(value: str) -> cli.setup.TokenCheck:
@@ -405,6 +406,8 @@ def test_setup_writes_config_with_tight_permissions(
     assert cli.main(["setup"]) == 0
     assert target.is_file()
     assert oct(target.stat().st_mode & 0o777) == "0o600"
+    # Каталог конфига тоже не должен быть доступен на чтение чужим пользователям.
+    assert oct(target.parent.stat().st_mode & 0o777) == "0o700"
 
     config = cli.load_config(target)
     assert config.allowed_user_id == 42
@@ -422,6 +425,7 @@ def test_setup_never_prints_the_token(
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
     answers = iter([secret, "n", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
     async def fake_verify(value: str) -> cli.setup.TokenCheck:
@@ -450,6 +454,7 @@ def test_setup_keeps_existing_values_on_empty_answers(
 
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": "")
     monkeypatch.setattr("builtins.input", lambda prompt="": "")
 
     async def fake_verify(value: str) -> cli.setup.TokenCheck:
@@ -474,6 +479,7 @@ def test_setup_rejects_missing_directory(
     # Каталог не существует, и человек повторяет ответ — визард переспрашивает,
     # а не пишет заведомо нерабочий конфиг.
     answers = iter([token, "n", "42", str(tmp_path / "nope"), str(tmp_path / "nope")])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
     async def fake_verify(value: str) -> cli.setup.TokenCheck:
@@ -507,6 +513,7 @@ def test_setup_does_not_poll_when_user_id_already_known(
     monkeypatch.setattr(cli.setup, "catch_user_id", explode)
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": "")
     monkeypatch.setattr("builtins.input", lambda prompt="": "")
 
     async def fake_verify(value: str) -> cli.setup.TokenCheck:
@@ -534,6 +541,125 @@ def test_setup_falls_back_to_manual_user_id(
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
     # токен, «n» на автоподхват, user_id, каталоги
     answers = iter([token, "n", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_setup_rerun_keeps_hand_edited_scan_depth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # scan_depth визард не спрашивает — раньше повторный запуск с Enter на все
+    # вопросы молча стирал его, откатывая правку из README на дефолт.
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+    target.write_text(
+        cli.setup.render_config(
+            cli.setup.Answers(bot_token=token, allowed_user_id=7, rc_roots=(root,)),
+            extra={"scan_depth": 5},
+        )
+    )
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": "")
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert cli.load_config(target).scan_depth == 5
+
+
+def test_setup_ctrl_c_during_autopickup_exits_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Ctrl+C во время ожидания сообщения не должен ронять визард трейсбеком —
+    # подсказка обещает только «прервать», а не гарантированный переход к
+    # ручному вводу (asyncio.run Ctrl+C ловится не там, где кажется).
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    def interrupted(value: str, **kwargs: object) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", interrupted)
+    monkeypatch.setattr(cli, "_agrees", lambda question: True)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": token)
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == cli.EXIT_ENVIRONMENT
+    assert "Traceback" not in capsys.readouterr().err
+    assert not target.exists()
+
+
+def test_setup_rejected_token_and_missing_user_id_share_exit_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Обе причины отказаться — не приняли токен, не назвали user_id — одной
+    # природы: человек не смог ответить. Код возврата должен быть одинаковым.
+    target = tmp_path / "config.toml"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": "not-a-token")
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(False, None, False, "Telegram отверг токен")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == cli.EXIT_ENVIRONMENT
+    assert not target.exists()
+
+
+def test_setup_does_not_poll_when_config_exists_but_unreadable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Самая частая причина перезапустить визард — конфиг перестал читаться (например,
+    # каталог из rc_roots исчез), а не то, что его вообще не было. Это тоже сигнал
+    # «бот, скорее всего, настроен и работает» — автоподхват не должен предлагаться,
+    # даже если бы человек на него согласился, иначе рядом с работающим ботом
+    # поднимется второй поллер того же токена.
+    target = tmp_path / "config.toml"
+    missing_root = tmp_path / "gone"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+    target.write_text(
+        f'bot_token = "{token}"\nallowed_user_id = 7\nrc_roots = ["{missing_root}"]\n'
+    )
+
+    def explode(value: str, **kwargs: object) -> int:
+        raise AssertionError("поллинг при существующем, но битом конфиге недопустим")
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", explode)
+    # Форсируем согласие: без него баг маскируется случайным несовпадением ответа
+    # с «да», а фикс обязан пропускать вопрос вовсе — независимо от ответа.
+    monkeypatch.setattr(cli, "_agrees", lambda question: True)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+
+    root = tmp_path / "code"
+    root.mkdir()
+    answers = iter([token, "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
     async def fake_verify(value: str) -> cli.setup.TokenCheck:
