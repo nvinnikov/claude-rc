@@ -99,6 +99,59 @@ import Testing
         #expect(!isNotConfigured(supervisor.state))
     }
 
+    /// Три сценария ниже проверяют не заглушку, а настоящий `BotSupervisor.checkConfigured`
+    /// static-метод — через реальный, хоть и игрушечный, дочерний процесс (`cli` не
+    /// подменяется, используется `init`-дефолт). До прошлой правки все три ветки
+    /// (ненулевой код, пустой stdout, мусор вместо JSON) читались как `.notConfigured`:
+    /// доктор что-то ответил, а разбор молча превращался в пустой список проверок,
+    /// неотличимый от честного "конфига нет".
+    @MainActor
+    @Suite struct RealDoctorFailureModes {
+        @Test func nonZeroExitCodeGivesCheckFailed() async throws {
+            let cli = try makeFakeDoctorCLI(doctorBody: "echo 'кина не будет' >&2; exit 3")
+            defer { try? FileManager.default.removeItem(at: cli) }
+            let supervisor = makeSupervisorWithRealDoctorCheck(cli: cli)
+
+            supervisor.start()
+            try await settle(supervisor)
+
+            guard case .configurationCheckFailed(let reason) = supervisor.state else {
+                Issue.record("ожидали .configurationCheckFailed, получили \(supervisor.state)")
+                return
+            }
+            #expect(reason.contains("3"))
+            #expect(reason.contains("кина не будет"))
+        }
+
+        @Test func emptyStdoutGivesCheckFailed() async throws {
+            let cli = try makeFakeDoctorCLI(doctorBody: "exit 0")
+            defer { try? FileManager.default.removeItem(at: cli) }
+            let supervisor = makeSupervisorWithRealDoctorCheck(cli: cli)
+
+            supervisor.start()
+            try await settle(supervisor)
+
+            guard case .configurationCheckFailed = supervisor.state else {
+                Issue.record("ожидали .configurationCheckFailed, получили \(supervisor.state)")
+                return
+            }
+        }
+
+        @Test func garbageInsteadOfJSONGivesCheckFailed() async throws {
+            let cli = try makeFakeDoctorCLI(doctorBody: "echo 'определённо не json'; exit 0")
+            defer { try? FileManager.default.removeItem(at: cli) }
+            let supervisor = makeSupervisorWithRealDoctorCheck(cli: cli)
+
+            supervisor.start()
+            try await settle(supervisor)
+
+            guard case .configurationCheckFailed = supervisor.state else {
+                Issue.record("ожидали .configurationCheckFailed, получили \(supervisor.state)")
+                return
+            }
+        }
+    }
+
     @Test func repeatedStartDuringCheckDoesNotDoubleCheck() async throws {
         let counter = CallCounter()
         let release = DispatchSemaphore(value: 0)
@@ -336,6 +389,22 @@ private func makeSupervisor(
     )
 }
 
+/// Как `makeSupervisor`, но БЕЗ подмены `checkConfigured` — гоняет настоящий
+/// `BotSupervisor.checkConfigured(cli:)` static-метод через реальный (хоть и
+/// игрушечный) дочерний процесс `cli`. Нужен только для `RealDoctorFailureModes`:
+/// разбор кода возврата/stdout/stderr — часть самого static-метода, заглушкой
+/// его не проверить.
+@MainActor
+private func makeSupervisorWithRealDoctorCheck(
+    cli: URL,
+    detectForeignBot: @escaping @MainActor () -> Int32? = { nil }
+) -> BotSupervisor {
+    let logURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("claude-rc-test-\(UUID().uuidString)")
+        .appendingPathComponent("claude-rc.log")
+    return BotSupervisor(cli: cli, logURL: logURL, detectForeignBot: detectForeignBot)
+}
+
 /// Скрипт-заглушка вместо настоящего бота: просто спит `duration` секунд. Safe
 /// stand-in, чтобы проверить переход в `.running` и его дальнейшую судьбу, не трогая
 /// ни tmux, ни Telegram, ни реального бота, который может уже работать на машине.
@@ -344,6 +413,24 @@ private func makeFakeBotScript(duration: Int = 5) throws -> URL {
     let url = FileManager.default.temporaryDirectory
         .appendingPathComponent("claude-rc-test-bot-\(UUID().uuidString)")
     try "#!/bin/sh\nsleep \(duration)\n".write(to: url, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    return url
+}
+
+/// Фейковый `cli`, отвечающий только на `doctor` — до `bot` в сценариях
+/// `RealDoctorFailureModes` дело не доходит: любой из трёх исходов (ненулевой
+/// код, пустой stdout, мусор) обязан остановить `continueStart` раньше.
+@MainActor
+private func makeFakeDoctorCLI(doctorBody: String) throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("claude-rc-test-cli-\(UUID().uuidString)")
+    let script = """
+        #!/bin/sh
+        if [ "$1" = "doctor" ]; then
+            \(doctorBody)
+        fi
+        """
+    try script.write(to: url, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     return url
 }

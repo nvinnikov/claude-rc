@@ -265,9 +265,10 @@ final class BotSupervisor {
         let task = Process()
         task.executableURL = cli
         task.arguments = ["doctor", "--json"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        task.standardOutput = stdout
+        task.standardError = stderr
         task.environment = CLILocator.childEnvironment(base: ProcessInfo.processInfo.environment)
 
         let exited = DispatchSemaphore(value: 0)
@@ -279,8 +280,48 @@ final class BotSupervisor {
             task.terminate()
             return .checkFailed(reason: "doctor не ответил за 5с")
         }
-        let checks = Doctor.parse(pipe.fileHandleForReading.readDataToEndOfFile())
+
+        let outData = stdout.fileHandleForReading.readDataToEndOfFile()
+        // Отработал, но не так, как ожидалось, — тоже «проверить не удалось», а не
+        // «конфига нет»: ненулевой код, пустой stdout и мусор вместо JSON смешивались
+        // с честным ответом доктора в один и тот же .notConfigured, отправляя человека
+        // проходить визард заново там, где сломан не конфиг, а сама тулза.
+        guard task.terminationStatus == 0 else {
+            let detail = firstLines(of: stderr.fileHandleForReading.readDataToEndOfFile())
+            let reason = detail.isEmpty
+                ? "doctor завершился с кодом \(task.terminationStatus)"
+                : "doctor завершился с кодом \(task.terminationStatus): \(detail)"
+            return .checkFailed(reason: truncated(reason))
+        }
+        guard !outData.isEmpty else {
+            return .checkFailed(reason: "doctor вернул пустой ответ")
+        }
+        let checks = Doctor.parse(outData)
+        guard !checks.isEmpty else {
+            // Секретов тут по построению нет — doctor печатает про токен только
+            // «задан/пуст», не сам токен (см. Doctor.Check) — обрезаем по объёму,
+            // а не вычищаем содержимое.
+            let raw = String(data: outData, encoding: .utf8) ?? "<не UTF-8>"
+            return .checkFailed(reason: truncated("doctor вернул нераспознанный ответ: \(raw)"))
+        }
         return Doctor.isConfigured(in: checks) ? .configured : .notConfigured
+    }
+
+    /// Первые несколько строк вывода для причины в логе/меню — не весь вывод: он
+    /// может быть многословным, а сообщение об ошибке должно оставаться читаемым.
+    nonisolated private static func firstLines(of data: Data, maxLines: Int = 3) -> String {
+        guard let text = String(data: data, encoding: .utf8) else { return "" }
+        return text
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .prefix(maxLines)
+            .joined(separator: " / ")
+    }
+
+    /// Ограничение на объём диагностической строки, а не на содержимое: вывод
+    /// `doctor` может содержать пути (например, до конфига), но не секреты.
+    nonisolated private static func truncated(_ text: String, limit: Int = 200) -> String {
+        guard text.count > limit else { return text }
+        return String(text.prefix(limit)) + "…"
     }
 
     func start() {
