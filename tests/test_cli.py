@@ -1678,3 +1678,76 @@ def test_setup_does_not_keep_a_previously_stored_invalid_user_id(
 
     assert cli.main(["setup"]) == 0
     assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_sync_without_repos_says_so(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["sync"]) == 2
+    assert capsys.readouterr().err.strip()
+
+
+def test_sync_reports_one_line_per_repo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = tmp_path / "alpha"
+    second = tmp_path / "beta"
+    for path in (first, second):
+        (path / ".git").mkdir(parents=True)
+
+    async def fake_sync(repo: Path, **kwargs: object) -> cli.sync.SyncResult:
+        return cli.sync.SyncResult(repo, cli.sync.Outcome.updated, "подтянуто коммитов: 2", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["sync"]) == 0
+    out = capsys.readouterr().out
+    assert "alpha" in out and "beta" in out
+
+
+def test_sync_returns_one_when_something_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "alpha"
+    (repo / ".git").mkdir(parents=True)
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        return cli.sync.SyncResult(target, cli.sync.Outcome.failed, "ветки разошлись", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["sync"]) == 1
+
+
+def test_sync_passes_branch_through(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = tmp_path / "alpha"
+    (repo / ".git").mkdir(parents=True)
+    seen: dict[str, object] = {}
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        seen.update(kwargs)
+        return cli.sync.SyncResult(target, cli.sync.Outcome.already, "ok", "dev")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    monkeypatch.chdir(tmp_path)
+
+    cli.main(["sync", "--branch", "dev", "--no-fetch"])
+    assert seen["branch"] == "dev"
+    assert seen["fetch"] is False
+
+
+def test_sync_accepts_explicit_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = tmp_path / "elsewhere"
+    (repo / ".git").mkdir(parents=True)
+    seen: list[Path] = []
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        seen.append(target)
+        return cli.sync.SyncResult(target, cli.sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    assert cli.main(["sync", str(repo)]) == 0
+    assert seen == [repo]

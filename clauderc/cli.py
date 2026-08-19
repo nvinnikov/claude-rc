@@ -23,6 +23,7 @@ from typing import Any, NamedTuple
 
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
 from clauderc import setup as setup  # тесты подменяют cli.setup.verify_token/catch_user_id
+from clauderc import sync as clauderc_sync  # _Commands.sync затенил бы модуль sync
 from clauderc import worktrees as worktrees  # тесты подменяют cli.worktrees.ensure
 from clauderc.config import load_config as load_config  # тесты читают cli.load_config
 from clauderc.remote import (
@@ -37,6 +38,11 @@ from clauderc.remote import (
     list_sessions,
 )
 from clauderc.worktrees import WorktreeError
+
+# Публичный алиас для тестов: `_Commands.sync` — метод класса и модулю не мешает,
+# но `cli.sync` без него указывал бы на функцию, а не на модуль clauderc.sync,
+# который тесты подменяют (`monkeypatch.setattr(cli.sync, "sync", ...)`).
+sync = clauderc_sync
 
 # Коды возврата: 1 — не получилось сделать, 2 — не с чем работать.
 EXIT_FAILED = 1
@@ -82,6 +88,11 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true", dest="as_json")
 
     sub.add_parser("setup", help="заполнить config.toml: токен, user_id, каталоги")
+
+    sync_cmd = sub.add_parser("sync", help="подтянуть репозитории из origin")
+    sync_cmd.add_argument("paths", nargs="*", help="каталоги (по умолчанию текущий)")
+    sync_cmd.add_argument("--branch", help="переключить на ветку перед подтягиванием")
+    sync_cmd.add_argument("--no-fetch", action="store_false", dest="fetch", help="не ходить в сеть")
 
     return parser
 
@@ -205,6 +216,18 @@ class _Commands:
             print("\nПрервано.", file=sys.stderr)
             return EXIT_ENVIRONMENT
 
+    @staticmethod
+    def sync(args: argparse.Namespace) -> int:
+        targets = _sync_targets([Path(p) for p in args.paths])
+        if not targets:
+            print("Репозиториев не нашлось.", file=sys.stderr)
+            return EXIT_ENVIRONMENT
+        results = asyncio.run(_sync_all(targets, args.branch, args.fetch))
+        for result in results:
+            print(f"{_MARK[result.outcome]} {result.path.name}\t{result.branch}\t{result.detail}")
+        failed = sum(1 for r in results if r.outcome is clauderc_sync.Outcome.failed)
+        return EXIT_FAILED if failed else 0
+
 
 class _TrustDeclined(RuntimeError):
     """Каталог требует подтверждения доверия, а подтвердить некому или отказались."""
@@ -216,6 +239,36 @@ class _TrustDeclined(RuntimeError):
 
 class _StopFailed(RuntimeError):
     """Сессия нашлась, но tmux не смог её погасить — не путать с «не найдена»."""
+
+
+_MARK = {
+    clauderc_sync.Outcome.updated: "⤵",
+    clauderc_sync.Outcome.already: "=",
+    clauderc_sync.Outcome.skipped: "·",
+    clauderc_sync.Outcome.failed: "✗",
+}
+
+
+def _sync_targets(paths: list[Path]) -> list[Path]:
+    """Что синхронизировать: явные пути или репозитории в текущем каталоге."""
+    if paths:
+        return [p.expanduser().resolve() for p in paths if (p / ".git").exists()]
+    here = Path.cwd()
+    found = [child for child in sorted(here.iterdir()) if (child / ".git").exists()]
+    # Сам каталог тоже цель, если он репозиторий: `sync` внутри проекта осмыслен.
+    if (here / ".git").exists():
+        found.insert(0, here)
+    return found
+
+
+async def _sync_all(
+    targets: list[Path], branch: str | None, fetch: bool
+) -> list[clauderc_sync.SyncResult]:
+    # Параллельно: каждый репозиторий — несколько вызовов git, последовательно
+    # десяток штук ждать заметно дольше.
+    return list(
+        await asyncio.gather(*(clauderc_sync.sync(t, branch=branch, fetch=fetch) for t in targets))
+    )
 
 
 def _as_dict(session: RemoteSession) -> dict[str, Any]:
