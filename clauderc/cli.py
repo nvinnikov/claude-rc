@@ -257,6 +257,20 @@ _ATTEMPTS = 2
 
 async def _run_setup(target: Path) -> int:
     """Спрашивает три значения и пишет config.toml."""
+    # Путь показываем раньше любых вопросов: `config_file()` может вернуть
+    # `./config.toml` из текущего каталога — документированный способ работы
+    # в клоне, но и корень совсем чужого репозитория, если запустить визард
+    # не там. Молчание здесь — то, как это выяснилось на живом PR: чужой файл
+    # переписан, а на его месте — боевой токен бота.
+    print(f"Конфиг будет записан сюда: {target}")
+    if target != paths.default_config_file():
+        print(
+            "  ! Это не путь по умолчанию (~/.config/claude-rc/config.toml) — "
+            "тулза и приложение ищут конфиг по своей цепочке (см. README), и не "
+            "факт, что найдут именно этот файл.",
+            file=sys.stderr,
+        )
+
     current = _current_answers(target)
     # Файла может не быть — тогда автоподхват user_id уместен, это первый запуск.
     # А может быть, но не читаться (например, каталог из rc_roots исчез) — тогда
@@ -269,6 +283,31 @@ async def _run_setup(target: Path) -> int:
     except OSError as exc:
         print(f"не удалось проверить {target}: {exc}", file=sys.stderr)
         return EXIT_ENVIRONMENT
+
+    if config_exists:
+        raw = _read_raw_toml(target)
+        if raw is None:
+            # Не разобрался как TOML вовсе — если это был наш конфиг с ручными
+            # правками технических полей (worktree_root, scan_depth и т.п.),
+            # перенести их не получится: render_config пишет только то, что
+            # смог прочитать (см. _current_extras).
+            print(
+                "  ! Существующий файл не разобрался как TOML — если там были "
+                "технические настройки (worktree_root, scan_depth и т.п.), "
+                "перенести их не получится.",
+                file=sys.stderr,
+            )
+        if raw is None or "bot_token" not in raw:
+            # Не похоже на конфиг claude-rc: не парсится вовсе или нет ключа,
+            # которым мы вообще узнаём свой файл. Переписывать такой без
+            # подтверждения нельзя — Enter не должен молча означать «да».
+            if not _agrees(
+                f"По этому пути уже есть файл, непохожий на конфиг claude-rc "
+                f"({target}). Переписать его?",
+                default=False,
+            ):
+                print("Отменено — файл не тронут.", file=sys.stderr)
+                return EXIT_ENVIRONMENT
 
     token = await _ask_token(current.bot_token if current else None)
     if token is None:
@@ -346,20 +385,28 @@ def _current_answers(target: Path) -> setup.Answers | None:
     )
 
 
+def _read_raw_toml(target: Path) -> dict[str, object] | None:
+    """Сырой разбор файла — без валидации `load_config` (типов, `rc_roots` и т.п.).
+
+    `None` — файла нет, нет доступа или содержимое вообще не TOML. Используется
+    и чтобы отличить «наш конфиг с чем-то битым» от «чужой файл» (по наличию
+    `bot_token`), и чтобы перенести технические поля (`_current_extras`) — оба
+    вопроса не требуют полной валидации, которую делает `load_config`.
+    """
+    try:
+        with target.open("rb") as fh:
+            return tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+
+
 _EXTRA_KEYS = ("worktree_root", "state_path", "scan_depth", "launch_timeout_s")
 
 
 def _current_extras(target: Path) -> dict[str, object]:
-    """Поля, которые визард не спрашивает, но не должен стирать при перезаписи.
-
-    Читаем сырым `tomllib`, а не через `load_config`: если `rc_roots` указывает
-    на исчезнувший каталог, `load_config` падает целиком, а эти поля к
-    `rc_roots` отношения не имеют и читаются нормально.
-    """
-    try:
-        with target.open("rb") as fh:
-            raw = tomllib.load(fh)
-    except (OSError, tomllib.TOMLDecodeError):
+    """Поля, которые визард не спрашивает, но не должен стирать при перезаписи."""
+    raw = _read_raw_toml(target)
+    if raw is None:
         return {}
     return {key: raw[key] for key in _EXTRA_KEYS if key in raw}
 

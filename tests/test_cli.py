@@ -1162,3 +1162,143 @@ def test_setup_leaves_permissions_of_preexisting_config_dir_untouched(
 
     assert cli.main(["setup"]) == 0
     assert oct(config_dir.stat().st_mode & 0o777) == "0o755"
+
+
+def test_setup_refuses_foreign_file_without_confirmation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Буквальный сценарий из ревью: человек запускает claude-rc setup, находясь
+    # в чужом репозитории со своим config.toml (Hugo, любой сервис). O_TRUNC
+    # снёс бы его целиком и записал бы боевой токен на его место.
+    target = tmp_path / "config.toml"
+    foreign = 'baseURL = "https://example.com"\nlanguageCode = "en-us"\ntitle = "My Site"\n'
+    target.write_text(foreign)
+
+    async def explode(value: str) -> cli.setup.TokenCheck:
+        raise AssertionError("токен не должен спрашиваться, пока не решена судьба чужого файла")
+
+    monkeypatch.setattr(cli.setup, "verify_token", explode)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+
+    assert cli.main(["setup"]) == cli.EXIT_ENVIRONMENT
+    assert target.read_text() == foreign  # байт в байт как было
+    assert "Отменено" in capsys.readouterr().err
+
+
+def test_setup_rewrites_own_config_without_extra_confirmation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Перезапись НАШЕГО конфига — обычный сценарий и не должна становиться
+    # назойливой: подтверждение нужно только для чужого файла или неожиданного
+    # пути, не для собственного config.toml.
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+    target.write_text(
+        cli.setup.render_config(
+            cli.setup.Answers(bot_token=token, allowed_user_id=7, rc_roots=(root,))
+        )
+    )
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    # Пустые ответы на все вопросы — если бы визард спросил подтверждение на
+    # перезапись (лишний вопрос), оно тоже получило бы "" и, с default=False,
+    # отменило бы всё; тест этого не ожидает.
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": "")
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    config = cli.load_config(target)
+    assert config.bot_token == token
+    assert config.allowed_user_id == 7
+
+
+def test_setup_warns_when_target_path_is_not_the_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "not-xdg" / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    answers = iter([token, "n", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    err = capsys.readouterr().err
+    assert "не путь по умолчанию" in err.lower()
+
+
+def test_setup_does_not_warn_about_path_when_it_is_the_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / ".config" / "claude-rc" / "config.toml"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    answers = iter([token, "n", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert "не путь по умолчанию" not in capsys.readouterr().err.lower()
+
+
+def test_setup_warns_when_existing_file_fails_to_parse_but_allows_confirmed_overwrite(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Синтаксическая ошибка в TOML — не то же самое, что "нет ключа bot_token":
+    # файл мог быть нашим до опечатки, и его технические поля пропадут молча,
+    # если не сказать об этом прямо.
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    target.write_text('bot_token = "123456:old"\nallowed_user_id = 1\nbroken = [\n')
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+    # «y» на подтверждение перезаписи, дальше — токен, user_id, каталоги.
+    # Автоподхват не предложится: конфиг уже существует (config_exists=True),
+    # хоть и не разобрался.
+    answers = iter(["y", token, "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+
+    assert cli.main(["setup"]) == 0
+    err = capsys.readouterr().err
+    assert "не разобрался как toml" in err.lower()
+    assert cli.load_config(target).allowed_user_id == 42

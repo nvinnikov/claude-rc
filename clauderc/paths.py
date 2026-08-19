@@ -12,6 +12,16 @@ import os
 from pathlib import Path
 
 
+def default_config_file() -> Path:
+    """XDG-путь — куда тулза кладёт конфиг сама и где ищет его по умолчанию.
+
+    Отдельно от `config_file()`, чтобы код мог спросить «это путь по
+    умолчанию?», не зная всей цепочки: например, визард предупреждает, если
+    пишет конфиг не сюда.
+    """
+    return Path.home() / ".config/claude-rc/config.toml"
+
+
 def config_file() -> Path:
     """Первый существующий конфиг из цепочки; если ни одного — XDG-путь.
 
@@ -22,10 +32,7 @@ def config_file() -> Path:
     if env:
         return Path(env).expanduser()
 
-    candidates = [
-        Path.home() / ".config/claude-rc/config.toml",
-        Path.cwd() / "config.toml",
-    ]
+    candidates = [default_config_file(), Path.cwd() / "config.toml"]
     for candidate in candidates:
         if candidate.is_file():
             return candidate
