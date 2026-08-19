@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import (
+    TelegramConflictError,
+    TelegramNetworkError,
+    TelegramUnauthorizedError,
+)
 
 _TOKEN = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
 _VISIBLE_TAIL = 4
@@ -163,19 +167,53 @@ async def verify_token(token: str) -> TokenCheck:
     return TokenCheck(True, getattr(me, "username", None), False, "токен принят")
 
 
-async def catch_user_id(token: str, *, timeout_s: float = 120.0) -> int | None:
-    """Ждёт первое сообщение боту и возвращает id отправителя.
+class PollingConflict(RuntimeError):
+    """`getUpdates` ответил конфликтом — токен уже опрашивает кто-то ещё."""
+
+
+class TokenRejected(RuntimeError):
+    """Telegram отверг токен во время ожидания (401 Unauthorized)."""
+
+
+@dataclass(frozen=True)
+class CaughtSender:
+    """Кого поймал автоподхват — не только id, но и то, чем его можно сверить.
+
+    Сверить id не с чем, а cli.py должен дать человеку рубеж подтверждения
+    («это точно ты?») — для этого нужны имя и username, а не голое число.
+    """
+
+    user_id: int
+    display_name: str
+    username: str | None
+
+
+async def catch_user_id(token: str, *, timeout_s: float = 120.0) -> CaughtSender | None:
+    """Ждёт первое сообщение боту, пришедшее ПОСЛЕ начала ожидания, и отдаёт отправителя.
 
     Иначе человеку пришлось бы искать @userinfobot и копировать число — самый
     ошибкоёмкий шаг настройки.
+
+    Telegram хранит неподтверждённые обновления до 24 часов: без сброса
+    бэклога первым «пойманным» может оказаться тот, кто писал боту вчера, а не
+    тот, кто сейчас сидит в визарде. `allowed_user_id` — единственная защита
+    машины: кто её прошёл, получает полноценный Claude Code со всеми токенами
+    в домашнем каталоге, — ошибиться здесь значит отдать машину чужому.
+    Поэтому сначала подглядываем в хвост очереди (`offset=-1`, ничего не
+    подтверждая) и начинаем реальное ожидание сразу за тем, что там уже лежало.
+
+    Конфликт поллеров и отказ токена снаружи выглядят так же, как истёкший
+    таймаут («не дождался»), но природа разная и по ней можно понять, что
+    делать дальше, — различаем их отдельными исключениями. Текст самого
+    исключения по-прежнему не отдаём: он может содержать токен (см. verify_token).
 
     Зовётся только пока бот не настроен, то есть заведомо не запущен: второй
     поллер того же токена ломает работающего бота.
     """
     bot = _make_bot(token)
-    deadline = asyncio.get_running_loop().time() + timeout_s
-    offset: int | None = None
     try:
+        offset = await _first_fresh_offset(bot)
+        deadline = asyncio.get_running_loop().time() + timeout_s
         while asyncio.get_running_loop().time() < deadline:
             updates = await bot.get_updates(offset=offset, timeout=5)
             for update in updates:
@@ -183,13 +221,35 @@ async def catch_user_id(token: str, *, timeout_s: float = 120.0) -> int | None:
                 message = getattr(update, "message", None)
                 sender = getattr(message, "from_user", None) if message else None
                 if sender is not None:
-                    return int(sender.id)
+                    return CaughtSender(
+                        user_id=int(sender.id),
+                        display_name=getattr(sender, "full_name", None) or "без имени",
+                        username=getattr(sender, "username", None),
+                    )
+    except TelegramConflictError as exc:
+        raise PollingConflict from exc
+    except TelegramUnauthorizedError as exc:
+        raise TokenRejected from exc
     except Exception:
         # Тот же довод, что и в verify_token: текст ошибки может содержать токен
         # (он в URL запроса) — наружу отдаём None, а не исключение с его текстом.
         return None
     finally:
         await _close(bot)
+    return None
+
+
+async def _first_fresh_offset(bot: Any) -> int | None:
+    """offset, с которого начинать реальное ожидание — без старого бэклога.
+
+    `offset=-1` — штатный приём Telegram: подглядеть последнее обновление в
+    очереди, ничего не подтверждая (не «съедая» его). Если там что-то есть —
+    в очереди уже накопился бэклог, и реальное ожидание должно начаться сразу
+    ЗА ним, а не с него, иначе первым придёт кто-то из прошлого.
+    """
+    backlog = await bot.get_updates(offset=-1, timeout=0)
+    if backlog:
+        return int(backlog[-1].update_id) + 1
     return None
 
 

@@ -2,8 +2,13 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
-from aiogram.methods import GetMe
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramConflictError,
+    TelegramNetworkError,
+    TelegramUnauthorizedError,
+)
+from aiogram.methods import GetMe, GetUpdates
 from clauderc import setup
 from clauderc.config import load_config
 from clauderc.setup import Answers, RootsError
@@ -266,8 +271,12 @@ async def test_verify_token_never_echoes_the_token(
 
 
 class _FakeSender:
-    def __init__(self, user_id: int) -> None:
+    def __init__(
+        self, user_id: int, full_name: str = "Test User", username: str | None = "testuser"
+    ) -> None:
         self.id = user_id
+        self.full_name = full_name
+        self.username = username
 
 
 class _FakeMessage:
@@ -284,7 +293,12 @@ class _FakeUpdate:
 class _FakeUpdatesBot:
     """Заглушка для catch_user_id: отдаёт заранее заготовленные партии обновлений
     и запоминает offset, с которым её вызвали — второй поллер того же токена
-    без сдвига offset вечно перечитывал бы одно и то же обновление."""
+    без сдвига offset вечно перечитывал бы одно и то же обновление.
+
+    `offset=-1` (сброс бэклога перед ожиданием) отвечает пустым списком — этим
+    тестам бэклог не важен, а без этой ветки самый первый вызов из
+    `_first_fresh_offset` съедал бы первую партию как обычный опрос.
+    """
 
     def __init__(self, batches: list[list[_FakeUpdate]], behaviour: str = "ok") -> None:
         self._batches = list(batches)
@@ -295,8 +309,42 @@ class _FakeUpdatesBot:
         self.seen_offsets.append(offset)
         if self.behaviour == "offline":
             raise OSError("нет сети")
+        if self.behaviour == "conflict":
+            raise TelegramConflictError(
+                method=GetUpdates(), message="terminated by other getUpdates"
+            )
+        if self.behaviour == "unauthorized":
+            raise TelegramUnauthorizedError(method=GetUpdates(), message="Unauthorized")
+        if offset == -1:
+            return []
         if self._batches:
             return self._batches.pop(0)
+        return []
+
+
+class _FakeBacklogBot:
+    """Очередь Telegram, как её видит getUpdates: `offset=-1` подглядывает
+    последнее сообщение, не подтверждая его; обычный вызов возвращает всё
+    начиная с offset (включая бэклог, если offset его не отсёк) — так же, как
+    настоящий Telegram. Нужна для проверки самого сброса бэклога: `_FakeUpdatesBot`
+    его нарочно не моделирует.
+    """
+
+    def __init__(self, backlog: list[_FakeUpdate], arriving: list[_FakeUpdate]) -> None:
+        self._backlog = list(backlog)
+        self._arriving = list(arriving)
+        self.seen_offsets: list[int | None] = []
+
+    async def get_updates(self, offset: int | None = None, timeout: int = 5) -> list[_FakeUpdate]:
+        self.seen_offsets.append(offset)
+        if offset == -1:
+            return [self._backlog[-1]] if self._backlog else []
+        due = [u for u in self._backlog if offset is None or u.update_id >= offset]
+        self._backlog = [u for u in self._backlog if u not in due]
+        if due:
+            return due
+        if self._arriving:
+            return [self._arriving.pop(0)]
         return []
 
 
@@ -306,7 +354,9 @@ async def test_catch_user_id_returns_sender_of_first_message(
     batches = [[_FakeUpdate(1, _FakeMessage(777))]]
     monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeUpdatesBot(batches))
     got = await setup.catch_user_id("123456:x", timeout_s=1.0)
-    assert got == 777
+    assert got is not None
+    assert got.user_id == 777
+    assert got.username == "testuser"
 
 
 async def test_catch_user_id_ignores_updates_without_message(
@@ -316,7 +366,8 @@ async def test_catch_user_id_ignores_updates_without_message(
     batches = [[_FakeUpdate(1)], [_FakeUpdate(2, _FakeMessage(42))]]
     monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeUpdatesBot(batches))
     got = await setup.catch_user_id("123456:x", timeout_s=1.0)
-    assert got == 42
+    assert got is not None
+    assert got.user_id == 42
 
 
 async def test_catch_user_id_advances_offset_past_seen_updates(
@@ -326,7 +377,8 @@ async def test_catch_user_id_advances_offset_past_seen_updates(
     bot = _FakeUpdatesBot(batches)
     monkeypatch.setattr(setup, "_make_bot", lambda token: bot)
     await setup.catch_user_id("123456:x", timeout_s=1.0)
-    assert bot.seen_offsets == [None, 10]
+    # -1 — сброс бэклога перед ожиданием, идёт первым.
+    assert bot.seen_offsets == [-1, None, 10]
 
 
 async def test_catch_user_id_returns_none_on_timeout(
@@ -343,3 +395,38 @@ async def test_catch_user_id_returns_none_when_network_fails(
     monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeUpdatesBot([], "offline"))
     got = await setup.catch_user_id("123456:x", timeout_s=1.0)
     assert got is None
+
+
+async def test_catch_user_id_raises_polling_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Кто-то ещё опрашивает getUpdates этим же токеном — снаружи выглядело бы
+    # как истёкший таймаут, а причина другая (второй бот уже работает).
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeUpdatesBot([], "conflict"))
+    with pytest.raises(setup.PollingConflict):
+        await setup.catch_user_id("123456:x", timeout_s=1.0)
+
+
+async def test_catch_user_id_raises_token_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeUpdatesBot([], "unauthorized"))
+    with pytest.raises(setup.TokenRejected):
+        await setup.catch_user_id("123456:x", timeout_s=1.0)
+
+
+async def test_catch_user_id_skips_backlog_from_before_the_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Critical: Telegram хранит неподтверждённые обновления до 24 часов. Без
+    # сброса бэклога первым «пойманным» может оказаться тот, кто писал боту
+    # вчера, а не тот, кто сейчас сидит в визарде — allowed_user_id единственная
+    # защита машины, ошибиться здесь значит отдать её чужому.
+    stale = _FakeUpdate(5, _FakeMessage(999))  # посторонний, уже лежит в очереди
+    fresh = _FakeUpdate(6, _FakeMessage(777))  # тот, кто пишет боту прямо сейчас
+    bot = _FakeBacklogBot(backlog=[stale], arriving=[fresh])
+    monkeypatch.setattr(setup, "_make_bot", lambda token: bot)
+
+    caught = await setup.catch_user_id("123456:x", timeout_s=1.0)
+    assert caught is not None
+    assert caught.user_id == 777

@@ -456,11 +456,34 @@ async def _ask_user_id(current: int | None, token: str, *, config_exists: bool) 
     # и поллинг рядом с ним поднимет второго поллера того же токена.
     if current is None and not config_exists and _should_attempt_autopickup():
         print("  Жду сообщение боту… до 2 минут, Ctrl+C — прервать.")
-        caught = await setup.catch_user_id(token)
+        caught: setup.CaughtSender | None = None
+        try:
+            caught = await setup.catch_user_id(token)
+        except setup.PollingConflict:
+            # Кто-то ещё опрашивает getUpdates этим же токеном прямо сейчас —
+            # выглядит как истёкший таймаут, но причина другая и человеку стоит
+            # её знать: скорее всего, где-то уже работает второй бот.
+            print("  ✗ Telegram ответил конфликтом — похоже, токен уже опрашивает кто-то ещё.")
+        except setup.TokenRejected:
+            print("  ✗ Telegram отверг токен во время ожидания.")
+        else:
+            if caught is None:
+                print("  Не дождался.")
+
         if caught is not None:
-            print(f"  ✓ user_id: {caught}")
-            return caught
-        print("  Не дождался — введи вручную.")
+            # Сверить пойманный id не с чем — показываем, кого поймали, и просим
+            # подтвердить. Это второй рубеж после сброса бэклога в catch_user_id:
+            # даже если чужое сообщение как-то проскочит, человек увидит чужое
+            # имя и откажется. Печатаем отдельным print, а не в подсказку
+            # input() — та не гарантированно долетает до stdout (см. _agrees).
+            handle = f" (@{caught.username})" if caught.username else ""
+            print(f"  Поймал: {caught.display_name}{handle}, id {caught.user_id}.")
+            if _agrees("Это ты?"):
+                print(f"  ✓ user_id: {caught.user_id}")
+                return caught.user_id
+            print("  Не совпало — введи вручную.")
+        else:
+            print("  Введи вручную.")
 
     hint = f" [{current}]" if current else ""
     for _ in range(_ATTEMPTS):

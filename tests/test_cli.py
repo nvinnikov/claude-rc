@@ -782,9 +782,9 @@ def test_setup_offers_autopickup_when_no_bot_process_running(
     token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
     called: list[str] = []
 
-    async def fake_catch(value: str, **kwargs: object) -> int:
+    async def fake_catch(value: str, **kwargs: object) -> cli.setup.CaughtSender:
         called.append(value)
-        return 99
+        return cli.setup.CaughtSender(user_id=99, display_name="Test User", username="testuser")
 
     monkeypatch.setattr(cli.setup, "catch_user_id", fake_catch)
     monkeypatch.setattr(
@@ -792,8 +792,8 @@ def test_setup_offers_autopickup_when_no_bot_process_running(
     )
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
-    # токен, «y» на автоподхват, каталоги — user_id ловится автоподхватом
-    answers = iter([token, "y", str(root)])
+    # токен, «y» на автоподхват, «y» на подтверждение пойманного отправителя, каталоги
+    answers = iter([token, "y", "y", str(root)])
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
@@ -872,16 +872,16 @@ def test_setup_proceeds_when_bot_check_failed_and_human_confirms(
     token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
     called: list[str] = []
 
-    async def fake_catch(value: str, **kwargs: object) -> int:
+    async def fake_catch(value: str, **kwargs: object) -> cli.setup.CaughtSender:
         called.append(value)
-        return 77
+        return cli.setup.CaughtSender(user_id=77, display_name="Test User", username="testuser")
 
     monkeypatch.setattr(cli.setup, "catch_user_id", fake_catch)
     monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, False))
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
-    # токен, «y» на предупреждение-подтверждение, каталоги
-    answers = iter([token, "y", str(root)])
+    # токен, «y» на предупреждение-подтверждение, «y» на подтверждение отправителя, каталоги
+    answers = iter([token, "y", "y", str(root)])
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
@@ -919,12 +919,13 @@ def test_setup_warns_about_dropped_extra_key(
     monkeypatch.setattr(
         cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(pid=None, checked=True)
     )
-    answers = iter([token, "y", str(root)])
+    # токен, «y» на автоподхват, «y» на подтверждение отправителя, каталоги
+    answers = iter([token, "y", "y", str(root)])
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
-    async def fake_catch(value: str, **kwargs: object) -> int:
-        return 42
+    async def fake_catch(value: str, **kwargs: object) -> cli.setup.CaughtSender:
+        return cli.setup.CaughtSender(user_id=42, display_name="Test User", username="testuser")
 
     monkeypatch.setattr(cli.setup, "catch_user_id", fake_catch)
 
@@ -938,3 +939,106 @@ def test_setup_warns_about_dropped_extra_key(
     assert "scan_depth" in err
     assert "list" in err
     assert "scan_depth" not in target.read_text()
+
+
+def test_setup_shows_caught_sender_and_falls_back_when_confirmation_declined(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Сверить пойманный id не с чем — второй рубеж после сброса бэклога в
+    # catch_user_id: человек должен увидеть имя и username, прежде чем
+    # согласиться. Отказался — визард переходит к ручному вводу, а не
+    # принимает пойманное значение молча.
+    target = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    async def fake_catch(value: str, **kwargs: object) -> cli.setup.CaughtSender:
+        return cli.setup.CaughtSender(
+            user_id=999, display_name="Чужой Человек", username="stranger"
+        )
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", fake_catch)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    # токен, «y» на автоподхват, «n» — это не я, ручной user_id, каталоги
+    answers = iter([token, "y", "n", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    out = capsys.readouterr().out
+    assert "Чужой Человек" in out
+    assert "stranger" in out
+    assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_setup_names_polling_conflict_distinctly_from_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Конфликт поллеров (кто-то уже опрашивает этот токен) снаружи выглядит
+    # как истёкший таймаут — человек должен увидеть настоящую причину, а не
+    # просто «не дождался», которое не объясняет, почему ждать бессмысленно.
+    target = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    async def fake_catch(value: str, **kwargs: object) -> cli.setup.CaughtSender | None:
+        raise cli.setup.PollingConflict
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", fake_catch)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    answers = iter([token, "y", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    out = capsys.readouterr().out
+    assert "конфликт" in out.lower()
+    assert "не дождался" not in out.lower()
+    assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_setup_names_token_rejected_distinctly_from_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    async def fake_catch(value: str, **kwargs: object) -> cli.setup.CaughtSender | None:
+        raise cli.setup.TokenRejected
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", fake_catch)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    answers = iter([token, "y", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    out = capsys.readouterr().out
+    assert "отверг" in out.lower()
+    assert "не дождался" not in out.lower()
+    assert cli.load_config(target).allowed_user_id == 42
