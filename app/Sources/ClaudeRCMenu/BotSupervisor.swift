@@ -285,6 +285,38 @@ final class BotSupervisor {
         // Проверку показываем как starting, а не молчим пять секунд: иначе клик по
         // кнопке выглядит так, будто ничего не произошло.
         state = .starting
+        dispatchConfigurationCheck { [weak self] configured in
+            self?.continueStart(configured: configured)
+        }
+    }
+
+    /// Пассивная перепроверка при открытии меню в `.notConfigured` — человек мог
+    /// пройти визард в соседнем Терминале и должен увидеть перемену, просто открыв
+    /// меню, а не разбираться, почему кнопка бездействует, пока не кликнет её вслепую.
+    ///
+    /// В отличие от `start()`, она НЕ поднимает бота, даже если конфиг оказался в
+    /// порядке, — только снимает `.notConfigured`, а решение «запускать или нет»
+    /// по-прежнему за явным кликом `Start bot`. Тот же `isCheckingConfiguration`,
+    /// что и у `start()`, — второй параллельный запрос к `doctor` не нужен ни там,
+    /// ни здесь, поэтому флаг общий, а не заведён отдельно.
+    func recheckConfigurationIfNeeded() {
+        guard case .notConfigured = state else { return }
+        guard !isCheckingConfiguration else { return }
+        dispatchConfigurationCheck { [weak self] configured in
+            guard let self else { return }
+            // Пока проверка летела, стало не до нас (например, реальный клик
+            // start() уже что-то поменял) — не перетираем чужой результат.
+            guard case .notConfigured = self.state else { return }
+            if configured {
+                self.state = .stopped
+            }
+        }
+    }
+
+    /// Общий механизм постановки проверки `doctor` в фон с возвратом ответа на main
+    /// actor — используется и в `start()`, и в пассивной перепроверке; `completion`
+    /// вызывается уже после того, как `isCheckingConfiguration` сброшен обратно.
+    private func dispatchConfigurationCheck(completion: @escaping @MainActor (Bool) -> Void) {
         isCheckingConfiguration = true
         let cli = self.cli
         let checkConfigured = self.checkConfigured
@@ -295,7 +327,8 @@ final class BotSupervisor {
             // крутится ли где-то настоящий run loop главного потока — это же делает
             // переход воспроизводимым в тестах.
             Task { @MainActor [weak self] in
-                self?.continueStart(configured: configured)
+                self?.isCheckingConfiguration = false
+                completion(configured)
             }
         }
     }
@@ -306,7 +339,6 @@ final class BotSupervisor {
     /// дождаться ответа `doctor` за 5с означало бы объявить «не настроено» поверх
     /// работающего бота — меню соврало бы о том, что человек видит своими глазами.
     private func continueStart(configured: Bool) {
-        isCheckingConfiguration = false
         guard !stopRequested else {
             // Стоп нажали, пока `doctor` отвечал, — не поднимаем бота вопреки этому.
             state = .stopped

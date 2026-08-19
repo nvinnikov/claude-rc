@@ -163,6 +163,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         renderSetupNote()
         loginRow.state = LoginItem.isEnabled ? .on : .off
         renderLoginNote()
+        // Человек мог пройти визард в соседнем Терминале, не возвращаясь в
+        // приложение, — не заставляем его ещё и кликать "Start bot" вслепую,
+        // чтобы просто узнать, подхватился ли конфиг. Метод сам не запускает
+        // бота и не делает ничего, если состояние сейчас не .notConfigured.
+        supervisor?.recheckConfigurationIfNeeded()
     }
 
     /// Показывает причину, по которой попытка открыть визард не сработала. Привязана
@@ -216,7 +221,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .notConfigured:
             statusRow.title = "Bot: not configured"
             toggleRow.title = "Start bot"
-            toggleRow.isEnabled = false
+            // Доступна: start() сам перепроверяет конфиг. Раньше кнопка была
+            // недоступна именно тут — единственный выход из .notConfigured был
+            // перезапуск приложения, а ради этого весь визард и делался.
+            toggleRow.isEnabled = cli != nil
         }
         takeOverRow.isHidden = !showsTakeOverRow(for: state)
         takeOverRow.title = takeOverRowTitle(for: state) ?? takeOverRow.title
@@ -280,7 +288,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // Открываем Терминал, а не запускаем визард внутри: он интерактивный,
         // а у приложения нет ни stdin, ни места, где показать вопросы.
-        let script = "clear; \(cli.path) setup"
+        // shellQuoted, а не просто "\(cli.path)" в кавычках: путь пользователя может
+        // содержать пробел или саму одинарную кавычку (`/Users/имя фамилия/...`,
+        // `/Users/o'brien/...`) — без честного экранирования это разваливает скрипт.
+        let script = "clear; \(shellQuoted(cli.path)) setup"
         let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
         // Имя с UUID — второй клик до того, как первый скрипт дочитан Терминалом,
         // не должен переписать файл, который тот ещё открывает.
@@ -398,4 +409,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 func isNotConfigured(_ state: BotState?) -> Bool {
     if case .notConfigured = state { return true }
     return false
+}
+
+/// Честное POSIX-экранирование, а не просто обёртка в кавычки: одинарная кавычка
+/// внутри самой строки (`/Users/o'brien/...`) закрыла бы такую обёртку раньше
+/// времени. Стандартный приём — закрыть кавычку, экранированная одинарная
+/// кавычка снаружи, открыть кавычку заново: `'` → `'\''`.
+func shellQuoted(_ value: String) -> String {
+    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }

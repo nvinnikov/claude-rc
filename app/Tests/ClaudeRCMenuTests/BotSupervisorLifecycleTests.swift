@@ -154,6 +154,92 @@ import Testing
         try await Task.sleep(nanoseconds: 2_500_000_000)
         #expect(recorder.states.count == 5)
     }
+
+    /// Регресс из ревью PR: `.notConfigured` был тупиком — кнопка недоступна, а
+    /// само состояние никогда не пересчитывалось, и единственным выходом был
+    /// перезапуск приложения. `flag` имитирует человека, прошедшего визард в
+    /// соседнем Терминале уже ПОСЛЕ того, как приложение однажды увидело
+    /// `.notConfigured`, — ровно тот сценарий, ради которого весь этот пункт
+    /// меню и делался.
+    @Test func recheckClearsNotConfiguredWhenNowConfigured() async throws {
+        let flag = ConfiguredFlag(false)
+        let supervisor = makeSupervisor(checkConfigured: { _ in flag.value })
+
+        supervisor.start()
+        try await settle(supervisor)
+        #expect(isNotConfigured(supervisor.state))
+
+        flag.value = true
+        let recorder = TransitionRecorder()
+        recorder.attach(to: supervisor)
+
+        supervisor.recheckConfigurationIfNeeded()
+        try await recorder.wait(forCount: 1)
+        // Именно .stopped, а не что-то ещё: перепроверка обязана только снять
+        // .notConfigured, а не сама поднять бота — запуск по-прежнему за явным
+        // кликом Start bot.
+        #expect(supervisor.state == .stopped)
+    }
+
+    @Test func recheckLeavesNotConfiguredWhenStillNotConfigured() async throws {
+        let supervisor = makeSupervisor(checkConfigured: { _ in false })
+
+        supervisor.start()
+        try await settle(supervisor)
+        #expect(isNotConfigured(supervisor.state))
+
+        let recorder = TransitionRecorder()
+        recorder.attach(to: supervisor)
+        supervisor.recheckConfigurationIfNeeded()
+
+        // Отсутствие перехода — это и есть ожидаемый результат; ждём с запасом и
+        // проверяем, что состояние действительно не двигалось, а не что мы просто
+        // не успели заметить смену.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        #expect(recorder.states.isEmpty)
+        #expect(isNotConfigured(supervisor.state))
+    }
+
+    /// Повторный клик по "Start bot" во время идущей пассивной перепроверки не
+    /// должен запускать вторую параллельную проверку — общий `isCheckingConfiguration`
+    /// (переиспользован, а не заведён отдельный флаг под пассивный путь).
+    @Test func recheckAndExplicitStartShareTheSameGuard() async throws {
+        let counter = CallCounter()
+        let release = DispatchSemaphore(value: 0)
+        // `blocking` разводит две фазы одной заглушки: сперва нужен обычный
+        // синхронный `false`, чтобы дойти до `.notConfigured` через настоящий
+        // `start()` (там state идёт через `.starting`, и `settle()` это отследит);
+        // затем — управляемая семафором фаза для самой проверки этого теста.
+        let blocking = ConfiguredFlag(false)
+        let supervisor = makeSupervisor(checkConfigured: { _ in
+            counter.increment()
+            guard blocking.value else { return false }
+            release.wait()
+            return true
+        })
+
+        supervisor.start()
+        try await settle(supervisor)
+        #expect(isNotConfigured(supervisor.state))
+
+        counter.reset()
+        blocking.value = true
+        let recorder = TransitionRecorder()
+        recorder.attach(to: supervisor)
+
+        supervisor.recheckConfigurationIfNeeded()
+        // Клик по кнопке, пока пассивная перепроверка ещё летит: start() должен
+        // увидеть занятый флаг и не выпустить второй запрос к doctor. Проверяем
+        // счётчик СРАЗУ, без ожидания: оба вызова синхронны и `isCheckingConfiguration`
+        // взводится синхронно внутри `dispatchConfigurationCheck`, до диспетча в фон —
+        // никакой гонки с фоновым потоком тут нет.
+        supervisor.start()
+        #expect(counter.value == 1)
+
+        release.signal()
+        try await recorder.wait(forCount: 1)
+        #expect(supervisor.state == .stopped)
+    }
 }
 
 @MainActor
@@ -261,9 +347,38 @@ private final class CallCounter: @unchecked Sendable {
         lock.unlock()
     }
 
+    func reset() {
+        lock.lock()
+        count = 0
+        lock.unlock()
+    }
+
     var value: Int {
         lock.lock()
         defer { lock.unlock() }
         return count
+    }
+}
+
+/// Переключаемая заглушка `checkConfigured` — имитирует человека, прошедшего визард
+/// в соседнем окне уже после того, как приложение увидело `.notConfigured`. Обычный
+/// `var` не годится: заглушка читает значение с `DispatchQueue.global`.
+private final class ConfiguredFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Bool
+
+    init(_ value: Bool) { stored = value }
+
+    var value: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return stored
+        }
+        set {
+            lock.lock()
+            stored = newValue
+            lock.unlock()
+        }
     }
 }
