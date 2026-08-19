@@ -165,16 +165,13 @@ remote; перебить отказ можно явным `/wtrm <имя> force`
 
 Вручную: `make run` (то же самое, что `claude-rc bot` — см. раздел «CLI»).
 
-Автозапуск. Подставь в `launchd/com.nvinnikov.claude-rc.plist` свои пути вместо
-`/Users/YOUR_USERNAME/claude-rc` (`WorkingDirectory`, `PATH`, пути логов), при
-необходимости поправь путь к `uv` (`which uv`). Затем:
-
-```bash
-ln -sf "$PWD/launchd/com.nvinnikov.claude-rc.plist" ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.nvinnikov.claude-rc.plist
-```
-
-Остановить: `launchctl unload ~/Library/LaunchAgents/com.nvinnikov.claude-rc.plist`
+Приложение в меню-баре. `make app` собирает `ClaudeRC.app` в `app/build/` —
+Xcode не нужен, бандл складывается скриптом `app/make-app.sh` из бинаря SPM.
+Перенеси `ClaudeRC.app` в `/Applications` и запусти: бот живёт внутри
+приложения как дочерний процесс, иконка в меню-баре показывает его состояние,
+`Stop bot`/`Start bot` включают и гасят его вручную. Галочка `Launch at login`
+регистрирует приложение через `SMAppService` — тумблер переживает перезапуск.
+Закрыл приложение (`Quit`) — бот погас вместе с ним.
 
 Чтобы бот отвечал, мак не должен засыпать: `sudo pmset -c sleep 0`.
 
