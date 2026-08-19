@@ -14,6 +14,7 @@ import os as os  # тесты подменяют cli.os.path.lexists — реэ�
 import shutil as shutil  # тесты подменяют cli.shutil/cli.sys.stdin — реэкспорт для mypy --strict
 import subprocess as subprocess  # тесты подменяют cli.subprocess.run
 import sys as sys
+import tempfile
 import tomllib
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
@@ -284,6 +285,11 @@ async def _run_setup(target: Path) -> int:
         print(f"не удалось проверить {target}: {exc}", file=sys.stderr)
         return EXIT_ENVIRONMENT
 
+    # is_ours — не «config_exists», а именно «похоже на конфиг claude-rc»
+    # (есть bot_token). Технические поля (_current_extras) переносим только
+    # отсюда: из файла, который мы сами отказались бы переписывать без
+    # подтверждения, читать что-либо как «своё» нельзя — это чужие данные.
+    is_ours = False
     if config_exists:
         raw = _read_raw_toml(target)
         if raw is None:
@@ -297,7 +303,16 @@ async def _run_setup(target: Path) -> int:
                 "перенести их не получится.",
                 file=sys.stderr,
             )
-        if raw is None or "bot_token" not in raw:
+        else:
+            is_ours = "bot_token" in raw
+            if not is_ours:
+                print(
+                    "  ! Файл не похож на конфиг claude-rc — технические "
+                    "настройки из него (worktree_root, scan_depth и т.п.), "
+                    "если они там есть, не переносятся.",
+                    file=sys.stderr,
+                )
+        if not is_ours:
             # Не похоже на конфиг claude-rc: не парсится вовсе или нет ключа,
             # которым мы вообще узнаём свой файл. Переписывать такой без
             # подтверждения нельзя — Enter не должен молча означать «да».
@@ -308,6 +323,16 @@ async def _run_setup(target: Path) -> int:
             ):
                 print("Отменено — файл не тронут.", file=sys.stderr)
                 return EXIT_ENVIRONMENT
+        else:
+            # Свой файл — перезапись обычна и вопросов не добавляет, но про
+            # потерю комментариев и полей вне известного списка визард раньше
+            # молчал (хотя про непереносимый тип поля — предупреждает ниже):
+            # асимметрия, а не тишина по делу.
+            print(
+                "  Существующий конфиг будет переписан — комментарии и любые "
+                "поля вне тех, что знает визард, будут потеряны.",
+                file=sys.stderr,
+            )
 
     token = await _ask_token(current.bot_token if current else None)
     if token is None:
@@ -326,7 +351,10 @@ async def _run_setup(target: Path) -> int:
         return EXIT_ENVIRONMENT
 
     answers = setup.Answers(bot_token=token, allowed_user_id=user_id, rc_roots=roots)
-    extras = _current_extras(target)
+    # Технические поля переносим только из файла, который опознали как свой —
+    # у чужого файла (Hugo, что угодно) worktree_root или scan_depth к нам
+    # отношения не имеют, даже если человек согласился его переписать.
+    extras = _current_extras(target) if is_ours else {}
     for key, type_name in setup.unsupported_extra_keys(extras):
         # Человек должен узнать, что поле пропало, а не найти это через полгода,
         # разбирая, откуда в конфиге нет его правки.
@@ -356,27 +384,41 @@ async def _run_setup(target: Path) -> int:
 
 
 def _write_config(target: Path, content: str) -> None:
-    """Пишет файл сразу с правами 600 и дожимает их, даже если файл уже был.
+    """Пишет во временный файл рядом и атомарно подменяет им целевой путь.
 
-    `write_text` создаёт файл по umask (обычно 0644): до отдельного `chmod`
-    токен в нём читаем любым пользователем машины. Но и `0o600` в `os.open`
-    не панацея: этот режим действует только при *создании* файла — если
-    `config.toml` уже лежал с более широкими правами (например, от версии
-    без этой правки), `O_CREAT` их не тронет. Поэтому дожимаем `os.fchmod` по
-    дескриптору — не `os.chmod` по пути, чтобы между открытием и сужением
-    прав путь не успел подмениться (например, на симлинк).
+    `O_TRUNC` прямо по `target` сначала обнуляет файл, потом пишет — если
+    процесс умрёт между этими моментами, конфиг уничтожен, а токен записан
+    наполовину. Именно этот файл человек не коммитит и нигде не дублирует:
+    восстановить неоткуда. `os.replace` атомарен в пределах одной файловой
+    системы (временный файл лежит в том же каталоге, что и `target`, — это
+    условие и обеспечивает), поэтому целевой путь в любой момент либо старый
+    целиком, либо новый целиком, третьего не бывает.
+
+    Права `0600` выставляем на временный файл `os.fchmod`'ом ДО записи — если
+    выставить после, окно «файл на диске читаем всем» просто переедет с
+    `target` на временный файл, а не исчезнет.
     """
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        os.fchmod(fh.fileno(), 0o600)
-        fh.write(content)
+    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _current_answers(target: Path) -> setup.Answers | None:
     """Что уже настроено. Битый конфиг — то же, что его отсутствие для этих трёх полей."""
     try:
         config = load_config(target)
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError, TypeError):
+        # TypeError — например, scan_depth в файле оказался списком, а не
+        # числом: int(raw.get("scan_depth", 3)) падает не ValueError. Без
+        # этого визард крашился бы трейсбеком на файле с любым битым по типу
+        # техническим полем, а не только с плохим rc_roots.
         return None
     return setup.Answers(
         bot_token=config.bot_token,

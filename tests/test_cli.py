@@ -937,30 +937,26 @@ def test_setup_warns_about_dropped_extra_key(
     # опечатки). Молча отбрасывать его нельзя: человек должен узнать, какой
     # именно ключ пропал и почему, а не найти это полгода спустя.
     #
-    # _current_extras подменяем напрямую, а не кладём битый TOML на диск: такое
-    # значение не проходит и int(raw.get("scan_depth", ...)) в load_config, то
-    # есть уронило бы весь _current_answers ещё до этой ветки — а тест целится
-    # именно в предупреждение при записи, не в устойчивость парсинга.
+    # Файл настоящий (bot_token на месте — иначе extras не переносятся вовсе,
+    # см. test_setup_does_not_import_extras_from_a_foreign_file), но
+    # scan_depth в нём битого типа. load_config тоже споткнётся на int([...])
+    # (TypeError, который _current_answers теперь тоже ловит), так что current
+    # будет None и все три вопроса требуют полного ручного ответа — это не
+    # мешает: _current_extras читает сырым tomllib независимо от load_config.
     root = tmp_path / "code"
     root.mkdir()
     target = tmp_path / "config.toml"
     token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+    target.write_text(
+        f'bot_token = "{token}"\nallowed_user_id = 1\nrc_roots = ["{root}"]\n'
+        'scan_depth = ["a", "b"]\n'
+    )
 
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
-    monkeypatch.setattr(cli, "_current_extras", lambda t: {"scan_depth": ["a", "b"]})
-    monkeypatch.setattr(
-        cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(pid=None, checked=True)
-    )
-    # токен, «y» на автоподхват, «y» на подтверждение отправителя, каталоги
-    answers = iter([token, "y", "y", str(root)])
-    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": token)
+    answers = iter(["1", str(root)])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
-
-    async def fake_catch(value: str, **kwargs: object) -> cli.setup.CaughtSender:
-        return cli.setup.CaughtSender(user_id=42, display_name="Test User", username="testuser")
-
-    monkeypatch.setattr(cli.setup, "catch_user_id", fake_catch)
 
     async def fake_verify(value: str) -> cli.setup.TokenCheck:
         return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
@@ -972,6 +968,40 @@ def test_setup_warns_about_dropped_extra_key(
     assert "scan_depth" in err
     assert "list" in err
     assert "scan_depth" not in target.read_text()
+
+
+def test_setup_does_not_import_extras_from_a_foreign_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Логика была бы противоречивой: отказываемся переписывать чужой файл без
+    # подтверждения, но читаем из него worktree_root/scan_depth как из своего.
+    # Чужие поля к нам отношения не имеют — переносить их нельзя, даже если
+    # человек согласился файл переписать.
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    target.write_text('scan_depth = 9\nworktree_root = "/tmp/foreign"\ntitle = "not ours"\n')
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    # «y» на подтверждение перезаписи чужого файла, дальше — токен, user_id, каталоги
+    answers = iter(["y", token, "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    written = target.read_text()
+    assert "scan_depth" not in written
+    assert "worktree_root" not in written
+    err = capsys.readouterr().err
+    assert "не переносятся" in err.lower()
 
 
 def test_setup_shows_caught_sender_and_falls_back_when_confirmation_declined(
@@ -1302,3 +1332,117 @@ def test_setup_warns_when_existing_file_fails_to_parse_but_allows_confirmed_over
     err = capsys.readouterr().err
     assert "не разобрался как toml" in err.lower()
     assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_setup_write_leaves_no_temp_files_and_correct_content(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # os.replace атомарен: либо весь новый файл, либо весь старый — но только
+    # если временный файл убирается сам собой (сменой имени) и не остаётся
+    # мусором в каталоге при успехе.
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    answers = iter([token, "n", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+    config = cli.load_config(target)
+    assert config.allowed_user_id == 42
+    assert config.rc_roots == (root,)
+    assert {p.name for p in tmp_path.iterdir()} == {"config.toml", "code"}
+
+
+def test_write_config_cleans_up_temp_file_on_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "config.toml"
+
+    def explode(*args: object, **kwargs: object) -> None:
+        raise OSError("диск кончился")
+
+    monkeypatch.setattr(cli.os, "replace", explode)
+
+    with pytest.raises(OSError):
+        cli._write_config(target, 'bot_token = "x"\n')
+
+    # Ни целевого файла, ни временного — os.replace не добрался до конца.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_setup_warns_before_overwriting_own_existing_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Про потерю ключа неподдерживаемого типа визард предупреждает прямо, а
+    # про потерю комментариев и полей вне известного списка молчал —
+    # асимметрия. Строка должна появиться перед перезаписью существующего
+    # (опознанного как наш) конфига.
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+    target.write_text(
+        cli.setup.render_config(
+            cli.setup.Answers(bot_token=token, allowed_user_id=7, rc_roots=(root,))
+        )
+    )
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": "")
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    err = capsys.readouterr().err
+    assert "комментарии" in err.lower()
+
+
+def test_setup_does_not_warn_about_comments_for_a_brand_new_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    answers = iter([token, "n", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert "комментарии" not in capsys.readouterr().err.lower()
+
+
+def test_current_answers_survives_wrong_typed_technical_field(tmp_path: Path) -> None:
+    # int(raw.get("scan_depth", 3)) на списке падает TypeError, не ValueError —
+    # без явного отлова _current_answers ронял бы весь визард трейсбеком на
+    # конфиге с любым битым по типу техническим полем, не только с плохим
+    # rc_roots.
+    target = tmp_path / "config.toml"
+    target.write_text('bot_token = "123456:x"\nallowed_user_id = 1\nscan_depth = ["a", "b"]\n')
+    assert cli._current_answers(target) is None
