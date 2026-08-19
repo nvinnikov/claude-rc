@@ -136,9 +136,7 @@ async def catch_user_id(token: str, *, timeout_s: float = 120.0) -> int | None:
     Зовётся только пока бот не настроен, то есть заведомо не запущен: второй
     поллер того же токена ломает работающего бота.
     """
-    from aiogram import Bot
-
-    bot = Bot(token=token)
+    bot = _make_bot(token)
     deadline = asyncio.get_running_loop().time() + timeout_s
     offset: int | None = None
     try:
@@ -151,6 +149,8 @@ async def catch_user_id(token: str, *, timeout_s: float = 120.0) -> int | None:
                 if sender is not None:
                     return int(sender.id)
     except Exception:
+        # Тот же довод, что и в verify_token: текст ошибки может содержать токен
+        # (он в URL запроса) — наружу отдаём None, а не исключение с его текстом.
         return None
     finally:
         await _close(bot)
@@ -169,6 +169,8 @@ def _toml_string(value: str) -> str:
     literal = f'"{escaped}"'
     # Дешёвая страховка от собственной ошибки экранирования: если получившийся
     # литерал не читается обратно, лучше упасть здесь, чем отдать битый конфиг.
+    # Значение в сообщение не кладём: сюда попадает и bot_token, а текст исключения
+    # долетает до логов и трейсбеков.
     if tomllib.loads(f"x = {literal}")["x"] != value:
-        raise ValueError(f"не удалось закодировать значение для TOML: {value!r}")
+        raise ValueError("не удалось закодировать значение для TOML")
     return literal

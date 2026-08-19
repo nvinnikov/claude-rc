@@ -178,3 +178,83 @@ async def test_verify_token_never_echoes_the_token(
     monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeBot(token, "bad"))
     check = await setup.verify_token(secret)
     assert "SECRETVALUE" not in check.detail
+
+
+class _FakeSender:
+    def __init__(self, user_id: int) -> None:
+        self.id = user_id
+
+
+class _FakeMessage:
+    def __init__(self, user_id: int) -> None:
+        self.from_user = _FakeSender(user_id)
+
+
+class _FakeUpdate:
+    def __init__(self, update_id: int, message: _FakeMessage | None = None) -> None:
+        self.update_id = update_id
+        self.message = message
+
+
+class _FakeUpdatesBot:
+    """Заглушка для catch_user_id: отдаёт заранее заготовленные партии обновлений
+    и запоминает offset, с которым её вызвали — второй поллер того же токена
+    без сдвига offset вечно перечитывал бы одно и то же обновление."""
+
+    def __init__(self, batches: list[list[_FakeUpdate]], behaviour: str = "ok") -> None:
+        self._batches = list(batches)
+        self.behaviour = behaviour
+        self.seen_offsets: list[int | None] = []
+
+    async def get_updates(self, offset: int | None = None, timeout: int = 5) -> list[_FakeUpdate]:
+        self.seen_offsets.append(offset)
+        if self.behaviour == "offline":
+            raise OSError("нет сети")
+        if self._batches:
+            return self._batches.pop(0)
+        return []
+
+
+async def test_catch_user_id_returns_sender_of_first_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batches = [[_FakeUpdate(1, _FakeMessage(777))]]
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeUpdatesBot(batches))
+    got = await setup.catch_user_id("123456:x", timeout_s=1.0)
+    assert got == 777
+
+
+async def test_catch_user_id_ignores_updates_without_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Например edited_message: update есть, а message — нет, за ответ не считается.
+    batches = [[_FakeUpdate(1)], [_FakeUpdate(2, _FakeMessage(42))]]
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeUpdatesBot(batches))
+    got = await setup.catch_user_id("123456:x", timeout_s=1.0)
+    assert got == 42
+
+
+async def test_catch_user_id_advances_offset_past_seen_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batches = [[_FakeUpdate(9)], [_FakeUpdate(10, _FakeMessage(1))]]
+    bot = _FakeUpdatesBot(batches)
+    monkeypatch.setattr(setup, "_make_bot", lambda token: bot)
+    await setup.catch_user_id("123456:x", timeout_s=1.0)
+    assert bot.seen_offsets == [None, 10]
+
+
+async def test_catch_user_id_returns_none_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeUpdatesBot([]))
+    got = await setup.catch_user_id("123456:x", timeout_s=0.02)
+    assert got is None
+
+
+async def test_catch_user_id_returns_none_when_network_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeUpdatesBot([], "offline"))
+    got = await setup.catch_user_id("123456:x", timeout_s=1.0)
+    assert got is None
