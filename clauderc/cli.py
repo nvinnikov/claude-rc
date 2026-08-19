@@ -297,8 +297,15 @@ async def _run_setup(target: Path) -> int:
             file=sys.stderr,
         )
     try:
+        parent_existed = target.parent.exists()
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.parent.chmod(0o700)
+        if not parent_existed:
+            # Сужаем права только каталогу, который создали сами. paths.config_file()
+            # может вернуть `./config.toml` из текущего каталога (документированный
+            # способ работы в клоне) или путь из $CLAUDE_RC_CONFIG — в обоих случаях
+            # это не наш каталог, и его права трогать нельзя (первое — вообще корень
+            # чужого репозитория).
+            target.parent.chmod(0o700)
         _write_config(target, setup.render_config(answers, extra=extras))
     except OSError as exc:
         print(f"не удалось записать {target}: {exc}", file=sys.stderr)
@@ -443,9 +450,12 @@ def _should_attempt_autopickup() -> bool:
             "вовремя или не найден в PATH.",
             file=sys.stderr,
         )
+        # default=False: пустой ответ здесь не должен означать «пробуем» — согласие
+        # рядом с работающим ботом может его сломать.
         return _agrees(
             "Проверить не вышло. Если бот уже работает, автоподхват его сломает — "
-            "всё равно попробовать?"
+            "всё равно попробовать?",
+            default=False,
         )
     return _agrees("Узнать твой user_id автоматически? Напишешь боту любое сообщение.")
 
@@ -478,7 +488,9 @@ async def _ask_user_id(current: int | None, token: str, *, config_exists: bool) 
             # input() — та не гарантированно долетает до stdout (см. _agrees).
             handle = f" (@{caught.username})" if caught.username else ""
             print(f"  Поймал: {caught.display_name}{handle}, id {caught.user_id}.")
-            if _agrees("Это ты?"):
+            # default=False: это ровно тот вопрос, где ошибка отдаёт машину
+            # постороннему — Enter не должен молча означать «да».
+            if _agrees("Это ты?", default=False):
                 print(f"  ✓ user_id: {caught.user_id}")
                 return caught.user_id
             print("  Не совпало — введи вручную.")
@@ -498,8 +510,18 @@ async def _ask_user_id(current: int | None, token: str, *, config_exists: bool) 
     return None
 
 
-def _agrees(question: str) -> bool:
-    return input(f"{question} [Y/n]: ").strip().lower() in {"", "y", "yes", "д", "да"}
+def _agrees(question: str, *, default: bool = True) -> bool:
+    """Да/нет с явным умолчанием на пустой ответ — не всегда «да».
+
+    `default=False` — для вопросов, где ошибка дорого стоит (принять чужой
+    id, поллить рядом с уже работающим ботом): Enter там не должен молча
+    означать согласие. Подсказка `[y/N]`/`[Y/n]` показывает, что выберет тишина.
+    """
+    hint = "[Y/n]" if default else "[y/N]"
+    raw = input(f"{question} {hint}: ").strip().lower()
+    if not raw:
+        return default
+    return raw in {"y", "yes", "д", "да"}
 
 
 def _ask_roots(current: tuple[Path, ...] | None) -> tuple[Path, ...]:

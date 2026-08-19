@@ -375,6 +375,39 @@ def test_doctor_never_prints_the_token_on_broken_config(
     assert "SECRET_VALUE" not in captured.err
 
 
+def test_agrees_default_true_accepts_empty_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    assert cli._agrees("вопрос") is True
+
+
+def test_agrees_default_false_rejects_empty_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Рискованные вопросы (принять чужой id, поллить рядом с живым ботом) не
+    # должны трактовать тишину как согласие.
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    assert cli._agrees("вопрос", default=False) is False
+
+
+def test_agrees_hint_shows_which_answer_default_is(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+
+    def fake_input(prompt: str = "") -> str:
+        seen.append(prompt)
+        return ""
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    cli._agrees("вопрос", default=True)
+    cli._agrees("вопрос", default=False)
+    assert "[Y/n]" in seen[0]
+    assert "[y/N]" in seen[1]
+
+
+def test_agrees_explicit_answer_overrides_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    assert cli._agrees("вопрос", default=False) is True
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    assert cli._agrees("вопрос", default=True) is False
+
+
 def test_setup_without_tty_refuses(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1042,3 +1075,90 @@ def test_setup_names_token_rejected_distinctly_from_timeout(
     assert "отверг" in out.lower()
     assert "не дождался" not in out.lower()
     assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_setup_empty_answer_to_sender_confirmation_falls_back_to_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # "Это ты?" рискованный вопрос: пустой ответ не должен молча приниматься
+    # за «да» — иначе Enter отдаёт машину постороннему.
+    target = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    async def fake_catch(value: str, **kwargs: object) -> cli.setup.CaughtSender:
+        return cli.setup.CaughtSender(user_id=999, display_name="Кто-то", username=None)
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", fake_catch)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    # токен, «y» на автоподхват, пустой ответ на «Это ты?», ручной user_id, каталоги
+    answers = iter([token, "y", "", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_setup_narrows_permissions_of_newly_created_config_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "code"
+    root.mkdir()
+    config_dir = tmp_path / "fresh-config-dir"
+    target = config_dir / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    answers = iter([token, "n", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert not config_dir.exists()
+    assert cli.main(["setup"]) == 0
+    assert oct(config_dir.stat().st_mode & 0o777) == "0o700"
+
+
+def test_setup_leaves_permissions_of_preexisting_config_dir_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # paths.config_file() может вернуть ./config.toml из текущего каталога — это
+    # документированный способ работы в клоне, и в этом случае target.parent —
+    # корень чужого репозитория. Сужать ему права нельзя.
+    root = tmp_path / "code"
+    root.mkdir()
+    config_dir = tmp_path / "existing-repo"
+    config_dir.mkdir()
+    config_dir.chmod(0o755)  # mkdir(mode=...) проходит через umask — выставляем явно
+    target = config_dir / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, True))
+    answers = iter([token, "n", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert oct(config_dir.stat().st_mode & 0o777) == "0o755"

@@ -13,12 +13,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from aiogram.exceptions import (
-    TelegramConflictError,
-    TelegramNetworkError,
-    TelegramUnauthorizedError,
-)
-
 _TOKEN = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
 _VISIBLE_TAIL = 4
 
@@ -144,6 +138,10 @@ async def verify_token(token: str) -> TokenCheck:
     полчаса. Отсутствие сети и отказ Telegram различаются: в первом случае
     настройку можно продолжать, во втором — бессмысленно.
     """
+    # Ленивый импорт: aiogram — самая тяжёлая часть импорта этого модуля
+    # (~1.5с), а verify_token зовут не всегда, что этот вызов и оправдывает.
+    from aiogram.exceptions import TelegramNetworkError
+
     if not looks_like_token(token):
         return TokenCheck(False, None, False, "не похоже на токен от @BotFather")
 
@@ -210,6 +208,9 @@ async def catch_user_id(token: str, *, timeout_s: float = 120.0) -> CaughtSender
     Зовётся только пока бот не настроен, то есть заведомо не запущен: второй
     поллер того же токена ломает работающего бота.
     """
+    # Ленивый импорт: см. довод в verify_token.
+    from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
+
     bot = _make_bot(token)
     try:
         offset = await _first_fresh_offset(bot)
