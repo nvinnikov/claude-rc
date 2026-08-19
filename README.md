@@ -150,14 +150,30 @@ remote; перебить отказ можно явным `/wtrm <имя> force`
 - **из релиза на GitHub** — скачать `ClaudeRC.app.zip` и пакет со
   [страницы релизов](https://github.com/nvinnikov/claude-rc/releases), см. раздел
   «Релиз» ниже про снятие карантина;
-- **через Homebrew** — `brew install nvinnikov/tap/claude-rc-app` поставит и
-  тулзу, и приложение. Формула и cask лежат в `packaging/homebrew/`, но
-  репозиторий `nvinnikov/homebrew-tap` пока не создан — этот способ ещё не
-  заработает, пока его не завести руками (см. `packaging/homebrew/README.md`).
+- **через Homebrew** —
+
+  ```bash
+  brew install nvinnikov/tap/claude-rc-app
+  ```
+
+  поставит и тулзу, и приложение (формула `claude-rc` подтягивается как
+  зависимость каска). Только тулзу без приложения — `brew install
+  nvinnikov/tap/claude-rc`. Источник формулы и каска — `packaging/homebrew/`
+  в этом репозитории, а сам tap — `nvinnikov/homebrew-tap` (см.
+  `packaging/homebrew/README.md` про то, как он обновляется под релиз).
   Cask, как и ручная установка из зипа, ставит карантин на скачанный бандл —
   подписи Developer ID нет, поэтому после установки нужно то же самое снятие
   карантина, что и в разделе «Релиз» ниже (`brew` печатает команду в caveats
-  после установки).
+  после установки). Формула собирает `pydantic-core` (зависимость `aiogram`)
+  из исходников на Rust, поэтому `brew install` занимает минуты, а не
+  секунды, — это не зависание.
+
+  Если тулза уже стоит через `uv tool install` (см. «Установка руками»
+  ниже) в `~/.local/bin`, а этот каталог в `PATH` раньше, чем `brew --prefix`
+  (`/opt/homebrew/bin` на Apple Silicon) — `claude-rc` по имени продолжит
+  резолвиться в старую копию из `~/.local/bin`, даже после установки через
+  Homebrew. `brew` предупреждает об этом в выводе (`shadowed by ...`); версию
+  конкретной копии показывает `claude-rc version`, путь — `which claude-rc`.
 
 `make install` ставит всё одной командой: тулзу `claude-rc` в `~/.local/bin` (через
 `uv tool install`) и `ClaudeRC.app` в `/Applications`. Приложение перед копированием

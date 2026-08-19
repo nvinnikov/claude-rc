@@ -1,32 +1,54 @@
 # Homebrew tap
 
 Формула и cask для установки `claude-rc` и `ClaudeRC.app` через Homebrew.
-Не самодостаточный tap — заготовки, которые нужно скопировать в отдельный
-репозиторий `nvinnikov/homebrew-tap`:
+Не самодостаточный tap — это источник, а живут файлы в отдельном репозитории
+[`nvinnikov/homebrew-tap`](https://github.com/nvinnikov/homebrew-tap):
 
 - `claude-rc.rb` → `Formula/claude-rc.rb`
 - `claude-rc-app.rb` → `Casks/claude-rc-app.rb`
 
+Изменения сюда и в тап вносятся отдельно, руками: копия должна быть один в
+один, но автоматической синхронизации нет (см. «Почему нет автоматического
+пуша» ниже).
+
 ## Обновление под релиз
 
-После каждого релиза (см. `.github/workflows/release.yml`) в оба файла нужно
-руками подставить:
+После каждого релиза (см. `.github/workflows/release.yml`) в обоих файлах —
+здесь и в `nvinnikov/homebrew-tap` — нужно руками подставить:
 
-- `VERSION` — версия релиза, без `v` (например `0.1.0`);
-- `REPLACE_WITH_SHA256` — чексумма соответствующего артефакта. Джоба `publish`
-  печатает `shasum -a 256` по `claude_rc-VERSION.tar.gz` и `ClaudeRC.app.zip`
-  в свой лог — оттуда и копировать.
+- `url`/`version` — версия релиза (в формуле — часть `url`, вида `v0.2.0`; в
+  каске — поле `version` без `v`);
+- `sha256` — чексумма соответствующего артефакта. Джоба `publish` печатает
+  `shasum -a 256` по `claude_rc-VERSION.tar.gz` и `ClaudeRC.app.zip` в свой
+  лог — оттуда и копировать.
 
-Перед первой публикацией формулы **обязательно**, иначе `brew install` упадёт:
-сгенерировать блоки `resource` для зависимостей `claude-rc` (в первую очередь
-`aiogram` и всё, что она тянет) — `virtualenv_install_with_resources` без них
-ставит только сам пакет. Команда (из корня клонированного tap):
+Если релиз меняет зависимости `claude-rc` (новый пакет, апгрейд `aiogram`
+и то, что она тянет), блоки `resource` в формуле нужно перегенерировать —
+иначе `brew install` поставит версии зависимостей, зафиксированные на
+момент прошлого релиза, а не те, что нужны новому коду. Команда (из корня
+клонированного `nvinnikov/homebrew-tap`, brew 6.x требует `trust` перед
+загрузкой формулы из неофициального tap):
 
 ```bash
+brew trust --formula nvinnikov/tap/claude-rc
 brew update-python-resources Formula/claude-rc.rb
 ```
 
-Без этого шага формула не установится.
+Без блоков `resource` формула не установится вовсе (первая публикация) или
+установит не те зависимости (последующие релизы с изменившимся деревом).
+
+`pydantic-core` (транзитивная зависимость `aiogram` → `pydantic`) — это
+Rust-расширение, ставится только из sdist, а её build backend `maturin`
+сам собирается из исходников в изолированном окружении сборки Homebrew.
+Поэтому в формуле есть `depends_on "rust" => :build` — без него `brew
+install` падает на `Failed to build installable wheels ... maturin`. Если
+при следующей генерации `brew update-python-resources` этот `depends_on`
+уберёт как «лишний» (сам он про Rust ничего не знает), верните его руками.
+
+Из-за этой же сборки из исходников `brew install nvinnikov/tap/claude-rc`
+занимает не секунды, а минуты (~1.5–2 на чистой машине без готового `rust`)
+— compiler-toolchain компилирует и сам Rust (если его ещё нет), и
+`maturin`, и `pydantic-core`. Это не зависание, а ожидаемое время сборки.
 
 ## Лицензия
 

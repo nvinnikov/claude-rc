@@ -1,6 +1,6 @@
 cask "claude-rc-app" do
-  version "VERSION"
-  sha256 "REPLACE_WITH_SHA256"
+  version "0.2.0"
+  sha256 "18eecdba40f0eeebe0df1599ff0fdab4de89ddbfe41092aa505241a1137895cf"
 
   url "https://github.com/nvinnikov/claude-rc/releases/download/v#{version}/ClaudeRC.app.zip"
   name "ClaudeRC"
@@ -11,7 +11,7 @@ cask "claude-rc-app" do
   # Полный путь тапа — иначе зависимость резолвится только потому, что тап
   # уже подключён у того, кто ставит cask руками, а не сама по себе.
   depends_on formula: "nvinnikov/tap/claude-rc"
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
   # app/make-app.sh собирает `swift build -c release` без указания архитектур —
   # бинарь получается под архитектуру сборочной машины (arm64), универсального
   # никто не делает. На Intel cask ставил бы бандл, который не запустится.
