@@ -62,6 +62,21 @@ def render_config(answers: Answers, *, extra: dict[str, object] | None = None) -
     return base + "".join(lines)
 
 
+def unsupported_extra_keys(extra: dict[str, object] | None) -> tuple[tuple[str, str], ...]:
+    """Ключи `extra`, которые `render_config` молча отбросил, и их тип.
+
+    Отдельно от `render_config`, а не print внутри нее: та функция чистая и
+    только строит текст. Человек должен узнать, что поле пропало, а не
+    обнаружить это через полгода, разбирая, откуда в конфиге нет его правки —
+    печатью занимается вызывающий код в cli.py.
+    """
+    if not extra:
+        return ()
+    return tuple(
+        (key, type(value).__name__) for key, value in extra.items() if _toml_value(value) is None
+    )
+
+
 def parse_roots(raw: str, *, default: tuple[Path, ...]) -> tuple[Path, ...]:
     """Разбирает ответ про каталоги: несколько путей через запятую."""
     items = [chunk.strip() for chunk in raw.split(",")]

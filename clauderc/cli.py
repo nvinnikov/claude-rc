@@ -12,13 +12,13 @@ import getpass as getpass  # тесты подменяют cli.getpass.getpass �
 import json
 import os as os  # тесты подменяют cli.os.path.lexists — реэкспорт для mypy --strict
 import shutil as shutil  # тесты подменяют cli.shutil/cli.sys.stdin — реэкспорт для mypy --strict
-import subprocess
+import subprocess as subprocess  # тесты подменяют cli.subprocess.run
 import sys as sys
 import tomllib
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
 from clauderc import setup as setup  # тесты подменяют cli.setup.verify_token/catch_user_id
@@ -287,10 +287,19 @@ async def _run_setup(target: Path) -> int:
         return EXIT_ENVIRONMENT
 
     answers = setup.Answers(bot_token=token, allowed_user_id=user_id, rc_roots=roots)
+    extras = _current_extras(target)
+    for key, type_name in setup.unsupported_extra_keys(extras):
+        # Человек должен узнать, что поле пропало, а не найти это через полгода,
+        # разбирая, откуда в конфиге нет его правки.
+        print(
+            f"  ! поле «{key}» ({type_name}) не перенесено — не умею записать такой "
+            "тип в TOML, правь его в файле руками.",
+            file=sys.stderr,
+        )
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.parent.chmod(0o700)
-        _write_config(target, setup.render_config(answers, extra=_current_extras(target)))
+        _write_config(target, setup.render_config(answers, extra=extras))
     except OSError as exc:
         print(f"не удалось записать {target}: {exc}", file=sys.stderr)
         return EXIT_FAILED
@@ -378,8 +387,21 @@ async def _ask_token(current: str | None) -> str | None:
 _BOT_PROCESS_PATTERN = r"(^|/)claude-rc bot$|-m clauderc\.bot$"
 
 
-def _foreign_bot_pid() -> int | None:
-    """PID уже работающего `claude-rc bot`, если такой процесс есть.
+class _ForeignBotCheck(NamedTuple):
+    """Результат поиска живого `claude-rc bot`.
+
+    `checked=False` — не «бота нет», а «не смогли проверить» (pgrep не ответил
+    вовремя или не установлен). Разница важна: молча трактовать её как «нет
+    бота» значит идти на автоподхват вслепую именно тогда, когда проверка
+    нужнее всего.
+    """
+
+    pid: int | None
+    checked: bool
+
+
+def _foreign_bot_pid() -> _ForeignBotCheck:
+    """Ищет живой `claude-rc bot`.
 
     `config_exists`/`current is None` — только прокси для «бот, скорее всего,
     работает». Это прямая проверка того факта, который на самом деле опасен:
@@ -393,10 +415,7 @@ def _foreign_bot_pid() -> int | None:
             timeout=2,
         )
     except (OSError, subprocess.TimeoutExpired):
-        # Тот же выбор, что в Swift-части: на решение "поднять поллинг рядом с
-        # ботом" отвечаем консервативно только когда проверка вообще сработала.
-        # Если pgrep не ответил или его нет — считаем, что чужого бота нет.
-        return None
+        return _ForeignBotCheck(pid=None, checked=False)
 
     own_pid = os.getpid()
     for line in result.stdout.splitlines():
@@ -405,25 +424,43 @@ def _foreign_bot_pid() -> int | None:
             continue
         pid = int(token[0])
         if pid != own_pid:
-            return pid
-    return None
+            return _ForeignBotCheck(pid=pid, checked=True)
+    return _ForeignBotCheck(pid=None, checked=True)
+
+
+def _should_attempt_autopickup() -> bool:
+    """Спрашивает разрешения на автоподхват, учитывая проверку живого бота."""
+    check = _foreign_bot_pid()
+    if check.pid is not None:
+        print(f"  Бот уже запущен (pid {check.pid}) — введи user_id вручную.")
+        return False
+    if not check.checked:
+        # Swift-версия в этом месте пишет в лог — здесь того же требует человек:
+        # без предупреждения он не узнает, что guard не сработал, и согласится
+        # на автоподхват с полной уверенностью, что чужого бота нет.
+        print(
+            "  ! Не удалось проверить, не запущен ли уже бот — pgrep не ответил "
+            "вовремя или не найден в PATH.",
+            file=sys.stderr,
+        )
+        return _agrees(
+            "Проверить не вышло. Если бот уже работает, автоподхват его сломает — "
+            "всё равно попробовать?"
+        )
+    return _agrees("Узнать твой user_id автоматически? Напишешь боту любое сообщение.")
 
 
 async def _ask_user_id(current: int | None, token: str, *, config_exists: bool) -> int | None:
     # Автоподхват предлагаем только на действительно первом запуске: если файл
     # уже есть (пусть даже не читается), бот, скорее всего, настроен и работает,
     # и поллинг рядом с ним поднимет второго поллера того же токена.
-    if current is None and not config_exists:
-        foreign_pid = _foreign_bot_pid()
-        if foreign_pid is not None:
-            print(f"  Бот уже запущен (pid {foreign_pid}) — введи user_id вручную.")
-        elif _agrees("Узнать твой user_id автоматически? Напишешь боту любое сообщение."):
-            print("  Жду сообщение боту… до 2 минут, Ctrl+C — прервать.")
-            caught = await setup.catch_user_id(token)
-            if caught is not None:
-                print(f"  ✓ user_id: {caught}")
-                return caught
-            print("  Не дождался — введи вручную.")
+    if current is None and not config_exists and _should_attempt_autopickup():
+        print("  Жду сообщение боту… до 2 минут, Ctrl+C — прервать.")
+        caught = await setup.catch_user_id(token)
+        if caught is not None:
+            print(f"  ✓ user_id: {caught}")
+            return caught
+        print("  Не дождался — введи вручную.")
 
     hint = f" [{current}]" if current else ""
     for _ in range(_ATTEMPTS):

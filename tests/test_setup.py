@@ -101,6 +101,19 @@ def test_render_config_drops_values_of_unknown_type(tmp_path: Path) -> None:
     assert "rc_roots_backup" not in parsed
 
 
+def test_unsupported_extra_keys_names_dropped_key_and_its_type() -> None:
+    # cli.py печатает предупреждение по этому списку — человек должен узнать,
+    # какое поле пропало и почему, а не найти это через полгода.
+    dropped = setup.unsupported_extra_keys({"scan_depth": 5, "rc_roots_backup": ["a", "b"]})
+    assert dropped == (("rc_roots_backup", "list"),)
+
+
+def test_unsupported_extra_keys_empty_for_supported_values() -> None:
+    assert setup.unsupported_extra_keys({"scan_depth": 5, "worktree_root": "~/x"}) == ()
+    assert setup.unsupported_extra_keys(None) == ()
+    assert setup.unsupported_extra_keys({}) == ()
+
+
 def test_parse_roots_splits_on_comma(tmp_path: Path) -> None:
     first = tmp_path / "a"
     second = tmp_path / "b"

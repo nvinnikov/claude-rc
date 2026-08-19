@@ -396,7 +396,9 @@ def test_setup_writes_config_with_tight_permissions(
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
     # Тесты идут вслепую относительно того, крутится ли на машине настоящий бот —
     # без этой заглушки «n» на автоподхват уехало бы не туда, если pgrep его найдёт.
-    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: None)
+    monkeypatch.setattr(
+        cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(pid=None, checked=True)
+    )
     answers = iter([token, "n", "42", str(root)])
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
@@ -427,7 +429,9 @@ def test_setup_never_prints_the_token(
 
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
-    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: None)
+    monkeypatch.setattr(
+        cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(pid=None, checked=True)
+    )
     answers = iter([secret, "n", "42", str(root)])
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
@@ -480,7 +484,9 @@ def test_setup_rejects_missing_directory(
 
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
-    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: None)
+    monkeypatch.setattr(
+        cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(pid=None, checked=True)
+    )
     # Каталог не существует, и человек повторяет ответ — визард переспрашивает,
     # а не пишет заведомо нерабочий конфиг.
     answers = iter([token, "n", "42", str(tmp_path / "nope"), str(tmp_path / "nope")])
@@ -544,7 +550,9 @@ def test_setup_falls_back_to_manual_user_id(
     monkeypatch.setattr(cli.setup, "catch_user_id", explode)
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
-    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: None)
+    monkeypatch.setattr(
+        cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(pid=None, checked=True)
+    )
     # токен, «n» на автоподхват, user_id, каталоги
     answers = iter([token, "n", "42", str(root)])
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
@@ -603,7 +611,9 @@ def test_setup_ctrl_c_during_autopickup_exits_cleanly(
 
     monkeypatch.setattr(cli.setup, "catch_user_id", interrupted)
     monkeypatch.setattr(cli, "_agrees", lambda question: True)
-    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: None)
+    monkeypatch.setattr(
+        cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(pid=None, checked=True)
+    )
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": token)
@@ -744,7 +754,9 @@ def test_setup_skips_autopickup_when_bot_process_is_running(
         raise AssertionError("бот уже работает — поллинг недопустим")
 
     monkeypatch.setattr(cli.setup, "catch_user_id", explode)
-    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: 4242)
+    monkeypatch.setattr(
+        cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(pid=4242, checked=True)
+    )
     monkeypatch.setattr(cli, "_agrees", lambda question: True)
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
@@ -775,7 +787,9 @@ def test_setup_offers_autopickup_when_no_bot_process_running(
         return 99
 
     monkeypatch.setattr(cli.setup, "catch_user_id", fake_catch)
-    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: None)
+    monkeypatch.setattr(
+        cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(pid=None, checked=True)
+    )
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr(cli.paths, "config_file", lambda: target)
     # токен, «y» на автоподхват, каталоги — user_id ловится автоподхватом
@@ -791,3 +805,136 @@ def test_setup_offers_autopickup_when_no_bot_process_running(
     assert cli.main(["setup"]) == 0
     assert called == [token]
     assert cli.load_config(target).allowed_user_id == 99
+
+
+def test_foreign_bot_pid_reports_unchecked_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def timed_out(*args: object, **kwargs: object) -> object:
+        raise cli.subprocess.TimeoutExpired(cmd="pgrep", timeout=2)
+
+    monkeypatch.setattr(cli.subprocess, "run", timed_out)
+    check = cli._foreign_bot_pid()
+    assert check.pid is None
+    assert check.checked is False
+
+
+def test_foreign_bot_pid_reports_unchecked_when_pgrep_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing(*args: object, **kwargs: object) -> object:
+        raise FileNotFoundError("pgrep не найден")
+
+    monkeypatch.setattr(cli.subprocess, "run", missing)
+    check = cli._foreign_bot_pid()
+    assert check.pid is None
+    assert check.checked is False
+
+
+def test_setup_warns_and_asks_when_bot_check_failed_but_declines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # pgrep не ответил вовремя — не «бота нет», а «не смогли проверить». Молчание
+    # тут хуже отказа: человек согласился бы на автоподхват, не зная, что guard
+    # не сработал. Он должен увидеть предупреждение и явно подтвердить риск.
+    target = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    def explode(value: str, **kwargs: object) -> int:
+        raise AssertionError("отказ от риска — поллинг недопустим")
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", explode)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, False))
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    # токен, «n» на предупреждение-подтверждение, user_id, каталоги
+    answers = iter([token, "n", "42", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    err = capsys.readouterr().err
+    assert "не удалось проверить" in err.lower()
+    assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_setup_proceeds_when_bot_check_failed_and_human_confirms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+    called: list[str] = []
+
+    async def fake_catch(value: str, **kwargs: object) -> int:
+        called.append(value)
+        return 77
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", fake_catch)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(None, False))
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    # токен, «y» на предупреждение-подтверждение, каталоги
+    answers = iter([token, "y", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert "не удалось проверить" in capsys.readouterr().err.lower()
+    assert called == [token]
+    assert cli.load_config(target).allowed_user_id == 77
+
+
+def test_setup_warns_about_dropped_extra_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # scan_depth — известный ключ, но со значением, для которого render_config не
+    # умеет закодировать TOML (список вместо числа — например, после ручной
+    # опечатки). Молча отбрасывать его нельзя: человек должен узнать, какой
+    # именно ключ пропал и почему, а не найти это полгода спустя.
+    #
+    # _current_extras подменяем напрямую, а не кладём битый TOML на диск: такое
+    # значение не проходит и int(raw.get("scan_depth", ...)) в load_config, то
+    # есть уронило бы весь _current_answers ещё до этой ветки — а тест целится
+    # именно в предупреждение при записи, не в устойчивость парсинга.
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr(cli, "_current_extras", lambda t: {"scan_depth": ["a", "b"]})
+    monkeypatch.setattr(
+        cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(pid=None, checked=True)
+    )
+    answers = iter([token, "y", str(root)])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_catch(value: str, **kwargs: object) -> int:
+        return 42
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", fake_catch)
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    err = capsys.readouterr().err
+    assert "scan_depth" in err
+    assert "list" in err
+    assert "scan_depth" not in target.read_text()
