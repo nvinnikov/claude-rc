@@ -1,3 +1,4 @@
+import subprocess
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -145,9 +146,23 @@ async def test_await_url_fills_tmux_name_when_session_ended_on_its_own(
     assert exc.value.tmux_name == "rc-oms"
 
 
+def _default_server_sessions() -> str:
+    """Список сессий на tmux-сервере по умолчанию — том, где живут рабочие rc-*."""
+    result = subprocess.run(["tmux", "list-sessions"], capture_output=True, text=True, check=False)
+    return result.stdout
+
+
 @pytest.mark.skipif(not remote.tmux_available(), reason="нет tmux")
 async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Сквозная проверка: настоящий tmux, вместо claude — заглушка с tty."""
+    """Сквозная проверка: настоящий tmux на отдельном сокете, claude — заглушка с tty.
+
+    Отдельный сокет (`CLAUDE_RC_TMUX_SOCKET`) — не для скорости, а для изоляции:
+    сессия теста не должна попасться на глаза боту, который следит за сервером
+    по умолчанию и честно репортит появление/исчезновение rc-* как чужую сессию.
+    """
+    socket_name = f"claude-rc-pytest-{uuid.uuid4().hex[:8]}"
+    monkeypatch.setenv(remote.TMUX_SOCKET_ENV, socket_name)
+
     url = "https://claude.ai/code/session_" + uuid.uuid4().hex[:16]
     stub = tmp_path / "fake-claude"
     stub.write_text(f'#!/bin/sh\necho "remote control active at"\necho "{url}"\nsleep 30\n')
@@ -155,6 +170,7 @@ async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr(remote, "CLAUDE_BIN", str(stub))
     repo = f"pytest-{uuid.uuid4().hex[:8]}"
 
+    before = _default_server_sessions()
     try:
         session = await remote.launch(repo, str(tmp_path), timeout_s=20)
 
@@ -164,10 +180,19 @@ async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch: pytest.Monk
         assert Path(session.cwd).resolve() == tmp_path.resolve()
         assert repo in {s.name for s in await remote.list_sessions()}
 
+        # Главное доказательство изоляции: на сервере по умолчанию сессии нет —
+        # именно её отсутствие/появление там видит watcher бота.
+        assert f"rc-{repo}" not in _default_server_sessions()
+        assert _default_server_sessions() == before
+
         assert await remote.kill_session(repo) is True
         assert repo not in {s.name for s in await remote.list_sessions()}
     finally:
         await remote._run("kill-session", "-t", f"=rc-{repo}", check=False)
+        # Гасим и сам изолированный сервер, иначе процесс tmux -L останется висеть.
+        await remote._run("kill-server", check=False)
+
+    assert _default_server_sessions() == before
 
 
 async def test_find_matches_by_directory_not_name(monkeypatch: pytest.MonkeyPatch) -> None:
