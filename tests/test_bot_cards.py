@@ -1,0 +1,81 @@
+import re
+from pathlib import Path
+
+from clauderc import bot as bot_module
+from clauderc.bot import ResumeChoice, _died_text, _pop_resume_group, _resume_keyboard
+from clauderc.watch import Died
+
+# Гашение обязано идти через Watcher — иначе намеренно погашенная сессия
+# попадает в отчёт как упавшая (см. CLAUDE.md, «Точки гашения»). Ловим прямой
+# вызов remote.kill_* мимо `watcher.`, чтобы регрессия не держалась на ручном
+# грепе при следующей правке bot.py.
+_DIRECT_KILL = re.compile(r"(?<!watcher\.)\b(?:kill_tmux|kill_all|kill_session)\(")
+
+
+def test_resume_keyboard_lists_new_continue_and_conversations() -> None:
+    markup = _resume_keyboard(
+        [
+            ("t0", "New session"),
+            ("t1", "Continue last"),
+            ("t2", "сделай релиз"),
+        ]
+    )
+    labels = [button.text for row in markup.inline_keyboard for button in row]
+    assert labels == ["New session", "Continue last", "сделай релиз"]
+
+
+def test_resume_keyboard_callback_data_fits_telegram_limit() -> None:
+    # В callback_data влезает 64 байта; id диалога туда не кладём — только токен.
+    markup = _resume_keyboard([("deadbeef", "и" * 200)])
+    (button,) = markup.inline_keyboard[0]
+    assert button.callback_data == "res:deadbeef"
+    assert len((button.callback_data or "").encode()) <= 64
+
+
+def test_died_text_names_the_directory() -> None:
+    text = _died_text(Died(name="oms", tmux_name="rc-oms", cwd="/repos/oms"))
+    assert "oms" in text
+    assert "/repos/oms" in text
+
+
+def test_died_text_escapes_html() -> None:
+    text = _died_text(Died(name="a&b", tmux_name="rc-a-b", cwd="/repos/<x>"))
+    assert "&amp;" in text
+    assert "<x>" not in text
+
+
+def test_pop_resume_group_clears_sibling_tokens() -> None:
+    # Два быстрых тапа по разным кнопкам одной карточки не должны поднять две
+    # сессии: выбор одного варианта гасит соседние токены той же карточки.
+    choice_a: ResumeChoice = (Path("/repos/oms"), None, None)
+    choice_b: ResumeChoice = (Path("/repos/oms"), None, "last")
+    pending: dict[str, tuple[str, ResumeChoice]] = {
+        "t0": ("g1", choice_a),
+        "t1": ("g1", choice_b),
+        "t2": ("g2", (Path("/repos/geo"), None, None)),
+    }
+
+    picked = _pop_resume_group(pending, "t0")
+
+    assert picked == choice_a
+    assert "t1" not in pending, "сосед по карточке должен исчезнуть"
+    assert "t2" in pending, "токен другой карточки трогать нельзя"
+
+
+def test_pop_resume_group_unknown_token_returns_none() -> None:
+    pending: dict[str, tuple[str, ResumeChoice]] = {"t0": ("g1", (Path("/repos/oms"), None, None))}
+
+    assert _pop_resume_group(pending, "stale") is None
+    assert "t0" in pending, "неизвестный токен не должен трогать чужую карточку"
+
+
+def test_no_direct_kill_calls_bypass_watcher() -> None:
+    """Прямой вызов kill_tmux/kill_all/kill_session мимо watcher — тихий баг.
+
+    Такая сессия гаснет, но Watcher о ней не узнаёт и на следующем опросе
+    доложит о ней как об упавшей — пользователь получит карточку «сессия
+    завершилась» сразу после того, как сам её погасил.
+    """
+    source = Path(bot_module.__file__).read_text(encoding="utf-8")
+    offenders = _DIRECT_KILL.findall(source)
+    assert not offenders, f"нашёл гашение мимо watcher: {offenders}"

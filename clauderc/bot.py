@@ -19,7 +19,7 @@ from aiogram.types import (
     User,
 )
 
-from clauderc import browse, worktrees
+from clauderc import browse, history, paths, worktrees
 from clauderc.browse import BrowseError
 from clauderc.config import Config, load_config
 from clauderc.remote import (
@@ -32,15 +32,13 @@ from clauderc.remote import (
     await_url,
     confirm_trust,
     find,
-    kill_all,
-    kill_session,
-    kill_tmux,
     launch,
     list_sessions,
     tmux_available,
 )
 from clauderc.repos import discover, resolve
 from clauderc.state import State
+from clauderc.watch import Died, Watcher
 from clauderc.worktrees import Worktree, WorktreeError
 
 log = logging.getLogger("clauderc")
@@ -108,6 +106,44 @@ def _open_keyboard(url: str) -> InlineKeyboardMarkup | None:
         return None
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Open in Claude", url=url)]]
+    )
+
+
+def _resume_keyboard(items: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    """Кнопки выбора диалога: по строке на вариант, в callback_data — только токен."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=label, callback_data=f"res:{token}")]
+            for token, label in items
+        ]
+    )
+
+
+ResumeChoice = tuple[Path, str | None, str | None]
+
+
+def _pop_resume_group(
+    pending: dict[str, tuple[str, ResumeChoice]], token: str
+) -> ResumeChoice | None:
+    """Достаёт выбранный вариант и гасит остальные токены той же карточки.
+
+    Варианты одной карточки независимы только с виду: выбор любого из них должен
+    сделать соседние недействительными, иначе два быстрых тапа по разным кнопкам
+    поднимут две RC-сессии в одном каталоге.
+    """
+    entry = pending.pop(token, None)
+    if entry is None:
+        return None
+    group, choice = entry
+    for other in [key for key, (other_group, _) in pending.items() if other_group == group]:
+        pending.pop(other, None)
+    return choice
+
+
+def _died_text(died: Died) -> str:
+    return (
+        f"⚠️ Сессия <b>{html.escape(died.name)}</b> завершилась\n"
+        f"<code>{html.escape(died.cwd)}</code>"
     )
 
 
@@ -258,8 +294,7 @@ class Discovery:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    root = Path(__file__).resolve().parent.parent
-    config = load_config(root / "config.toml")
+    config = load_config(paths.config_file())
     if not tmux_available():
         raise SystemExit("tmux не найден в PATH — поставь через `brew install tmux`")
 
@@ -267,6 +302,7 @@ async def main() -> None:
     dp = Dispatcher()
     discovery = Discovery(config)
     state = State(config.state_path, config.rc_roots[0])
+    watcher = Watcher()
     # Кандидаты для кнопок выбора при неоднозначном запросе. Токен короткий,
     # потому что в callback_data влезает 64 байта — полный путь туда не поместится.
     pending: dict[str, tuple[Path, str | None]] = {}
@@ -274,8 +310,13 @@ async def main() -> None:
     trust_pending: dict[str, tuple[str, str]] = {}
     stop_pending: dict[str, str] = {}
     tree_pending: dict[str, Path] = {}
+    # Значение — (id карточки, выбор): выбор любого варианта гасит остальные
+    # токены той же карточки, чтобы два тапа не подняли две сессии в одном каталоге.
+    resume_pending: dict[str, tuple[str, ResumeChoice]] = {}
 
-    async def start_session(message: Message, target: Path, branch: str | None) -> None:
+    async def start_session(
+        message: Message, target: Path, branch: str | None, resume: str | None = None
+    ) -> None:
         head = f"⏳ Поднимаю сессию в <code>{html.escape(str(target))}</code>"
         if branch:
             head += f"\nветка <code>{html.escape(branch)}</code>"
@@ -302,7 +343,9 @@ async def main() -> None:
             return
 
         try:
-            session = await launch(cwd.name, str(cwd), timeout_s=config.launch_timeout_s)
+            session = await launch(
+                cwd.name, str(cwd), timeout_s=config.launch_timeout_s, resume=resume
+            )
         except TrustRequired as need:
             token = uuid.uuid4().hex[:8]
             trust_pending[token] = (need.tmux_name, need.cwd)
@@ -323,6 +366,11 @@ async def main() -> None:
             return
         except LaunchError as exc:
             log.warning("launch failed for %s: %s", cwd, exc)
+            if exc.tmux_name:
+                # await_url уже видел сессию мёртвой (таймаут, упала сама
+                # или исчезла между capture и list) — без метки watcher
+                # опросил бы её как упавшую следом за этим же сообщением.
+                watcher.expect_death(exc.tmux_name)
             await notice.edit_text(
                 f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800],
                 parse_mode="HTML",
@@ -331,6 +379,38 @@ async def main() -> None:
 
         await notice.edit_text(
             _fresh_text(session), parse_mode="HTML", reply_markup=_open_keyboard(session.url)
+        )
+
+    async def offer_start(message: Message, target: Path, branch: str | None) -> None:
+        """Запуск с выбором диалога, если в каталоге уже есть история.
+
+        Для новой ветки истории быть не может — там свежий worktree, и лишний
+        шаг только мешал бы.
+        """
+        if branch is not None:
+            await start_session(message, target, branch)
+            return
+
+        found = history.conversations(str(target))
+        if not found:
+            await start_session(message, target, None)
+            return
+
+        group = uuid.uuid4().hex[:8]
+        items: list[tuple[str, str]] = []
+        for label, resume in [("New session", None), ("Continue last", "last")]:
+            token = uuid.uuid4().hex[:8]
+            resume_pending[token] = (group, (target, None, resume))
+            items.append((token, label))
+        for conversation in found:
+            token = uuid.uuid4().hex[:8]
+            resume_pending[token] = (group, (target, None, conversation.session_id))
+            items.append((token, conversation.preview))
+
+        await message.answer(
+            f"В <code>{html.escape(str(target))}</code> уже есть диалоги. Что поднимаем?",
+            parse_mode="HTML",
+            reply_markup=_resume_keyboard(items),
         )
 
     async def send_tree_card(
@@ -448,7 +528,7 @@ async def main() -> None:
             )
             return
         if len(matches) == 1:
-            await start_session(message, matches[0], branch)
+            await offer_start(message, matches[0], branch)
             return
 
         rows = []
@@ -472,11 +552,11 @@ async def main() -> None:
     async def cmd_rckill(message: Message) -> None:
         parts = (message.text or "").split()
         if len(parts) < 2:
-            killed = await kill_all()
+            killed = await watcher.kill_all()
             await message.reply(f"Погашено сессий: {killed}." if killed else "Гасить нечего.")
             return
         name = parts[1]
-        if await kill_session(name):
+        if await watcher.kill_named(name):
             # Worktree намеренно остаётся: в нём может лежать несохранённая работа.
             await message.reply(f"Сессия <b>{html.escape(name)}</b> погашена.", parse_mode="HTML")
         else:
@@ -527,7 +607,7 @@ async def main() -> None:
         # Сессия держит этот каталог: не погасив её, оставим Claude в исчезнувшем cwd.
         session = await find(str(path))
         if session is not None:
-            await kill_session(session.name)
+            await watcher.kill(session.tmux_name)
 
         try:
             await worktrees.remove(config.worktree_root, name, force=force)
@@ -554,7 +634,7 @@ async def main() -> None:
             return
         await message.edit_reply_markup(reply_markup=None)
         # Ветка уже выкачена в этом каталоге — второй worktree заводить не нужно.
-        await start_session(message, path, None)
+        await offer_start(message, path, None)
 
     @dp.callback_query(F.data.startswith(("wtrm:", "wtrmf:")))
     async def on_tree_remove(query: CallbackQuery) -> None:
@@ -599,7 +679,7 @@ async def main() -> None:
         # Сессия могла подняться уже после показа карточки.
         session = await find(str(path))
         if session is not None:
-            await kill_tmux(session.tmux_name)
+            await watcher.kill(session.tmux_name)
         try:
             await worktrees.remove(config.worktree_root, path.name, force=forced)
         except WorktreeError as exc:
@@ -625,7 +705,7 @@ async def main() -> None:
                 await message.edit_reply_markup(reply_markup=None)
             return
 
-        killed = await kill_tmux(tmux_name)
+        killed = await watcher.kill(tmux_name)
         await query.answer("Погашена" if killed else "Уже не жива")
         if message is None:
             return
@@ -667,7 +747,7 @@ async def main() -> None:
             return
 
         if action == "here":
-            await start_session(message, state.cwd, None)
+            await offer_start(message, state.cwd, None)
             return
 
         if action == "newwt":
@@ -709,7 +789,7 @@ async def main() -> None:
 
         tmux_name, cwd = waiting
         if verdict == "notrust":
-            await kill_tmux(tmux_name)
+            await watcher.kill(tmux_name)
             await message.answer("Отменил, сессия погашена.")
             return
 
@@ -722,6 +802,11 @@ async def main() -> None:
             )
         except LaunchError as exc:
             log.warning("launch failed after trust for %s: %s", cwd, exc)
+            if exc.tmux_name:
+                # await_url уже видел сессию мёртвой (таймаут, упала сама
+                # или исчезла между capture и list) — без метки watcher
+                # опросил бы её как упавшую следом за этим же сообщением.
+                watcher.expect_death(exc.tmux_name)
             await message.answer(
                 f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
             )
@@ -745,9 +830,58 @@ async def main() -> None:
             await message.answer("Выбор устарел, повтори /rc.")
             return
         target, branch = choice
-        await start_session(message, target, branch)
+        await offer_start(message, target, branch)
 
-    await dp.start_polling(bot)
+    @dp.callback_query(F.data.startswith("res:"))
+    async def on_resume(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        choice = _pop_resume_group(resume_pending, (query.data or "").removeprefix("res:"))
+        await query.answer()
+        message = _live_message(query)
+        if message is None:
+            return
+        if choice is None:
+            await message.answer("Выбор устарел, повтори запуск.")
+            return
+        await message.edit_reply_markup(reply_markup=None)
+        target, branch, resume = choice
+        await start_session(message, target, branch, resume)
+
+    async def on_died(died: Died) -> None:
+        # Watcher зовёт колбэк в цикле по всем упавшим за один опрос сессиям;
+        # необработанное исключение оборвёт цикл, а его снимок уже сменился —
+        # оставшиеся падения того же опроса тогда пропадут без следа.
+        try:
+            token = uuid.uuid4().hex[:8]
+            resume_pending[token] = (token, (Path(died.cwd), None, "last"))
+            await bot.send_message(
+                config.allowed_user_id,
+                _died_text(died),
+                parse_mode="HTML",
+                reply_markup=_resume_keyboard([(token, "↻ Resume")]),
+            )
+        except Exception:
+            log.warning("failed to report died session %s", died.tmux_name, exc_info=True)
+
+    # Список — удобство при рестарте бота, а не условие запуска: ошибка Telegram
+    # здесь (бота заблокировали, сеть недоступна) не должна срывать поллинг.
+    try:
+        for session in await list_sessions():
+            await bot.send_message(
+                config.allowed_user_id,
+                _list_item(session),
+                parse_mode="HTML",
+                reply_markup=_open_keyboard(session.url),
+            )
+    except Exception:
+        log.warning("failed to send startup session list", exc_info=True)
+
+    watch_task = asyncio.create_task(watcher.run(on_died))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        watch_task.cancel()
 
 
 if __name__ == "__main__":

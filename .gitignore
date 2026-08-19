@@ -7,3 +7,6 @@ config.toml
 *.egg-info/
 .pytest_cache/
 .superpowers/
+
+# setuptools оставляет его после `uv tool install .`
+build/

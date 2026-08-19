@@ -49,7 +49,17 @@ _SCRUB_ENV = 'for v in $(env | grep ^CLAUDE_CODE_ | cut -d= -f1); do unset "$v";
 
 
 class LaunchError(RuntimeError):
-    """Сессию не удалось поднять или tmux ответил ошибкой."""
+    """Сессию не удалось поднять или tmux ответил ошибкой.
+
+    `tmux_name` заполняется, если о смерти сессии уже можно судить по этому вызову —
+    watcher её видел живой и должен считать смерть ожидаемой, а не отчитываться о ней
+    как о падении второй раз. Не только для гашения по таймауту: то же верно, если
+    сессия завершилась сама или исчезла между capture-pane и list-sessions.
+    """
+
+    def __init__(self, message: str, *, tmux_name: str | None = None) -> None:
+        super().__init__(message)
+        self.tmux_name = tmux_name
 
 
 class TrustRequired(RuntimeError):
@@ -188,8 +198,23 @@ async def kill_all() -> int:
     return killed
 
 
-async def launch(repo: str, cwd: str, *, timeout_s: float = 90.0) -> RemoteSession:
-    """Поднимает RC-сессию в `cwd` и ждёт, пока claude напечатает ссылку."""
+def _resume_flag(resume: str | None) -> str:
+    """Хвост командной строки для резюма диалога."""
+    if resume is None:
+        return ""
+    if resume == "last":
+        return " --continue"
+    return f" --resume {shlex.quote(resume)}"
+
+
+async def launch(
+    repo: str, cwd: str, *, timeout_s: float = 90.0, resume: str | None = None
+) -> RemoteSession:
+    """Поднимает RC-сессию в `cwd` и ждёт, пока claude напечатает ссылку.
+
+    `resume` продолжает прежний диалог (`"last"` — последний, id — конкретный);
+    проверка на уже живую сессию в `cwd` его не отменяет — сессия одна на каталог.
+    """
     if not tmux_available():
         raise LaunchError("tmux не найден в PATH — поставь через `brew install tmux`")
 
@@ -198,7 +223,11 @@ async def launch(repo: str, cwd: str, *, timeout_s: float = 90.0) -> RemoteSessi
         return existing
 
     name = await _unique_name(repo, cwd)
-    command = _SCRUB_ENV + f"exec {shlex.quote(CLAUDE_BIN)} --remote-control {shlex.quote(repo)}"
+    command = (
+        _SCRUB_ENV
+        + f"exec {shlex.quote(CLAUDE_BIN)} --remote-control {shlex.quote(repo)}"
+        + _resume_flag(resume)
+    )
     await _run("new-session", "-d", "-s", name, "-x", _COLS, "-y", _ROWS, "-c", cwd, command)
     return await await_url(name, cwd, timeout_s=timeout_s)
 
@@ -218,7 +247,7 @@ async def await_url(
         await asyncio.sleep(_POLL_S)
         code, pane = await _run("capture-pane", "-p", "-J", "-t", f"={name}:", check=False)
         if code != 0:
-            raise LaunchError(_failure("сессия завершилась, не отдав ссылку", pane))
+            raise LaunchError(_failure("сессия завершилась, не отдав ссылку", pane), tmux_name=name)
         match = _URL.search(pane)
         if match is None:
             if watch_trust and _TRUST_PROMPT.search(pane):
@@ -229,12 +258,12 @@ async def await_url(
         await _run("set-option", "-t", f"={name}:", _URL_OPTION, url, check=False)
         session = await find(cwd)
         if session is None:  # успела умереть между capture и list
-            raise LaunchError(_failure("сессия исчезла сразу после запуска", pane))
+            raise LaunchError(_failure("сессия исчезла сразу после запуска", pane), tmux_name=name)
         log.info("rc session %s up: %s", name, url)
         return session
 
     await _run("kill-session", "-t", f"={name}", check=False)
-    raise LaunchError(_failure(f"ссылка не появилась за {int(timeout_s)}с", pane))
+    raise LaunchError(_failure(f"ссылка не появилась за {int(timeout_s)}с", pane), tmux_name=name)
 
 
 def _failure(reason: str, pane: str) -> str:
