@@ -18,8 +18,9 @@ from pathlib import Path
 from typing import Any
 
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
+from clauderc import setup as setup  # тесты подменяют cli.setup.verify_token/catch_user_id
 from clauderc import worktrees as worktrees  # тесты подменяют cli.worktrees.ensure
-from clauderc.config import load_config
+from clauderc.config import load_config as load_config  # тесты читают cli.load_config
 from clauderc.remote import (
     LaunchError,
     RemoteSession,
@@ -75,6 +76,8 @@ def _parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="проверить окружение")
     doctor.add_argument("--json", action="store_true", dest="as_json")
+
+    sub.add_parser("setup", help="заполнить config.toml: токен, user_id, каталоги")
 
     return parser
 
@@ -173,6 +176,17 @@ class _Commands:
                 print(f"{'✓' if check['ok'] else '✗'} {check['name']}: {check['detail']}")
         return 0 if all(check["ok"] for check in checks) else EXIT_ENVIRONMENT
 
+    @staticmethod
+    def setup(args: argparse.Namespace) -> int:
+        if not sys.stdin.isatty():
+            print(
+                "setup — интерактивная команда, а stdin не терминал.\n"
+                "Запусти её в терминале: claude-rc setup",
+                file=sys.stderr,
+            )
+            return EXIT_ENVIRONMENT
+        return asyncio.run(_run_setup(paths.config_file()))
+
 
 class _TrustDeclined(RuntimeError):
     """Каталог требует подтверждения доверия, а подтвердить некому или отказались."""
@@ -225,6 +239,122 @@ async def _ask_trust(need: TrustRequired) -> RemoteSession:
     # watch_trust=False: диалог ещё мгновение висит на экране и был бы принят
     # за неотвеченный (та же причина, что в боте).
     return await await_url(need.tmux_name, need.cwd, watch_trust=False)
+
+
+# Две попытки на каждый вопрос: одна на опечатку, вторая на исправление.
+_ATTEMPTS = 2
+
+
+async def _run_setup(target: Path) -> int:
+    """Спрашивает три значения и пишет config.toml."""
+    current = _current_answers(target)
+
+    token = await _ask_token(current.bot_token if current else None)
+    if token is None:
+        return EXIT_FAILED
+
+    user_id = await _ask_user_id(current.allowed_user_id if current else None, token)
+    if user_id is None:
+        return EXIT_ENVIRONMENT
+
+    try:
+        roots = _ask_roots(current.rc_roots if current else None)
+    except setup.RootsError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_ENVIRONMENT
+
+    answers = setup.Answers(bot_token=token, allowed_user_id=user_id, rc_roots=roots)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(setup.render_config(answers))
+        # 0600: в файле боевой токен бота.
+        target.chmod(0o600)
+    except OSError as exc:
+        print(f"не удалось записать {target}: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+
+    print(f"\nГотово: {target}")
+    print("Запусти приложение ClaudeRC или `claude-rc bot`.")
+    return 0
+
+
+def _current_answers(target: Path) -> setup.Answers | None:
+    """Что уже настроено. Битый конфиг — то же, что его отсутствие."""
+    try:
+        config = load_config(target)
+    except (OSError, ValueError, KeyError):
+        return None
+    return setup.Answers(
+        bot_token=config.bot_token,
+        allowed_user_id=config.allowed_user_id,
+        rc_roots=config.rc_roots,
+    )
+
+
+async def _ask_token(current: str | None) -> str | None:
+    hint = f" [{setup.mask_token(current)}]" if current else ""
+    for _ in range(_ATTEMPTS):
+        raw = input(f"Токен бота от @BotFather{hint}: ").strip()
+        token = raw or (current or "")
+        if not token:
+            print("Токен нужен: заведи бота у @BotFather и вставь сюда.")
+            continue
+
+        check = await setup.verify_token(token)
+        if check.ok:
+            print(f"  ✓ бот @{check.bot_name}" if check.bot_name else "  ✓ токен принят")
+            return token
+        if check.offline:
+            print(f"  ! {check.detail} — продолжаю, проверить не смог.")
+            return token
+        print(f"  ✗ {check.detail}")
+    print("Токен так и не принят.", file=sys.stderr)
+    return None
+
+
+async def _ask_user_id(current: int | None, token: str) -> int | None:
+    if current is None and _agrees(
+        "Узнать твой user_id автоматически? Напишешь боту любое сообщение."
+    ):
+        print("  Жду сообщение боту… до 2 минут, Ctrl+C — ввести вручную.")
+        try:
+            caught = await setup.catch_user_id(token)
+        except KeyboardInterrupt:
+            caught = None
+        if caught is not None:
+            print(f"  ✓ user_id: {caught}")
+            return caught
+        print("  Не дождался — введи вручную.")
+
+    hint = f" [{current}]" if current else ""
+    for _ in range(_ATTEMPTS):
+        raw = input(f"Твой Telegram user_id{hint}: ").strip()
+        if not raw and current:
+            return current
+        try:
+            return int(raw)
+        except ValueError:
+            print("  ✗ нужно число. Узнать своё: напиши @userinfobot.")
+    print("user_id не получен.", file=sys.stderr)
+    return None
+
+
+def _agrees(question: str) -> bool:
+    return input(f"{question} [Y/n]: ").strip().lower() in {"", "y", "yes", "д", "да"}
+
+
+def _ask_roots(current: tuple[Path, ...] | None) -> tuple[Path, ...]:
+    default = current or setup.default_roots()
+    shown = ", ".join(str(item) for item in default)
+    last: setup.RootsError | None = None
+    for _ in range(_ATTEMPTS):
+        raw = input(f"Каталоги с репозиториями, через запятую [{shown}]: ")
+        try:
+            return setup.parse_roots(raw, default=default)
+        except setup.RootsError as exc:
+            last = exc
+            print(f"  ✗ {exc}")
+    raise last if last else setup.RootsError("каталоги не получены")
 
 
 async def _stop(target: str) -> str | None:

@@ -20,8 +20,8 @@ def _session(name: str = "oms") -> RemoteSession:
 class _FakeStdin:
     """Подменяет только `isatty()` — `_ask_trust` больше у stdin ничего не спрашивает."""
 
-    def __init__(self, is_tty: bool) -> None:
-        self._is_tty = is_tty
+    def __init__(self, tty: bool) -> None:
+        self._is_tty = tty
 
     def isatty(self) -> bool:
         return self._is_tty
@@ -179,7 +179,7 @@ def test_start_trust_without_tty_fails_without_confirming(
 
     monkeypatch.setattr(cli, "launch", fake_launch)
     monkeypatch.setattr(cli, "confirm_trust", fake_confirm)
-    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(is_tty=False))
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=False))
 
     assert cli.main(["start", str(tmp_path)]) == 2
     assert "tmux attach -t rc-oms" in capsys.readouterr().err
@@ -205,7 +205,7 @@ def test_start_trust_declined_kills_session_without_confirming(
     monkeypatch.setattr(cli, "launch", fake_launch)
     monkeypatch.setattr(cli, "confirm_trust", fake_confirm)
     monkeypatch.setattr(cli, "kill_tmux", fake_kill)
-    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(is_tty=True))
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr("builtins.input", lambda prompt: "n")
 
     assert cli.main(["start", str(tmp_path)]) == 1
@@ -232,7 +232,7 @@ def test_start_trust_confirmed_prints_url(
     monkeypatch.setattr(cli, "launch", fake_launch)
     monkeypatch.setattr(cli, "confirm_trust", fake_confirm)
     monkeypatch.setattr(cli, "await_url", fake_await_url)
-    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(is_tty=True))
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
     monkeypatch.setattr("builtins.input", lambda prompt: "y")
 
     assert cli.main(["start", str(tmp_path)]) == 0
@@ -373,3 +373,173 @@ def test_doctor_never_prints_the_token_on_broken_config(
     captured = capsys.readouterr()
     assert "SECRET_VALUE" not in captured.out
     assert "SECRET_VALUE" not in captured.err
+
+
+def test_setup_without_tty_refuses(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Заполнять нечего, если некому отвечать. Та же логика, что у диалога доверия.
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=False))
+    assert cli.main(["setup"]) == 2
+    assert capsys.readouterr().err.strip()
+
+
+def test_setup_writes_config_with_tight_permissions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    answers = iter([token, "n", "42", str(root)])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert target.is_file()
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+    config = cli.load_config(target)
+    assert config.allowed_user_id == 42
+    assert config.rc_roots == (root,)
+
+
+def test_setup_never_prints_the_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    secret = "123456:SECRETVALUEabcdefghijklmnopqrstuvwxyz"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    answers = iter([secret, "n", "42", str(root)])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    cli.main(["setup"])
+    captured = capsys.readouterr()
+    assert "SECRETVALUE" not in captured.out
+    assert "SECRETVALUE" not in captured.err
+
+
+def test_setup_keeps_existing_values_on_empty_answers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+    target.write_text(
+        cli.setup.render_config(
+            cli.setup.Answers(bot_token=token, allowed_user_id=7, rc_roots=(root,))
+        )
+    )
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    config = cli.load_config(target)
+    assert config.bot_token == token
+    assert config.allowed_user_id == 7
+
+
+def test_setup_rejects_missing_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    # Каталог не существует, и человек повторяет ответ — визард переспрашивает,
+    # а не пишет заведомо нерабочий конфиг.
+    answers = iter([token, "n", "42", str(tmp_path / "nope"), str(tmp_path / "nope")])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 2
+    assert not target.exists()
+
+
+def test_setup_does_not_poll_when_user_id_already_known(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Поллинг рядом с уже настроенным (и, возможно, запущенным) ботом дал бы
+    # второго поллера того же токена — Telegram отдаёт конфликт, оба работают
+    # через раз.
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+    target.write_text(
+        cli.setup.render_config(
+            cli.setup.Answers(bot_token=token, allowed_user_id=7, rc_roots=(root,))
+        )
+    )
+
+    def explode(value: str, **kwargs: object) -> int:
+        raise AssertionError("поллинг при известном user_id недопустим")
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", explode)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert cli.load_config(target).allowed_user_id == 7
+
+
+def test_setup_falls_back_to_manual_user_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "code"
+    root.mkdir()
+    target = tmp_path / "config.toml"
+    token = "123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890"
+
+    def explode(value: str, **kwargs: object) -> int:
+        raise AssertionError("отказались от автоподхвата — в сеть не ходим")
+
+    monkeypatch.setattr(cli.setup, "catch_user_id", explode)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.paths, "config_file", lambda: target)
+    # токен, «n» на автоподхват, user_id, каталоги
+    answers = iter([token, "n", "42", str(root)])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    async def fake_verify(value: str) -> cli.setup.TokenCheck:
+        return cli.setup.TokenCheck(True, "my_test_bot", False, "токен принят")
+
+    monkeypatch.setattr(cli.setup, "verify_token", fake_verify)
+
+    assert cli.main(["setup"]) == 0
+    assert cli.load_config(target).allowed_user_id == 42
