@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from aiogram.exceptions import TelegramNetworkError
+
 _TOKEN = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
 _VISIBLE_TAIL = 4
 
@@ -115,8 +117,13 @@ async def verify_token(token: str) -> TokenCheck:
     bot = _make_bot(token)
     try:
         me = await bot.get_me()
-    except OSError as exc:
-        return TokenCheck(False, None, True, f"нет связи с Telegram: {exc}")
+    except (TelegramNetworkError, OSError):
+        # aiogram заворачивает обрыв сети (таймаут, ClientError) в
+        # TelegramNetworkError — голый OSError он не пропускает никогда, но
+        # ловим и его на случай других версий и подмен в тестах. Текст
+        # исключения в сообщение не кладём по той же причине, что и ниже:
+        # он может содержать токен.
+        return TokenCheck(False, None, True, "нет связи с Telegram")
     except Exception:
         # Текст исключения от aiogram может содержать сам токен (он в URL) —
         # наружу отдаём только факт отказа.

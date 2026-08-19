@@ -2,6 +2,8 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
+from aiogram.methods import GetMe
 from clauderc import setup
 from clauderc.config import load_config
 from clauderc.setup import Answers, RootsError
@@ -127,9 +129,12 @@ class _FakeBot:
 
     async def get_me(self) -> _FakeMe:
         if self.behaviour == "offline":
-            raise OSError("нет сети")
+            # То, что реально бросает aiogram при обрыве сети — заворачивает
+            # asyncio.TimeoutError/aiohttp.ClientError сюда. Голый OSError он
+            # никогда не пропускает наружу.
+            raise TelegramNetworkError(method=GetMe(), message="нет сети")
         if self.behaviour == "bad":
-            raise RuntimeError("Unauthorized")
+            raise TelegramAPIError(method=GetMe(), message="Unauthorized")
         return _FakeMe("my_test_bot")
 
     async def session_close(self) -> None:
@@ -157,6 +162,19 @@ async def test_verify_token_distinguishes_offline_from_rejected(
     rejected = await setup.verify_token("123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890")
     assert rejected.ok is False
     assert rejected.offline is False
+
+
+async def test_verify_token_recognizes_real_aiogram_network_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Регрессия: `except OSError` не ловит обрыв сети — aiogram заворачивает его
+    # в TelegramNetworkError, который не наследует OSError. На коде с одним
+    # `except OSError` этот тест краснеет: offline остаётся False, а человек без
+    # интернета слышит «неверный токен» и идёт перевыпускать рабочий у @BotFather.
+    monkeypatch.setattr(setup, "_make_bot", lambda token: _FakeBot(token, "offline"))
+    check = await setup.verify_token("123456:ABCdefGHIjklMNOpqrsTUVwxyz1234567890")
+    assert check.offline is True
+    assert check.ok is False
 
 
 async def test_verify_token_rejects_bad_shape_without_network(
