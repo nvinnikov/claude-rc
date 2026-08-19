@@ -39,6 +39,12 @@ def test_cwd_config_when_xdg_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert paths.config_file() == local
 
 
+def test_default_config_file_is_xdg_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Не зависит от $CLAUDE_RC_CONFIG и cwd — это просто «куда кладём по умолчанию».
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert paths.default_config_file() == tmp_path / ".config/claude-rc/config.toml"
+
+
 def test_falls_back_to_xdg_when_nothing_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -11,6 +11,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusRow = NSMenuItem(title: "Bot: stopped", action: nil, keyEquivalent: "")
     private let toggleRow = NSMenuItem(title: "Start bot", action: nil, keyEquivalent: "")
     private let takeOverRow = NSMenuItem(title: "Take over bot", action: nil, keyEquivalent: "")
+    private let setupRow = NSMenuItem(title: "Run setup…", action: nil, keyEquivalent: "")
+    private let setupNoteRow = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private var setupError: String?
     private let configRow = NSMenuItem(title: "Reveal config", action: nil, keyEquivalent: "")
     private let loginRow = NSMenuItem(title: "Launch at login", action: nil, keyEquivalent: "")
     private let loginNoteRow = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -111,6 +114,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleRow.target = self
         menu.addItem(toggleRow)
 
+        setupRow.action = #selector(runSetup)
+        setupRow.target = self
+        setupRow.isHidden = true
+        menu.addItem(setupRow)
+
+        setupNoteRow.isEnabled = false
+        setupNoteRow.isHidden = true
+        menu.addItem(setupNoteRow)
+
         takeOverRow.action = #selector(takeOverBot)
         takeOverRow.target = self
         takeOverRow.isHidden = true
@@ -147,8 +159,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         render(supervisor?.state ?? .crashed(reason: stalledReason))
         configRow.isEnabled = cli != nil
+        setupRow.isHidden = !isNotConfigured(supervisor?.state)
+        renderSetupNote()
         loginRow.state = LoginItem.isEnabled ? .on : .off
         renderLoginNote()
+        // Человек мог пройти визард в соседнем Терминале, не возвращаясь в
+        // приложение, — не заставляем его ещё и кликать "Start bot" вслепую,
+        // чтобы просто узнать, подхватился ли конфиг. Метод сам не запускает
+        // бота и не делает ничего, если состояние сейчас не .notConfigured.
+        supervisor?.recheckConfigurationIfNeeded()
+    }
+
+    /// Показывает причину, по которой попытка открыть визард не сработала. Привязана
+    /// к видимости `setupRow`, а не только к наличию ошибки: пункт про визард пропадает,
+    /// как только конфиг находится, и застрявшая под ним причина не должна пережить его.
+    private func renderSetupNote() {
+        guard !setupRow.isHidden, let setupError else {
+            setupNoteRow.isHidden = true
+            return
+        }
+        setupNoteRow.title = "⚠ \(setupError)"
+        setupNoteRow.isHidden = false
     }
 
     /// Показывает причину, по которой галочка не значит «автозапуск точно работает»:
@@ -186,6 +217,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .foreignBotRunning(let pid):
             statusRow.title = "Bot: уже запущен вне приложения, pid \(pid)"
             toggleRow.title = "Start bot"
+            toggleRow.isEnabled = cli != nil
+        case .notConfigured:
+            statusRow.title = "Bot: not configured"
+            toggleRow.title = "Start bot"
+            // Доступна: start() сам перепроверяет конфиг. Раньше кнопка была
+            // недоступна именно тут — единственный выход из .notConfigured был
+            // перезапуск приложения, а ради этого весь визард и делался.
+            toggleRow.isEnabled = cli != nil
+        case .configurationCheckFailed(let reason):
+            // Отдельная формулировка от .notConfigured: доктор не ответил или не
+            // запустился — конфиг тут ни при чём, а "not configured" отправило бы
+            // человека проходить визард заново без всякой пользы.
+            statusRow.title = "Bot: не удалось проверить конфиг (\(reason))"
+            toggleRow.title = "Retry"
             toggleRow.isEnabled = cli != nil
         }
         takeOverRow.isHidden = !showsTakeOverRow(for: state)
@@ -235,6 +280,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func takeOverBot() {
         supervisor?.takeOver()
+    }
+
+    @objc private func runSetup() {
+        setupError = nil
+        guard let cli else {
+            // Не должно случиться — пункт виден только когда cli уже найден при
+            // старте (см. render(.notConfigured)) — но молчать при этом хуже, чем
+            // сказать очевидное: человек нажал пункт меню и не увидел ничего.
+            setupError = "CLI не найден"
+            Log.app("runSetup: cli не найден, визард не открываем")
+            renderSetupNote()
+            return
+        }
+        // Открываем Терминал, а не запускаем визард внутри: он интерактивный,
+        // а у приложения нет ни stdin, ни места, где показать вопросы.
+        // shellQuoted, а не просто "\(cli.path)" в кавычках: путь пользователя может
+        // содержать пробел или саму одинарную кавычку (`/Users/имя фамилия/...`,
+        // `/Users/o'brien/...`) — без честного экранирования это разваливает скрипт.
+        let script = "clear; \(shellQuoted(cli.path)) setup"
+        let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+        // Имя с UUID — второй клик до того, как первый скрипт дочитан Терминалом,
+        // не должен переписать файл, который тот ещё открывает.
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-rc-setup-\(UUID().uuidString).command")
+        do {
+            try "#!/bin/sh\n\(script)\n".write(to: temp, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: temp.path)
+        } catch {
+            setupError = "не удалось подготовить скрипт визарда: \(error.localizedDescription)"
+            Log.app("runSetup: \(setupError!)")
+            renderSetupNote()
+            return
+        }
+        NSWorkspace.shared.open(
+            [temp], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration()
+        ) { [weak self] _, error in
+            DispatchQueue.main.async {
+                // Терминал успевает прочитать сам файл сразу при запуске — 2с с
+                // запасом на медленный старт приложения, дальше скрипт ему не нужен.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    try? FileManager.default.removeItem(at: temp)
+                }
+                guard let self else { return }
+                if let error {
+                    self.setupError = "не удалось открыть Терминал: \(error.localizedDescription)"
+                    Log.app("runSetup: \(self.setupError!)")
+                } else {
+                    self.setupError = nil
+                }
+                self.renderSetupNote()
+            }
+        }
     }
 
     @objc private func openLog() {
@@ -314,4 +411,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginRow.state = LoginItem.isEnabled ? .on : .off
         renderLoginNote()
     }
+}
+
+func isNotConfigured(_ state: BotState?) -> Bool {
+    if case .notConfigured = state { return true }
+    return false
+}
+
+/// Честное POSIX-экранирование, а не просто обёртка в кавычки: одинарная кавычка
+/// внутри самой строки (`/Users/o'brien/...`) закрыла бы такую обёртку раньше
+/// времени. Стандартный приём — закрыть кавычку, экранированная одинарная
+/// кавычка снаружи, открыть кавычку заново: `'` → `'\''`.
+func shellQuoted(_ value: String) -> String {
+    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }

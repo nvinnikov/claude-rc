@@ -92,3 +92,84 @@ def test_nonexistent_root_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="rc_roots"):
         load_config(cfg)
+
+
+def test_wrong_typed_bot_token_raises_value_error_without_leaking_it(tmp_path: Path) -> None:
+    # bot_token = 123456 (без кавычек) — TOML принял бы как целое число.
+    cfg = _write(tmp_path, "bot_token = 123456\nallowed_user_id = 1\n")
+
+    with pytest.raises(ValueError, match="bot_token") as excinfo:
+        load_config(cfg)
+    assert "123456" not in str(excinfo.value)
+
+
+def test_wrong_typed_allowed_user_id_raises_value_error(tmp_path: Path) -> None:
+    # Бытовой сценарий: человек пишет число в кавычках, как принято во многих
+    # форматах — allowed_user_id = "123" вместо allowed_user_id = 123.
+    cfg = _write(tmp_path, 'bot_token = "abc"\nallowed_user_id = "123"\n')
+
+    with pytest.raises(ValueError, match="allowed_user_id"):
+        load_config(cfg)
+
+
+def test_bool_allowed_user_id_is_rejected(tmp_path: Path) -> None:
+    # bool — подкласс int в Python: без явной проверки true тихо стало бы 1.
+    cfg = _write(tmp_path, 'bot_token = "abc"\nallowed_user_id = true\n')
+
+    with pytest.raises(ValueError, match="allowed_user_id"):
+        load_config(cfg)
+
+
+def test_wrong_typed_rc_roots_raises_value_error(tmp_path: Path) -> None:
+    cfg = _write(tmp_path, 'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = 5\n')
+
+    with pytest.raises(ValueError, match="rc_roots"):
+        load_config(cfg)
+
+
+def test_rc_roots_with_non_string_item_raises_value_error(tmp_path: Path) -> None:
+    cfg = _write(tmp_path, 'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = [5]\n')
+
+    with pytest.raises(ValueError, match="rc_roots"):
+        load_config(cfg)
+
+
+def test_wrong_typed_scan_depth_raises_value_error(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path,
+        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\nscan_depth = "3"\n',
+    )
+
+    with pytest.raises(ValueError, match="scan_depth"):
+        load_config(cfg)
+
+
+def test_wrong_typed_launch_timeout_s_raises_value_error(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path,
+        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n'
+        'launch_timeout_s = "90"\n',
+    )
+
+    with pytest.raises(ValueError, match="launch_timeout_s"):
+        load_config(cfg)
+
+
+def test_wrong_typed_worktree_root_raises_value_error(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path,
+        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\nworktree_root = 5\n',
+    )
+
+    with pytest.raises(ValueError, match="worktree_root"):
+        load_config(cfg)
+
+
+def test_wrong_typed_state_path_raises_value_error(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path,
+        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\nstate_path = 5\n',
+    )
+
+    with pytest.raises(ValueError, match="state_path"):
+        load_config(cfg)

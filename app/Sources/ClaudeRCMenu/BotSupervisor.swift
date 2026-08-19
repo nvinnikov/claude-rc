@@ -1,6 +1,6 @@
 import Foundation
 
-enum BotState {
+enum BotState: Equatable {
     case stopped
     case starting
     case running(since: Date)
@@ -9,6 +9,25 @@ enum BotState {
     /// текст внутри `crashed`: меню должно уметь показать пункт восстановления
     /// без разбора строки причины.
     case foreignBotRunning(pid: Int32)
+    /// Конфига нет или он неполон — `doctor` ответил и сказал это прямо. Отдельный
+    /// случай, а не `crashed`: крэш-луп из трёх попыток не сообщает причину и
+    /// выглядит как поломка.
+    case notConfigured
+    /// `doctor` не запустился или не ответил за отведённое время — саму проверку
+    /// провести не удалось. Отдельно от `notConfigured`: там доктор ответил и
+    /// сказал прямо, что конфига нет, — там уместно предложение пройти визард.
+    /// Здесь конфиг мог быть в полном порядке, а проблема в tmux/claude/машине —
+    /// отправлять человека проходить визард заново означало бы врать о причине.
+    case configurationCheckFailed(reason: String)
+}
+
+/// Результат проверки `doctor` — не голый `Bool`: «конфига нет» и «проверить не
+/// удалось» смешивались в одно `false`, хотя это разные вещи и реагировать на них
+/// нужно по-разному (см. `BotState.notConfigured` / `.configurationCheckFailed`).
+enum ConfigurationCheck: Equatable {
+    case configured
+    case notConfigured
+    case checkFailed(reason: String)
 }
 
 /// Показывать ли в меню пункт «забрать бота себе» — только когда рядом реально
@@ -107,10 +126,52 @@ final class BotSupervisor {
     private var startedAt: Date?
     private var stopRequested = false
     private var tally = RestartTally()
+    /// Пока `true`, `start()` не выпускает второй параллельный запрос к `doctor`
+    /// (см. её комментарий).
+    private var isCheckingConfiguration = false
+    /// Клик `Start bot`, пришедший, пока уже летит чья-то ещё проверка конфига
+    /// (например, пассивная `recheckConfigurationIfNeeded` при открытии меню) —
+    /// без этого флага такой клик просто терялся. Одноразовый: разбирается и
+    /// сбрасывается ровно там, где эта летящая проверка завершается, — см.
+    /// `dispatchConfigurationCheck`.
+    private var pendingStart = false
+    /// Внедряемая зависимость, а не прямой вызов `checkConfigured(cli:)`: тесты
+    /// подменяют её синхронной заглушкой и гоняют реальные `start()`/`stop()`
+    /// БЕЗ настоящего `doctor` и без спавна настоящего бота — второе всё равно
+    /// не запустится, `cli` в тестах указывает в никуда.
+    private let checkConfigured: @Sendable (URL) -> ConfigurationCheck
+    /// Та же логика, что и у `checkConfigured`: без подмены тест на переход в
+    /// `.running` недетерминирован на машине, где уже работает настоящий бот —
+    /// реальный `pgrep` находит его первым, и продукт (правильно!) уходит в
+    /// `.foreignBotRunning`, ни разу не дойдя до фактического запуска процесса.
+    private let detectForeignBot: @MainActor () -> Int32?
+    /// Тоже внедряемая: тест на ОТСУТСТВИЕ перезапуска после `stop()` иначе обязан
+    /// был бы спать не меньше самого быстрого backoff (2с, `backoffDelay(attempt:
+    /// 1)`) с запасом на загруженную машину — то есть доказывать отсутствие события
+    /// истечением срока, а не самим событием. С подменой тест видит сам факт
+    /// «перезапуск запланирован» синхронно, не дожидаясь настоящей задержки.
+    private let scheduleRestart: (TimeInterval, @escaping @MainActor () -> Void) -> Void
 
-    init(cli: URL, logURL: URL) {
+    init(
+        cli: URL, logURL: URL,
+        checkConfigured: @escaping @Sendable (URL) -> ConfigurationCheck = BotSupervisor.checkConfigured,
+        detectForeignBot: @escaping @MainActor () -> Int32? = BotSupervisor.foreignBotPID,
+        scheduleRestart: @escaping (TimeInterval, @escaping @MainActor () -> Void) -> Void = BotSupervisor.scheduleRealRestart
+    ) {
         self.cli = cli
         self.logURL = logURL
+        self.checkConfigured = checkConfigured
+        self.detectForeignBot = detectForeignBot
+        self.scheduleRestart = scheduleRestart
+    }
+
+    /// Настоящая реализация `scheduleRestart` — просто `DispatchQueue.main.asyncAfter`,
+    /// вынесенный за пределы `handleTermination`, чтобы тесты могли подменить его
+    /// синхронной заглушкой (см. комментарий у свойства).
+    nonisolated private static func scheduleRealRestart(delay: TimeInterval, work: @escaping @MainActor () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            Task { @MainActor in work() }
+        }
     }
 
     /// pid бота, запущенного мимо приложения. Два поллера одного токена получают
@@ -212,6 +273,78 @@ final class BotSupervisor {
         return "pid \(pid) ppid \(ppid) comm \(name)"
     }
 
+    /// Спрашивает `claude-rc doctor --json`. `nonisolated static`, а не метод
+    /// экземпляра: `start()` зовёт её с фонового потока (см. ниже), а `Process` и
+    /// `DispatchSemaphore.wait` под main actor изолировать нельзя — она не трогает
+    /// состояние `self`. Таймаут 5с — как у остальных внешних вызовов, но здесь
+    /// именно поэтому он и не блокирует главный поток, в отличие от `foreignBotPID`.
+    nonisolated private static func checkConfigured(cli: URL) -> ConfigurationCheck {
+        let task = Process()
+        task.executableURL = cli
+        task.arguments = ["doctor", "--json"]
+        let stdout = Pipe()
+        let stderr = Pipe()
+        task.standardOutput = stdout
+        task.standardError = stderr
+        task.environment = CLILocator.childEnvironment(base: ProcessInfo.processInfo.environment)
+
+        let exited = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in exited.signal() }
+        guard (try? task.run()) != nil else {
+            return .checkFailed(reason: "doctor не запустился")
+        }
+        guard exited.wait(timeout: .now() + 5) == .success else {
+            task.terminate()
+            return .checkFailed(reason: "doctor не ответил за 5с")
+        }
+
+        // Сначала вывод, потом код возврата. У `doctor` код 2 — контрактный сигнал
+        // «не с чем работать» (конфига нет), а не сбой: если stdout разобрался в
+        // непустой список проверок, ответу верим независимо от того, каким кодом
+        // процесс завершился. Кодом объясняем только то, что вывод сам объяснить
+        // не смог, — а этот случай («доктор ответил и сказал, что конфига нет» —
+        // отличается от «доктор сломан») и есть самый частый: у каждого нового
+        // человека `doctor` на свежей машине именно так и отвечает.
+        let outData = stdout.fileHandleForReading.readDataToEndOfFile()
+        let checks = Doctor.parse(outData)
+        if !checks.isEmpty {
+            return Doctor.isConfigured(in: checks) ? .configured : .notConfigured
+        }
+        guard outData.isEmpty else {
+            // Что-то напечатал, но не JSON (или JSON без единой проверки) — не
+            // разобрать. Секретов тут по построению нет — doctor печатает про
+            // токен только «задан/пуст», не сам токен (см. Doctor.Check) —
+            // обрезаем по объёму, а не вычищаем содержимое.
+            let raw = String(data: outData, encoding: .utf8) ?? "<не UTF-8>"
+            return .checkFailed(reason: truncated("doctor вернул нераспознанный ответ: \(raw)"))
+        }
+        guard task.terminationStatus == 0 else {
+            let detail = firstLines(of: stderr.fileHandleForReading.readDataToEndOfFile())
+            let reason = detail.isEmpty
+                ? "doctor завершился с кодом \(task.terminationStatus)"
+                : "doctor завершился с кодом \(task.terminationStatus): \(detail)"
+            return .checkFailed(reason: truncated(reason))
+        }
+        return .checkFailed(reason: "doctor вернул пустой ответ")
+    }
+
+    /// Первые несколько строк вывода для причины в логе/меню — не весь вывод: он
+    /// может быть многословным, а сообщение об ошибке должно оставаться читаемым.
+    nonisolated private static func firstLines(of data: Data, maxLines: Int = 3) -> String {
+        guard let text = String(data: data, encoding: .utf8) else { return "" }
+        return text
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .prefix(maxLines)
+            .joined(separator: " / ")
+    }
+
+    /// Ограничение на объём диагностической строки, а не на содержимое: вывод
+    /// `doctor` может содержать пути (например, до конфига), но не секреты.
+    nonisolated private static func truncated(_ text: String, limit: Int = 200) -> String {
+        guard text.count > limit else { return text }
+        return String(text.prefix(limit)) + "…"
+    }
+
     func start() {
         guard process == nil else {
             // `stop()` намеренно не зануляет `process` сразу (см. её комментарий) —
@@ -221,12 +354,139 @@ final class BotSupervisor {
             Log.app("start: бот уже поднят (pid \(process?.processIdentifier ?? -1)), повторный запуск игнорируем")
             return
         }
-        if let foreign = BotSupervisor.foreignBotPID() {
+        guard !isCheckingConfiguration else {
+            // Проверка `doctor` уже летит — своя или чужая (например, пассивная
+            // `recheckConfigurationIfNeeded` при открытии меню). Раньше клик тут
+            // просто терялся: ни следа в логе, ни изменения на экране. Теперь —
+            // видимая реакция (тот же `.starting`, что и у обычного запуска) и
+            // намерение, которое доведёт до конца летящая проверка, когда ответит:
+            // см. `dispatchConfigurationCheck`.
+            pendingStart = true
+            state = .starting
+            Log.app("start: проверка конфига уже идёт, запомнили клик — доведём до конца, когда она ответит")
+            return
+        }
+        // Сброс здесь, а не в continueStart перед фактическим запуском: тот guard
+        // ниже по `stopRequested` должен ловить только стоп, нажатый во время ЭТОЙ
+        // проверки. Раньше сброс жил только на пути реального запуска процесса —
+        // любой прошлый `stop()` навсегда взводил флаг, и следующий, никак с тем
+        // стопом не связанный `start()` доходил до `continueStart`, видел его и
+        // молча оседал в `.stopped` без единой попытки и без лога.
+        stopRequested = false
+        // Проверку показываем как starting, а не молчим пять секунд: иначе клик по
+        // кнопке выглядит так, будто ничего не произошло.
+        state = .starting
+        dispatchConfigurationCheck { [weak self] result in
+            self?.continueStart(result: result)
+        }
+    }
+
+    /// Пассивная перепроверка при открытии меню в `.notConfigured` — человек мог
+    /// пройти визард в соседнем Терминале и должен увидеть перемену, просто открыв
+    /// меню, а не разбираться, почему кнопка бездействует, пока не кликнет её вслепую.
+    ///
+    /// В отличие от `start()`, она НЕ поднимает бота, даже если конфиг оказался в
+    /// порядке, — только снимает `.notConfigured`, а решение «запускать или нет»
+    /// по-прежнему за явным кликом `Start bot` (если только он не пришёл, пока эта
+    /// проверка летела, — тогда `dispatchConfigurationCheck` доведёт его до конца
+    /// сам). Тот же `isCheckingConfiguration`, что и у `start()`, — второй
+    /// параллельный запрос к `doctor` не нужен ни там, ни здесь, поэтому флаг
+    /// общий, а не заведён отдельно.
+    func recheckConfigurationIfNeeded() {
+        guard case .notConfigured = state else { return }
+        guard !isCheckingConfiguration else { return }
+        dispatchConfigurationCheck { [weak self] result in
+            guard let self else { return }
+            // `.notConfigured` — обычный случай, никто её не трогал. `.starting` —
+            // клик `Start bot`, проглоченный ПОКА ЛЕТЕЛА ИМЕННО ЭТА проверка (см.
+            // `start()`): раз мы вообще дошли до этого замыкания, а не до короткого
+            // пути в `dispatchConfigurationCheck`, `pendingStart` уже разобран и
+            // не был про «настроено» — эту видимую реакцию нужно снять таким же
+            // честным состоянием, а не оставлять подвешенной навсегда. Любое
+            // другое состояние — работа кого-то другого (например, настоящий
+            // launch где-то ещё успел случиться), его не перетираем.
+            guard self.state == .notConfigured || self.state == .starting else { return }
+            switch result {
+            case .configured:
+                self.state = .stopped
+            case .notConfigured, .checkFailed:
+                // Пассивная перепроверка не должна пугать нежданной ошибкой —
+                // `.checkFailed` тут не поднимаем до отдельного состояния, тот
+                // же исход, что и «конфига по-прежнему нет»: следующее открытие
+                // меню попробует снова.
+                self.state = .notConfigured
+            }
+        }
+    }
+
+    /// Общий механизм постановки проверки `doctor` в фон с возвратом ответа на main
+    /// actor — используется и в `start()`, и в пассивной перепроверке; `completion`
+    /// вызывается уже после того, как `isCheckingConfiguration` сброшен обратно.
+    private func dispatchConfigurationCheck(completion: @escaping @MainActor (ConfigurationCheck) -> Void) {
+        isCheckingConfiguration = true
+        let cli = self.cli
+        let checkConfigured = self.checkConfigured
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = checkConfigured(cli)
+            // `Task { @MainActor in }`, а не `DispatchQueue.main.async`: возврат на
+            // main actor через структурированную конкурентность не завязан на то,
+            // крутится ли где-то настоящий run loop главного потока — это же делает
+            // переход воспроизводимым в тестах.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isCheckingConfiguration = false
+                // Клик, запомненный в start() пока эта проверка летела: доводим до
+                // конца именно её результатом, не спрашивая `doctor` заново. Если
+                // результат не «настроено» — обычный `completion` его и покажет
+                // (notConfigured/checkFailed), запуск сам собой не понадобится.
+                if self.pendingStart {
+                    self.pendingStart = false
+                    if case .configured = result {
+                        Log.app("start: конфиг нашёлся, доводим запомненный клик до конца")
+                        self.continueStart(result: result)
+                        return
+                    }
+                }
+                completion(result)
+            }
+        }
+    }
+
+    /// Вторая половина `start()` после ответа `doctor`, снова на main actor.
+    /// Спрашиваем про конфиг только когда своего процесса ещё нет: если бот уже
+    /// жив, он с этим конфигом и поднялся, спрашивать незачем. А спросить и не
+    /// дождаться ответа `doctor` за 5с означало бы объявить «не настроено» поверх
+    /// работающего бота — меню соврало бы о том, что человек видит своими глазами.
+    private func continueStart(result: ConfigurationCheck) {
+        guard !stopRequested else {
+            // Стоп нажали, пока `doctor` отвечал, — не поднимаем бота вопреки этому.
+            state = .stopped
+            return
+        }
+        switch result {
+        case .configured:
+            break
+        case .notConfigured:
+            Log.app("start: конфига нет, бота не поднимаем")
+            state = .notConfigured
+            return
+        case .checkFailed(let reason):
+            Log.app("start: проверка конфига не удалась (\(reason)), бота не поднимаем")
+            state = .configurationCheckFailed(reason: reason)
+            return
+        }
+        guard process == nil else {
+            // Кто-то другой (например, таймер перезапуска после падения) успел
+            // поднять бота, пока мы ждали `doctor`.
+            return
+        }
+        if let foreign = detectForeignBot() {
             state = .foreignBotRunning(pid: foreign)
             return
         }
 
-        stopRequested = false
+        // `stopRequested` уже false — сброшен в start() перед этой проверкой, и
+        // ранний guard выше вернул бы нас раньше, если бы стоп пришёл во время неё.
         state = .starting
 
         let task = Process()
@@ -288,7 +548,7 @@ final class BotSupervisor {
     /// заново и гасим только если это буквально тот же pid.
     func takeOver() {
         guard case .foreignBotRunning(let pid) = state else { return }
-        let current = BotSupervisor.foreignBotPID()
+        let current = detectForeignBot()
         switch takeOverDecision(remembered: pid, current: current) {
         case .killThenStart(let pid):
             Log.app("takeOver: SIGTERM чужому pid \(pid)")
@@ -354,7 +614,7 @@ final class BotSupervisor {
         }
 
         state = .crashed(reason: "упал, перезапуск через \(Int(delay)) с")
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        scheduleRestart(delay) { [weak self] in
             guard let self, self.process == nil, !self.stopRequested else { return }
             self.start()
         }

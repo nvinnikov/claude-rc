@@ -294,7 +294,13 @@ class Discovery:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    config = load_config(paths.config_file())
+    config_path = paths.config_file()
+    try:
+        config = load_config(config_path)
+    except (OSError, ValueError, KeyError) as exc:
+        # Тот же контракт, что у doctor/--branch в cli.py: битый конфиг —
+        # понятное сообщение и чистый выход, а не трейсбек в логе приложения.
+        raise SystemExit(f"config.toml не годится: {config_path}: {exc}") from exc
     if not tmux_available():
         raise SystemExit("tmux не найден в PATH — поставь через `brew install tmux`")
 

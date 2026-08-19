@@ -36,4 +36,14 @@ enum Doctor {
         }
         return check.detail
     }
+
+    /// Хватает ли конфига, чтобы бот вообще поднялся.
+    ///
+    /// Смотрим только на проверки про конфиг: отсутствие `tmux` — другая беда,
+    /// и про неё бот скажет сам, а вот без токена он просто упадёт.
+    static func isConfigured(in checks: [Check]) -> Bool {
+        let blocking = ["config", "bot_token", "allowed_user_id"]
+        guard checks.contains(where: { $0.name == "config" }) else { return false }
+        return !checks.contains { blocking.contains($0.name) && !$0.ok }
+    }
 }
