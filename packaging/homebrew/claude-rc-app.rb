@@ -12,6 +12,10 @@ cask "claude-rc-app" do
   # уже подключён у того, кто ставит cask руками, а не сама по себе.
   depends_on formula: "nvinnikov/tap/claude-rc"
   depends_on macos: ">= :sonoma"
+  # app/make-app.sh собирает `swift build -c release` без указания архитектур —
+  # бинарь получается под архитектуру сборочной машины (arm64), универсального
+  # никто не делает. На Intel cask ставил бы бандл, который не запустится.
+  depends_on arch: :arm64
 
   app "ClaudeRC.app"
 
@@ -30,4 +34,18 @@ cask "claude-rc-app" do
     "~/.claude-rc/claude-rc.log",
     "~/Library/LaunchAgents/com.nvinnikov.claude-rc-app.plist",
   ]
+
+  # Cask ставит com.apple.quarantine на скачанный бандл, а подписан он ad-hoc
+  # (без Developer ID) — Gatekeeper откажется открывать его точно так же, как
+  # и зип, скачанный руками со страницы релизов.
+  caveats <<~EOS
+    ClaudeRC.app подписан ad-hoc, без Developer ID — macOS пометит его
+    карантином и откажется открывать. Сними карантин вручную:
+
+      xattr -dr com.apple.quarantine #{appdir}/ClaudeRC.app
+
+    Либо переустанови без карантина:
+
+      brew install --cask --no-quarantine claude-rc-app
+  EOS
 end

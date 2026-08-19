@@ -123,6 +123,48 @@ def test_start_rejects_empty_resume(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert capsys.readouterr().err.strip()
 
 
+def test_start_branch_without_config_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Без этой проверки _start зовёт load_config напрямую, и отсутствие
+    # конфига долетает наружу как FileNotFoundError с трейсбеком.
+    missing_config = tmp_path / "config.toml"
+    monkeypatch.setattr(cli.paths, "config_file", lambda: missing_config)
+
+    assert cli.main(["start", str(tmp_path), "--branch", "feature/x"]) == 2
+    err = capsys.readouterr().err
+    assert str(missing_config) in err
+    assert "Traceback" not in err
+
+
+def test_start_branch_with_config_creates_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    config.write_text(f'bot_token = "x"\nallowed_user_id = 1\nrc_roots = ["{root}"]\n')
+    monkeypatch.setattr(cli.paths, "config_file", lambda: config)
+
+    seen: dict[str, Any] = {}
+
+    async def fake_ensure(target: Path, branch: str, root: Path) -> Path:
+        seen["target"] = target
+        seen["branch"] = branch
+        return tmp_path / "worktree"
+
+    async def fake_launch(repo: str, cwd: str, **kwargs: Any) -> RemoteSession:
+        seen["cwd"] = cwd
+        return _session()
+
+    monkeypatch.setattr(cli.worktrees, "ensure", fake_ensure)
+    monkeypatch.setattr(cli, "launch", fake_launch)
+
+    assert cli.main(["start", str(tmp_path), "--branch", "feature/x"]) == 0
+    assert seen["branch"] == "feature/x"
+    assert seen["cwd"] == str(tmp_path / "worktree")
+
+
 def test_start_trust_without_tty_fails_without_confirming(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

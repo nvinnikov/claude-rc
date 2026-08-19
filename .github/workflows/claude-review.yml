@@ -7,6 +7,12 @@
 #   - бюджет ходов ......... claude_args --max-turns
 #   - что пропускать ....... on.pull_request.paths-ignore
 #
+# Упор в --max-turns валит PR даже когда ревью прошло успешно: action
+# сравнивает число ходов с лимитом уже после успешного результата и репортит
+# ошибку вида "Claude reported a successful result after N turns, exceeding
+# the configured maximum" — то есть красный крест не значит, что ревью
+# сломано, ищи здесь, а не в коде ревьюера.
+#
 # Нужен секрет репозитория CLAUDE_CODE_OAUTH_TOKEN (получить: `claude setup-token`).
 # Без него джоба ничего не делает; сборку в любом случае гейтит ci.yml.
 name: Claude Code Review
@@ -104,5 +110,5 @@ jobs:
             Комментарии пиши на русском.
           claude_args: |
             --model claude-opus-5
-            --max-turns 30
+            --max-turns 60
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"
