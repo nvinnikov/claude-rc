@@ -2,7 +2,16 @@ import re
 from pathlib import Path
 
 from clauderc import bot as bot_module
-from clauderc.bot import ResumeChoice, _died_text, _pop_resume_group, _resume_keyboard
+from clauderc.bot import (
+    ResumeChoice,
+    _died_text,
+    _has_repos,
+    _pop_resume_group,
+    _resume_keyboard,
+    _sync_line,
+    _sync_report_line,
+)
+from clauderc.sync import Outcome, RepoStatus, SyncResult
 from clauderc.watch import Died
 
 # Гашение обязано идти через Watcher — иначе намеренно погашенная сессия
@@ -78,4 +87,66 @@ def test_no_direct_kill_calls_bypass_watcher() -> None:
     """
     source = Path(bot_module.__file__).read_text(encoding="utf-8")
     offenders = _DIRECT_KILL.findall(source)
-    assert not offenders, f"нашёл гашение мимо watcher: {offenders}"
+    assert not offenders, offenders
+
+
+def _status(**kwargs: object) -> RepoStatus:
+    base: dict[str, object] = {
+        "path": Path("/repos/alpha"),
+        "branch": "main",
+        "dirty": False,
+        "ahead": 0,
+        "behind": 0,
+        "upstream": "origin/main",
+        "detached": False,
+    }
+    base.update(kwargs)
+    return RepoStatus(**base)  # type: ignore[arg-type]
+
+
+def test_sync_line_marks_selection() -> None:
+    assert _sync_line(_status(), selected=True).startswith("☑")
+    assert _sync_line(_status(), selected=False).startswith("☐")
+
+
+def test_sync_line_shows_behind_and_ahead() -> None:
+    assert "↓3" in _sync_line(_status(behind=3), selected=False)
+    assert "↑2" in _sync_line(_status(ahead=2), selected=False)
+
+
+def test_sync_line_marks_dirty_and_clean() -> None:
+    assert "✎" in _sync_line(_status(dirty=True), selected=False)
+    assert "✓" in _sync_line(_status(), selected=False)
+
+
+def test_sync_line_marks_missing_upstream() -> None:
+    assert "⚠" in _sync_line(_status(upstream=None), selected=False)
+
+
+def test_sync_line_escapes_html() -> None:
+    line = _sync_line(_status(path=Path("/repos/a&b"), branch="<x>"), selected=False)
+    assert "&amp;" in line
+    assert "<x>" not in line
+
+
+def test_sync_report_line_covers_every_outcome() -> None:
+    for outcome in Outcome:
+        result = SyncResult(Path("/repos/alpha"), outcome, "причина", "main")
+        assert "alpha" in _sync_report_line(result)
+
+
+def test_has_repos_detects_repo_child(tmp_path: Path) -> None:
+    (tmp_path / "alpha" / ".git").mkdir(parents=True)
+    (tmp_path / "beta").mkdir()
+
+    assert _has_repos(tmp_path) is True
+    assert _has_repos(tmp_path / "beta") is False
+
+
+def test_has_repos_sees_worktree_gitfile(tmp_path: Path) -> None:
+    # У git worktree `.git` — файл, а не каталог; is_dir() его не увидит.
+    child = tmp_path / "wt"
+    child.mkdir()
+    (child / ".git").write_text("gitdir: /elsewhere\n")
+
+    assert _has_repos(tmp_path) is True

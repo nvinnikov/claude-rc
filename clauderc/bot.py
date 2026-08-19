@@ -38,6 +38,7 @@ from clauderc.remote import (
 )
 from clauderc.repos import discover, resolve
 from clauderc.state import State
+from clauderc.sync import Outcome, RepoStatus, SyncResult
 from clauderc.watch import Died, Watcher
 from clauderc.worktrees import Worktree, WorktreeError
 
@@ -272,6 +273,45 @@ def _projects_card(
     if len(paths) > len(shown):
         text += f"\nПоказал {len(shown)} из {len(paths)}, остальные через <b>/cd</b>."
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _has_repos(cwd: Path) -> bool:
+    """Есть ли смысл предлагать Sync: хотя бы один подкаталог — git-репозиторий."""
+    try:
+        children = list(cwd.iterdir())
+    except OSError:
+        return False
+    return any(browse.is_repo(child) for child in children)
+
+
+def _sync_line(status: RepoStatus, *, selected: bool) -> str:
+    """Строка репозитория в режиме выбора: имя, ветка и в каком он состоянии."""
+    box = "☑" if selected else "☐"
+    marks = []
+    if status.upstream is None:
+        marks.append("⚠")
+    if status.behind:
+        marks.append(f"↓{status.behind}")
+    if status.ahead:
+        marks.append(f"↑{status.ahead}")
+    marks.append("✎" if status.dirty else "✓")
+    return (
+        f"{box} <b>{html.escape(status.path.name)}</b> "
+        f"<code>{html.escape(status.branch)}</code> {' '.join(marks)}"
+    )
+
+
+def _sync_report_line(result: SyncResult) -> str:
+    mark = {
+        Outcome.updated: "⤵",
+        Outcome.already: "=",
+        Outcome.skipped: "·",
+        Outcome.failed: "❌",
+    }[result.outcome]
+    return (
+        f"{mark} <b>{html.escape(result.path.name)}</b> "
+        f"<code>{html.escape(result.branch)}</code> — {html.escape(result.detail)}"
+    )
 
 
 class Discovery:
