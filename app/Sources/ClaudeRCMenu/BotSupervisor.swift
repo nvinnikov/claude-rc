@@ -1,6 +1,6 @@
 import Foundation
 
-enum BotState {
+enum BotState: Equatable {
     case stopped
     case starting
     case running(since: Date)
@@ -113,10 +113,19 @@ final class BotSupervisor {
     /// Пока `true`, `start()` не выпускает второй параллельный запрос к `doctor`
     /// (см. её комментарий).
     private var isCheckingConfiguration = false
+    /// Внедряемая зависимость, а не прямой вызов `checkConfigured(cli:)`: тесты
+    /// подменяют её синхронной заглушкой и гоняют реальные `start()`/`stop()`
+    /// БЕЗ настоящего `doctor` и без спавна настоящего бота — второе всё равно
+    /// не запустится, `cli` в тестах указывает в никуда.
+    private let checkConfigured: @Sendable (URL) -> Bool
 
-    init(cli: URL, logURL: URL) {
+    init(
+        cli: URL, logURL: URL,
+        checkConfigured: @escaping @Sendable (URL) -> Bool = BotSupervisor.checkConfigured
+    ) {
         self.cli = cli
         self.logURL = logURL
+        self.checkConfigured = checkConfigured
     }
 
     /// pid бота, запущенного мимо приложения. Два поллера одного токена получают
@@ -259,14 +268,28 @@ final class BotSupervisor {
             Log.app("start: проверка конфига уже идёт, повторный запуск игнорируем")
             return
         }
+        // Сброс здесь, а не в continueStart перед фактическим запуском: тот guard
+        // ниже по `stopRequested` должен ловить только стоп, нажатый во время ЭТОЙ
+        // проверки. Раньше сброс жил только на пути реального запуска процесса —
+        // любой прошлый `stop()` навсегда взводил флаг, и следующий, никак с тем
+        // стопом не связанный `start()` доходил до `continueStart`, видел его и
+        // молча оседал в `.stopped` без единой попытки и без лога.
+        stopRequested = false
         // Проверку показываем как starting, а не молчим пять секунд: иначе клик по
         // кнопке выглядит так, будто ничего не произошло.
         state = .starting
         isCheckingConfiguration = true
         let cli = self.cli
+        let checkConfigured = self.checkConfigured
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let configured = BotSupervisor.checkConfigured(cli: cli)
-            DispatchQueue.main.async { self?.continueStart(configured: configured) }
+            let configured = checkConfigured(cli)
+            // `Task { @MainActor in }`, а не `DispatchQueue.main.async`: возврат на
+            // main actor через структурированную конкурентность не завязан на то,
+            // крутится ли где-то настоящий run loop главного потока — это же делает
+            // переход воспроизводимым в тестах.
+            Task { @MainActor [weak self] in
+                self?.continueStart(configured: configured)
+            }
         }
     }
 
@@ -297,7 +320,8 @@ final class BotSupervisor {
             return
         }
 
-        stopRequested = false
+        // `stopRequested` уже false — сброшен в start() перед этой проверкой, и
+        // ранний guard выше вернул бы нас раньше, если бы стоп пришёл во время неё.
         state = .starting
 
         let task = Process()
