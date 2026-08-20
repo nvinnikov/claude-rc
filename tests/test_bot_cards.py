@@ -170,21 +170,33 @@ def test_has_repos_true_when_cwd_itself_is_a_repo(tmp_path: Path) -> None:
     assert _has_repos(tmp_path) is True
 
 
-def test_selected_targets_maps_indices_in_order() -> None:
+def test_selected_targets_keeps_listing_order() -> None:
     listing = [Path("/repos/a"), Path("/repos/b"), Path("/repos/c")]
-    assert _selected_targets(listing, {2, 0}) == [Path("/repos/a"), Path("/repos/c")]
+    chosen = {Path("/repos/c"), Path("/repos/a")}
+    assert _selected_targets(listing, chosen) == [Path("/repos/a"), Path("/repos/c")]
 
 
-def test_selected_targets_drops_indices_the_listing_no_longer_has() -> None:
-    # Листинг мог измениться между отрисовкой карточки и тапом (другой каталог,
-    # исчезнувший репозиторий) — индексы вне диапазона не должны попасть в цели.
+def test_selected_targets_drops_paths_the_listing_no_longer_has() -> None:
+    # Листинг мог измениться между отрисовкой карточки и тапом (другой
+    # каталог, исчезнувший репозиторий) — путь, которого больше нет в
+    # листинге, не должен попасть в цели.
     listing = [Path("/repos/a")]
-    assert _selected_targets(listing, {0, 1, 5}) == [Path("/repos/a")]
+    chosen = {Path("/repos/a"), Path("/repos/gone")}
+    assert _selected_targets(listing, chosen) == [Path("/repos/a")]
 
 
 def test_selected_targets_empty_selection_or_listing() -> None:
-    assert _selected_targets([], {0, 1}) == []
+    assert _selected_targets([], {Path("/repos/a")}) == []
     assert _selected_targets([Path("/repos/a")], set()) == []
+
+
+def test_selected_targets_survives_reordering_when_new_repo_appears() -> None:
+    # Ровно тот сценарий, который чинили: рядом склонировали ещё один
+    # репозиторий между отрисовками. Индекс сместился бы на соседа; путь — нет.
+    chosen = {Path("/repos/beta")}
+    grown_listing = [Path("/repos/gamma"), Path("/repos/alpha"), Path("/repos/beta")]
+
+    assert _selected_targets(grown_listing, chosen) == [Path("/repos/beta")]
 
 
 def test_sync_line_marks_live_session() -> None:

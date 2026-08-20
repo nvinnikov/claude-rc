@@ -142,6 +142,56 @@ async def test_sync_never_touches_dirty_repo(tmp_path: Path) -> None:
     assert _run(clone, "status", "--porcelain") == before
 
 
+async def test_sync_rechecks_dirty_after_fetch_before_switching_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # dirty проверяется один раз до fetch; окно — вся его длительность (секунды),
+    # а человек вполне может успеть написать что-то в файлы за это время.
+    _, clone = _make_origin_and_clone(tmp_path)
+    _run(clone, "branch", "dev")
+    real_git = worktrees._git
+
+    async def fetch_that_dirties(
+        cwd: Path, *args: str, timeout_s: float | None = None
+    ) -> tuple[int, str]:
+        if args and args[0] == "fetch":
+            (clone / "file.txt").write_text("правки прямо во время fetch\n")
+        return await real_git(cwd, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(sync, "_git", fetch_that_dirties)
+
+    result = await sync.sync(clone, branch="dev")
+
+    assert result.outcome is sync.Outcome.skipped
+    assert "изменени" in result.detail.lower()
+    assert _run(clone, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+
+
+async def test_sync_rechecks_dirty_after_fetch_before_pull(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Без --branch switch не участвует вовсе — единственная защита тут
+    # перепроверка прямо перед pull.
+    bare, clone = _make_origin_and_clone(tmp_path)
+    _commit_to_origin(tmp_path, bare, "second")
+    real_git = worktrees._git
+
+    async def fetch_that_dirties(
+        cwd: Path, *args: str, timeout_s: float | None = None
+    ) -> tuple[int, str]:
+        if args and args[0] == "fetch":
+            (clone / "file.txt").write_text("правки прямо во время fetch\n")
+        return await real_git(cwd, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(sync, "_git", fetch_that_dirties)
+
+    result = await sync.sync(clone)
+
+    assert result.outcome is sync.Outcome.skipped
+    assert "изменени" in result.detail.lower()
+    assert (clone / "file.txt").read_text() == "правки прямо во время fetch\n"
+
+
 async def test_sync_refuses_when_branches_diverged(tmp_path: Path) -> None:
     bare, clone = _make_origin_and_clone(tmp_path)
     _commit_to_origin(tmp_path, bare, "theirs")

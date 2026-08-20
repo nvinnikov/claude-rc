@@ -312,14 +312,18 @@ def _chunk_report(lines: list[str], limit: int = _REPORT_CHUNK_CHARS) -> list[st
     return chunks
 
 
-def _selected_targets(listing: list[Path], chosen: set[int]) -> list[Path]:
-    """Пути, которые выбор `chosen` называет в `listing` — по возрастанию индекса.
+def _selected_targets(listing: list[Path], chosen: set[Path]) -> list[Path]:
+    """Пути из `chosen`, которых `listing` всё ещё касается — в порядке листинга.
 
-    Индексы вне диапазона отбрасываются: листинг мог измениться между отрисовкой
-    карточки и тапом (другой каталог, исчезнувший репозиторий) — использовать их
-    как есть означало бы подтянуть не то, что показано на экране.
+    Выбор хранится путями, а не индексами: листинг мог измениться между
+    отрисовкой карточки и тапом — не только сменой каталога (это ловит
+    `sync_cwd`), но и составом того же каталога (рядом склонировали ещё один
+    репозиторий). Индекс тогда указал бы на другой репозиторий; путь — нет.
+    Путь, которого в текущем листинге больше нет (исчез, укоротили до
+    MAX_SYNC_TARGETS), просто выпадает — тем же способом, что раньше выпадали
+    индексы вне диапазона.
     """
-    return [listing[i] for i in sorted(chosen) if 0 <= i < len(listing)]
+    return [p for p in listing if p in chosen]
 
 
 def _has_repos(cwd: Path) -> bool:
@@ -433,17 +437,24 @@ async def main() -> None:
     # токены той же карточки, чтобы два тапа не подняли две сессии в одном каталоге.
     resume_pending: dict[str, tuple[str, ResumeChoice]] = {}
     # Выбор живёт в памяти и привязан к сообщению: восстанавливать наполовину
-    # сделанный выбор после перезапуска опаснее, чем начать заново.
-    sync_selection: dict[int, set[int]] = {}
+    # сделанный выбор после перезапуска опаснее, чем начать заново. Хранится
+    # путями, а не индексами: индекс — позиция в листинге на момент отрисовки,
+    # и если между отрисовками состав каталога поменялся (склонировали рядом
+    # ещё один репозиторий), тот же индекс указал бы уже на другой репозиторий.
+    sync_selection: dict[int, set[Path]] = {}
     sync_listing: dict[int, list[Path]] = {}
     sync_branch: dict[int, str] = {}
     # Каталог, для которого карточка сейчас нарисована. Если он разошёлся с
-    # `state.cwd` — индексы в sync_selection описывают уже другой листинг,
-    # их нельзя использовать как есть (см. sync_card).
+    # `state.cwd` — выбор в sync_selection описывает уже другой листинг, его
+    # нельзя использовать как есть (см. sync_card).
     sync_cwd: dict[int, Path] = {}
-    # Индексы repo, для которых status() не отработал: показаны строкой с
-    # объяснением, но без кнопки — «Все» их не подхватывает, отметить нельзя.
-    sync_unselectable: dict[int, set[int]] = {}
+    # Repo, для которых status() не отработал: показаны строкой с объяснением,
+    # но без кнопки — «Все» их не подхватывает, отметить нельзя.
+    sync_unselectable: dict[int, set[Path]] = {}
+    # Сообщения, для которых сейчас идёт «Подтянуть»: второй тап по той же
+    # карточке, пока первый ещё не отработал, дал бы два параллельных `pull`
+    # по одним и тем же репозиториям — они подерутся за index.lock git'а.
+    sync_running: set[int] = set()
     # Ключ — id сообщения с запросом имени ветки (ForceReply), значение — id
     # карточки Sync. Ответ Telegram привязывает к запросу через reply_to_message,
     # так что случайное текстовое сообщение не подставится вместо имени ветки.
@@ -669,9 +680,9 @@ async def main() -> None:
     async def sync_card(chat_id: int, message_id: int, cwd: Path) -> None:
         """(Пере)рисовать карточку выбора репозиториев для конкретного сообщения."""
         if sync_cwd.get(message_id) != cwd:
-            # Каталог сменился с прошлой отрисовки этой самой карточки — старые
-            # индексы описывают уже другой листинг, безопаснее сбросить выбор,
-            # чем угадывать, что из отмеченного означает то же самое здесь.
+            # Каталог сменился с прошлой отрисовки этой самой карточки — прежний
+            # выбор относился к другому дереву, безопаснее сбросить его, чем
+            # угадывать, что из отмеченного означает то же самое здесь.
             sync_selection[message_id] = set()
         sync_cwd[message_id] = cwd
 
@@ -706,19 +717,19 @@ async def main() -> None:
         lines = [f"🔄 <code>{html.escape(str(cwd))}</code>"]
         rows: list[list[InlineKeyboardButton]] = []
         shown = False
-        unselectable: set[int] = set()
+        unselectable: set[Path] = set()
         for index, (path, repo_status) in enumerate(zip(listing, statuses, strict=True)):
             label = labels[path]
             if repo_status is None:
                 # Не молчим: показываем строкой с причиной, но без кнопки —
                 # синхронизировать то, о чём ничего не известно, нечего.
-                unselectable.add(index)
+                unselectable.add(path)
                 lines.append(_sync_unavailable_line(label))
                 continue
             shown = True
             live = os.path.realpath(str(path)) in occupied
             lines.append(
-                _sync_line(repo_status, selected=index in chosen, label=label, live_session=live)
+                _sync_line(repo_status, selected=path in chosen, label=label, live_session=live)
             )
             rows.append([InlineKeyboardButton(text=label, callback_data=f"sync:{index}")])
         sync_unselectable[message_id] = unselectable
@@ -757,35 +768,49 @@ async def main() -> None:
         _migrate_sync_state(message_id, rendered_id)
 
     async def run_sync(message: Message) -> None:
-        listing = sync_listing.get(message.message_id) or []
-        chosen = sync_selection.get(message.message_id, set())
-        targets = _selected_targets(listing, chosen)
-        if not targets:
-            await message.answer("Ничего не выбрано.")
+        # Второй тап «Подтянуть», пока первый ещё не отработал: два
+        # параллельных `pull` по одним и тем же репозиториям подерутся за
+        # index.lock, и придёт два отчёта, один из которых врёт. Проверка и
+        # пометка — до первого await, гонки между тапами тут не бывает.
+        if message.message_id in sync_running:
+            await message.answer("Уже идёт синхронизация — дождись отчёта.")
             return
-
-        branch = sync_branch.get(message.message_id) or None
-        notice = await message.answer(f"⏳ Подтягиваю: {len(targets)}…")
-
+        sync_running.add(message.message_id)
         try:
-            # sync_one, а не sync: одно исключение не должно уронить весь gather
-            # и оставить «⏳ Подтягиваю…» висеть навсегда без отчёта по остальным.
-            results = await asyncio.gather(
-                *(sync_mod.sync_one(path, branch=branch) for path in targets)
-            )
-            labels = sync_mod.display_names(targets)
-            lines = [_sync_report_line(r, label=labels[r.path]) for r in results]
-            # Без сети 15-20 репозиториев дают по строке `fatal: unable to
-            # access …` каждый и переваливают за лимит Telegram в 4096 символов
-            # на сообщение — тогда отчёт режем на части, а не теряем целиком.
-            chunks = _chunk_report(lines) or ["Пусто."]
-            await _sync_render(notice.chat.id, notice.message_id, chunks[0], None)
-            for extra in chunks[1:]:
-                await bot.send_message(notice.chat.id, extra, parse_mode="HTML")
+            listing = sync_listing.get(message.message_id) or []
+            chosen = sync_selection.get(message.message_id, set())
+            targets = _selected_targets(listing, chosen)
+            if not targets:
+                await message.answer("Ничего не выбрано.")
+                return
+
+            branch = sync_branch.get(message.message_id) or None
+            notice = await message.answer(f"⏳ Подтягиваю: {len(targets)}…")
+
+            try:
+                # sync_one, а не sync: одно исключение не должно уронить весь
+                # gather и оставить «⏳ Подтягиваю…» висеть навсегда без отчёта
+                # по остальным.
+                results = await asyncio.gather(
+                    *(sync_mod.sync_one(path, branch=branch) for path in targets)
+                )
+                labels = sync_mod.display_names(targets)
+                lines = [_sync_report_line(r, label=labels[r.path]) for r in results]
+                # Без сети 15-20 репозиториев дают по строке `fatal: unable to
+                # access …` каждый и переваливают за лимит Telegram в 4096
+                # символов на сообщение — тогда отчёт режем на части, а не
+                # теряем целиком.
+                chunks = _chunk_report(lines) or ["Пусто."]
+                await _sync_render(notice.chat.id, notice.message_id, chunks[0], None)
+                for extra in chunks[1:]:
+                    await bot.send_message(notice.chat.id, extra, parse_mode="HTML")
+            finally:
+                # Отчёт мог не дойти (сеть, Telegram) — но работа уже сделана,
+                # и держать карточку с галочками ради недоставленного текста
+                # не за чем.
+                _drop_sync_state(message.message_id)
         finally:
-            # Отчёт мог не дойти (сеть, Telegram) — но работа уже сделана, и
-            # держать карточку с галочками ради недоставленного текста не за чем.
-            _drop_sync_state(message.message_id)
+            sync_running.discard(message.message_id)
 
     @dp.message(lambda event: not _is_authorized(event.from_user, config.allowed_user_id))
     async def reject_strangers(message: Message) -> None:
@@ -1191,8 +1216,8 @@ async def main() -> None:
             return
 
         if sync_cwd.get(message.message_id) != state.cwd:
-            # Карточка нарисована для другого каталога — отмеченные индексы
-            # для него и остались бы, если бы их применили как есть.
+            # Карточка нарисована для другого каталога — прежний выбор к нему
+            # не относится, безопаснее начать заново, чем угадывать соответствие.
             sync_selection[message.message_id] = set()
             await message.answer("Каталог сменился — выбор сброшен, отметь заново.")
             await sync_card(message.chat.id, message.message_id, state.cwd)
@@ -1201,7 +1226,7 @@ async def main() -> None:
         chosen = sync_selection.setdefault(message.message_id, set())
         if action == "all":
             unselectable = sync_unselectable.get(message.message_id, set())
-            chosen.update(i for i in range(len(listing or [])) if i not in unselectable)
+            chosen.update(p for p in (listing or []) if p not in unselectable)
         elif action == "none":
             chosen.clear()
         elif action == "branch":
@@ -1224,7 +1249,11 @@ async def main() -> None:
             except ValueError:
                 await message.answer("Список устарел, повтори /pwd.")
                 return
-            chosen.symmetric_difference_update({index})
+            valid_listing = listing or []
+            if not 0 <= index < len(valid_listing):
+                await message.answer("Список устарел, повтори /pwd.")
+                return
+            chosen.symmetric_difference_update({valid_listing[index]})
 
         await sync_card(message.chat.id, message.message_id, state.cwd)
 

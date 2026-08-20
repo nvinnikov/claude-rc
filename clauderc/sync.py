@@ -114,6 +114,11 @@ async def sync(repo: Path, *, branch: str | None = None, fetch: bool = True) -> 
         current = await status(repo) or current
 
     if branch and branch != current.branch:
+        # fetch идёт секунды, а человек вполне мог за это время начать писать
+        # в тот же репозиторий — dirty проверяли до сети, а рабочее дерево с
+        # тех пор могло измениться. Перепроверяем прямо перед переключением.
+        if current.dirty:
+            return SyncResult(repo, Outcome.skipped, "незакоммиченные изменения", current.branch)
         # Живая RC-сессия работает в этом каталоге прямо сейчас: переключить
         # под ней ветку — значит подменить рабочее дерево так, что сессия
         # этого не заметит (mtime спасает не от всего, см. CLAUDE.md). Обычная
@@ -149,6 +154,11 @@ async def sync(repo: Path, *, branch: str | None = None, fetch: bool = True) -> 
         return SyncResult(
             repo, Outcome.skipped, f"отстаёт на {current.behind}, нужен fetch", current.branch
         )
+
+    if current.dirty:
+        # То же окно, что перед переключением: fetch (и, если было, switch)
+        # заняли время, за которое рабочее дерево могло стать грязным.
+        return SyncResult(repo, Outcome.skipped, "незакоммиченные изменения", current.branch)
 
     code, out = await _git(repo, "pull", "--ff-only", "--quiet", timeout_s=_NETWORK_TIMEOUT_S)
     if code != 0:
