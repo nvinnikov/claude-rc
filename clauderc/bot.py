@@ -717,6 +717,7 @@ async def main() -> None:
         lines = [f"🔄 <code>{html.escape(str(cwd))}</code>"]
         rows: list[list[InlineKeyboardButton]] = []
         shown = False
+        has_locked = False
         unselectable: set[Path] = set()
         for index, (path, repo_status) in enumerate(zip(listing, statuses, strict=True)):
             label = labels[path]
@@ -728,6 +729,7 @@ async def main() -> None:
                 continue
             shown = True
             live = os.path.realpath(str(path)) in occupied
+            has_locked = has_locked or live
             lines.append(
                 _sync_line(repo_status, selected=path in chosen, label=label, live_session=live)
             )
@@ -739,6 +741,10 @@ async def main() -> None:
             # не свежее последнего похода в сеть, и это главное, ради чего
             # карточку открывают.
             lines.append("<i>↓/↑ — на момент последнего fetch, не сейчас.</i>")
+        if has_locked:
+            # 🔒 обещает только «ветку не переключим» — перемотка происходит,
+            # и файлы под работающей сессией меняются (подробнее — в README).
+            lines.append("<i>🔒 — ветку не тронем, но перемотка всё равно случится.</i>")
         if truncated:
             lines.append(f"…показал первые {MAX_SYNC_TARGETS}.")
 

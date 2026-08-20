@@ -105,6 +105,47 @@ async def test_status_without_upstream(tmp_path: Path) -> None:
     assert got.ahead == 0 and got.behind == 0
 
 
+async def test_status_returns_none_when_porcelain_check_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Код возврата `status --porcelain` раньше игнорировался: пустой вывод при
+    # ошибке сошёл бы за «чисто», и sync() тронул бы репозиторий, чьё реальное
+    # состояние мы не увидели.
+    repo = _init_repo(tmp_path / "repo")
+    real_git = worktrees._git
+
+    async def failing_porcelain(
+        cwd: Path, *args: str, timeout_s: float | None = None
+    ) -> tuple[int, str]:
+        if args[:2] == ("status", "--porcelain"):
+            return 128, ""
+        return await real_git(cwd, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(sync, "_git", failing_porcelain)
+
+    assert await sync.status(repo) is None
+
+
+async def test_sync_skips_when_porcelain_check_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, clone = _make_origin_and_clone(tmp_path)
+    real_git = worktrees._git
+
+    async def failing_porcelain(
+        cwd: Path, *args: str, timeout_s: float | None = None
+    ) -> tuple[int, str]:
+        if args[:2] == ("status", "--porcelain"):
+            return 128, ""
+        return await real_git(cwd, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(sync, "_git", failing_porcelain)
+
+    result = await sync.sync(clone)
+
+    assert result.outcome is sync.Outcome.skipped
+
+
 async def test_status_detects_detached_head(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     head = _run(repo, "rev-parse", "HEAD").strip()

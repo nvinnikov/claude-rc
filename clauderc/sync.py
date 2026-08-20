@@ -46,7 +46,12 @@ async def status(repo: Path) -> RepoStatus | None:
 
     # `git status --porcelain` показывает и неотслеживаемые файлы: их `git switch`
     # тоже унесёт на другую ветку, так что для нас это такая же грязь.
-    _, dirty_out = await _git(repo, "status", "--porcelain")
+    dirty_code, dirty_out = await _git(repo, "status", "--porcelain")
+    if dirty_code != 0:
+        # Не отработало — значит состояние неизвестно, а не «чисто»: пустой
+        # вывод при ошибке молча сошёл бы за отсутствие изменений, и sync()
+        # тронул бы репозиторий, чьё реальное состояние мы не увидели.
+        return None
 
     upstream_code, upstream = await _git(
         repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"
