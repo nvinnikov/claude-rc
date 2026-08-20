@@ -23,11 +23,12 @@ _ERROR_TAIL = 400
 # пока человек ждёт ответа в телефоне.
 _GIT_TIMEOUT_S = 30.0
 
-# `worktree add` — не «локальный» вызов в смысле выше: это полный чекаут дерева,
-# и на крупном репозитории 30с не всегда хватает. Таймаут там убивает процесс
-# посреди чекаута и оставляет полусозданный worktree, зарегистрированный в git —
-# поэтому у записывающей операции свой, куда более щедрый запас.
-_WORKTREE_ADD_TIMEOUT_S = 180.0
+# `worktree add`/`worktree remove` — не «локальные» вызовы в смысле выше: это
+# полный чекаут дерева или его удаление, и на крупном репозитории 30с не всегда
+# хватает. Таймаут там убивает процесс посреди работы и оставляет наполовину
+# созданный или наполовину удалённый worktree, всё ещё зарегистрированный в
+# git — поэтому у обеих записывающих операций свой, куда более щедрый запас.
+_WORKTREE_WRITE_TIMEOUT_S = 180.0
 
 
 class WorktreeError(RuntimeError):
@@ -107,13 +108,13 @@ async def ensure(repo: Path, branch: str, root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     # Сначала пробуем существующую ветку — git сам подхватит remote-only через DWIM.
     # Не вышло — создаём новую от текущего HEAD. Свой, больший таймаут: это полный
-    # чекаут дерева, а не короткий локальный запрос (см. _WORKTREE_ADD_TIMEOUT_S).
+    # чекаут дерева, а не короткий локальный запрос (см. _WORKTREE_WRITE_TIMEOUT_S).
     code, out_existing = await _git(
-        repo, "worktree", "add", str(path), branch, timeout_s=_WORKTREE_ADD_TIMEOUT_S
+        repo, "worktree", "add", str(path), branch, timeout_s=_WORKTREE_WRITE_TIMEOUT_S
     )
     if code != 0:
         code, out_new = await _git(
-            repo, "worktree", "add", "-b", branch, str(path), timeout_s=_WORKTREE_ADD_TIMEOUT_S
+            repo, "worktree", "add", "-b", branch, str(path), timeout_s=_WORKTREE_WRITE_TIMEOUT_S
         )
         if code != 0:
             detail = out_new.strip() or out_existing.strip()
@@ -168,7 +169,10 @@ async def remove(root: Path, name: str, *, force: bool = False) -> Worktree:
         raise WorktreeError(common.strip()[-_ERROR_TAIL:])
 
     args = ["worktree", "remove"] + (["--force"] if force else []) + [str(path)]
-    code, out = await _git(Path(common.strip()).parent, *args)
+    # То же рассуждение, что у `worktree add`: удаление — тоже запись, и
+    # таймаут посреди него оставит наполовину снесённый worktree, всё ещё
+    # зарегистрированный в git (см. _WORKTREE_WRITE_TIMEOUT_S).
+    code, out = await _git(Path(common.strip()).parent, *args, timeout_s=_WORKTREE_WRITE_TIMEOUT_S)
     if code != 0:
         raise WorktreeError(out.strip()[-_ERROR_TAIL:])
     return info

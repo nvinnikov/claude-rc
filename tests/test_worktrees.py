@@ -210,6 +210,32 @@ async def test_remove_force_deletes_anyway(repo: Path, tmp_path: Path) -> None:
     assert not path.exists()
 
 
+async def test_remove_uses_its_own_longer_timeout(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, tmp_path: Path
+) -> None:
+    # То же рассуждение, что у `worktree add`: remove — тоже запись, и общий
+    # _GIT_TIMEOUT_S для неё мал на крупном репозитории. Шпионим за _git, а не
+    # укорачиваем таймаут глобально: inspect() внутри remove() тоже зовёт _git
+    # без переопределения и не переживёт общий обвал раньше, чем дойдёт до remove.
+    root = tmp_path / "wt"
+    path = await worktrees.ensure(repo, "feature-x", root)
+    (path / "new.txt").write_text("x\n")
+
+    seen: list[float | None] = []
+    real_git = worktrees._git
+
+    async def spy_git(cwd: Path, *args: str, timeout_s: float | None = None) -> tuple[int, str]:
+        if args[:2] == ("worktree", "remove"):
+            seen.append(timeout_s)
+        return await real_git(cwd, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(worktrees, "_git", spy_git)
+
+    await worktrees.remove(root, path.name, force=True)
+
+    assert seen == [worktrees._WORKTREE_WRITE_TIMEOUT_S]
+
+
 async def test_remove_clean_worktree_without_force(repo: Path, tmp_path: Path) -> None:
     root = tmp_path / "wt"
     # ветка существует и уже «на remote» её нет, но и своих коммитов нет —

@@ -1218,7 +1218,11 @@ async def main() -> None:
         if action == "cancel":
             _drop_sync_state(message.message_id)
             text, keyboard = _browse_card(state.cwd)
-            await message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+            # Состояние уже стёрто — мигрировать на новый id, если edit не
+            # выйдет (сообщение старше 48 часов — обычное дело для карточки
+            # Sync), нечего; но промолчать и оставить человека без ответа
+            # после «Отмена» нельзя, поэтому тот же приём, что и у sync_card.
+            await _sync_render(message.chat.id, message.message_id, text, keyboard)
             return
 
         if sync_cwd.get(message.message_id) != state.cwd:
