@@ -19,6 +19,12 @@ from clauderc.browse import is_repo
 from clauderc.remote import find as _find_session
 from clauderc.worktrees import _git
 
+# fetch/pull ходят в сеть — общий таймаут локальных вызовов (30с, см. _git в
+# worktrees.py) на большом или медленном репозитории может оборвать их на
+# середине. Тот же приём, что у `worktree add` в worktrees.py, здесь — для
+# сетевых операций sync.
+_NETWORK_TIMEOUT_S = 120.0
+
 
 @dataclass(frozen=True)
 class RepoStatus:
@@ -102,7 +108,7 @@ async def sync(repo: Path, *, branch: str | None = None, fetch: bool = True) -> 
         return SyncResult(repo, Outcome.skipped, "незакоммиченные изменения", current.branch)
 
     if fetch:
-        code, out = await _git(repo, "fetch", "--quiet")
+        code, out = await _git(repo, "fetch", "--quiet", timeout_s=_NETWORK_TIMEOUT_S)
         if code != 0:
             return SyncResult(repo, Outcome.failed, _short(out), current.branch)
         current = await status(repo) or current
@@ -115,6 +121,16 @@ async def sync(repo: Path, *, branch: str | None = None, fetch: bool = True) -> 
         if await _find_session(str(repo)) is not None:
             return SyncResult(
                 repo, Outcome.skipped, "живая RC-сессия — ветку не трогаю", current.branch
+            )
+        # Worktree — независимо от того, работает там кто-то сейчас или нет:
+        # переключение ветки обнулит счётчик неотправленных коммитов и снимет
+        # защиту `wtrm` от удаления неотправленной работы (см. CLAUDE.md, «Грабли»).
+        if await _is_worktree(repo):
+            return SyncResult(
+                repo,
+                Outcome.skipped,
+                "worktree — переключение снимет защиту от удаления",
+                current.branch,
             )
         switched = await _switch(repo, branch)
         if switched is not None:
@@ -134,7 +150,7 @@ async def sync(repo: Path, *, branch: str | None = None, fetch: bool = True) -> 
             repo, Outcome.skipped, f"отстаёт на {current.behind}, нужен fetch", current.branch
         )
 
-    code, out = await _git(repo, "pull", "--ff-only", "--quiet")
+    code, out = await _git(repo, "pull", "--ff-only", "--quiet", timeout_s=_NETWORK_TIMEOUT_S)
     if code != 0:
         return SyncResult(
             repo, Outcome.failed, f"остался на {current.branch}: {_short(out)}", current.branch
@@ -143,6 +159,17 @@ async def sync(repo: Path, *, branch: str | None = None, fetch: bool = True) -> 
     return SyncResult(
         repo, Outcome.updated, f"подтянуто коммитов: {current.behind}", current.branch
     )
+
+
+async def _is_worktree(repo: Path) -> bool:
+    """Worktree, а не обычный репозиторий.
+
+    У обычного репозитория `git rev-parse --git-common-dir` печатает ровно
+    `.git`; у worktree — путь до `.git` основного репозитория, физически
+    другого места (git сам отдаёт его абсолютным, раз он вне каталога).
+    """
+    code, out = await _git(repo, "rev-parse", "--git-common-dir")
+    return code == 0 and out.strip() != ".git"
 
 
 async def _switch(repo: Path, branch: str) -> SyncResult | None:
@@ -211,6 +238,16 @@ def resolve_targets(paths: list[Path]) -> list[Path]:
         expanded = [p.expanduser() for p in paths]
         return _dedupe([p.resolve() for p in expanded if is_repo(p)])
     return list_repos(Path.cwd())
+
+
+def rejected_paths(paths: list[Path]) -> list[Path]:
+    """Из явно перечисленных путей — те, что `resolve_targets` отбросит.
+
+    `resolve_targets` их просто не включает в список; здесь — чтобы можно
+    было назвать путь и причину, а не только развести руками «Репозиториев
+    не нашлось», когда на деле в пути опечатка.
+    """
+    return [p for p in paths if not is_repo(p.expanduser())]
 
 
 def display_names(paths: list[Path]) -> dict[Path, str]:

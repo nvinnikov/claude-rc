@@ -79,6 +79,19 @@ class TrustRequired(RuntimeError):
         self.cwd = cwd
 
 
+def attach_command(tmux_name: str) -> str:
+    """Команда для подсадки к сессии с самой машины.
+
+    CLAUDE_RC_TMUX_SOCKET переключает весь модуль на отдельный сервер (см.
+    модульный докстринг); без `-L` подсказка привела бы на сервер по
+    умолчанию, где этой сессии нет — особенно заметно в песочнице, где
+    рабочий сервер вообще пуст.
+    """
+    socket = os.environ.get(TMUX_SOCKET_ENV)
+    socket_flag = f"-L {shlex.quote(socket)} " if socket else ""
+    return f"tmux {socket_flag}attach -t {tmux_name}"
+
+
 @dataclass(frozen=True)
 class RemoteSession:
     name: str  # имя репозитория, как его видит пользователь
@@ -92,7 +105,7 @@ class RemoteSession:
 
     @property
     def attach_hint(self) -> str:
-        return f"tmux attach -t {self.tmux_name}"
+        return attach_command(self.tmux_name)
 
 
 def session_name(repo: str) -> str:

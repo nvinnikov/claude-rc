@@ -31,6 +31,7 @@ from clauderc.remote import (
     LaunchError,
     RemoteSession,
     TrustRequired,
+    attach_command,
     await_url,
     confirm_trust,
     kill_all,
@@ -219,7 +220,12 @@ class _Commands:
 
     @staticmethod
     def sync(args: argparse.Namespace) -> int:
-        targets = clauderc_sync.resolve_targets([Path(p) for p in args.paths])
+        explicit = [Path(p) for p in args.paths]
+        targets = clauderc_sync.resolve_targets(explicit)
+        # Только для явных путей: без них «отбросить нечего» — resolve_targets
+        # сам берёт репозитории из текущего каталога, там опечатки не бывает.
+        for path in clauderc_sync.rejected_paths(explicit):
+            print(f"⚠ не git-репозиторий, пропущен: {path}", file=sys.stderr)
         if not targets:
             print("Репозиториев не нашлось.", file=sys.stderr)
             return EXIT_ENVIRONMENT
@@ -294,7 +300,7 @@ async def _ask_trust(need: TrustRequired) -> RemoteSession:
         # Нечем спросить — это «не с чем работать», EXIT_ENVIRONMENT.
         raise _TrustDeclined(
             f"Каталог {need.cwd} ждёт подтверждения доверия, а stdin не терминал.\n"
-            f"Подтверди в панели: tmux attach -t {need.tmux_name}",
+            f"Подтверди в панели: {attach_command(need.tmux_name)}",
             exit_code=EXIT_ENVIRONMENT,
         )
     answer = input(f"Claude впервые видит {need.cwd}. Доверяешь каталогу? [y/N] ")

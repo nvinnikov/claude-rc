@@ -12,6 +12,7 @@ from clauderc.bot import (
     _selected_targets,
     _sync_line,
     _sync_report_line,
+    _sync_unavailable_line,
 )
 from clauderc.sync import Outcome, RepoStatus, SyncResult
 from clauderc.watch import Died
@@ -215,3 +216,14 @@ def test_chunk_report_never_splits_a_single_line() -> None:
 
 def test_chunk_report_empty_input() -> None:
     assert _chunk_report([]) == []
+
+
+def test_sync_unavailable_line_names_repo_and_reason() -> None:
+    line = _sync_unavailable_line("alpha")
+    assert "alpha" in line
+    assert "❔" in line
+
+
+def test_sync_unavailable_line_escapes_html() -> None:
+    line = _sync_unavailable_line("a&b")
+    assert "&amp;" in line

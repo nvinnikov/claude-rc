@@ -364,6 +364,16 @@ def _sync_line(
     )
 
 
+def _sync_unavailable_line(label: str) -> str:
+    """Строка репозитория, чей `status()` не отработал (в т.ч. по таймауту).
+
+    Не показать вовсе — человек не узнает о существовании каталога. Дать
+    отметить — предложить синхронизировать то, о чём ничего не известно.
+    Показываем и явно объясняем, почему кнопки нет.
+    """
+    return f"❔ <b>{html.escape(label)}</b> — состояние не получено, пропущен"
+
+
 def _sync_report_line(result: SyncResult, *, label: str) -> str:
     mark = {
         Outcome.updated: "⤵",
@@ -431,6 +441,9 @@ async def main() -> None:
     # `state.cwd` — индексы в sync_selection описывают уже другой листинг,
     # их нельзя использовать как есть (см. sync_card).
     sync_cwd: dict[int, Path] = {}
+    # Индексы repo, для которых status() не отработал: показаны строкой с
+    # объяснением, но без кнопки — «Все» их не подхватывает, отметить нельзя.
+    sync_unselectable: dict[int, set[int]] = {}
     # Ключ — id сообщения с запросом имени ветки (ForceReply), значение — id
     # карточки Sync. Ответ Telegram привязывает к запросу через reply_to_message,
     # так что случайное текстовое сообщение не подставится вместо имени ветки.
@@ -598,6 +611,7 @@ async def main() -> None:
         sync_listing.pop(message_id, None)
         sync_branch.pop(message_id, None)
         sync_cwd.pop(message_id, None)
+        sync_unselectable.pop(message_id, None)
         for token in [t for t, mid in branch_pending.items() if mid == message_id]:
             branch_pending.pop(token, None)
 
@@ -619,6 +633,8 @@ async def main() -> None:
             sync_branch[new_id] = sync_branch.pop(old_id)
         if old_id in sync_cwd:
             sync_cwd[new_id] = sync_cwd.pop(old_id)
+        if old_id in sync_unselectable:
+            sync_unselectable[new_id] = sync_unselectable.pop(old_id)
         for token, mid in list(branch_pending.items()):
             if mid == old_id:
                 branch_pending[token] = new_id
@@ -690,16 +706,23 @@ async def main() -> None:
         lines = [f"🔄 <code>{html.escape(str(cwd))}</code>"]
         rows: list[list[InlineKeyboardButton]] = []
         shown = False
+        unselectable: set[int] = set()
         for index, (path, repo_status) in enumerate(zip(listing, statuses, strict=True)):
+            label = labels[path]
             if repo_status is None:
+                # Не молчим: показываем строкой с причиной, но без кнопки —
+                # синхронизировать то, о чём ничего не известно, нечего.
+                unselectable.add(index)
+                lines.append(_sync_unavailable_line(label))
                 continue
             shown = True
-            label = labels[path]
             live = os.path.realpath(str(path)) in occupied
             lines.append(
                 _sync_line(repo_status, selected=index in chosen, label=label, live_session=live)
             )
             rows.append([InlineKeyboardButton(text=label, callback_data=f"sync:{index}")])
+        sync_unselectable[message_id] = unselectable
+        chosen -= unselectable  # мог быть отмечен раньше, пока status() ещё отвечал
         if shown:
             # ↓/↑ считаются по последнему известному origin/* — без fetch они
             # не свежее последнего похода в сеть, и это главное, ради чего
@@ -1177,7 +1200,8 @@ async def main() -> None:
 
         chosen = sync_selection.setdefault(message.message_id, set())
         if action == "all":
-            chosen.update(range(len(listing or [])))
+            unselectable = sync_unselectable.get(message.message_id, set())
+            chosen.update(i for i in range(len(listing or [])) if i not in unselectable)
         elif action == "none":
             chosen.clear()
         elif action == "branch":

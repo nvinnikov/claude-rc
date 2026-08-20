@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 from clauderc import remote
-from clauderc.remote import LaunchError, session_name
+from clauderc.remote import LaunchError, attach_command, session_name
 
 # Обработчик подменённого tmux: (команда, аргументы…) -> (код возврата, вывод)
 Handler = Callable[..., tuple[int, str]]
@@ -30,6 +30,20 @@ def test_session_name_prefixes_and_sanitizes() -> None:
 
 def test_session_name_survives_garbage_input() -> None:
     assert session_name("...") == "rc-session"
+
+
+def test_attach_command_uses_default_server_when_no_socket_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
+    assert attach_command("rc-oms") == "tmux attach -t rc-oms"
+
+
+def test_attach_command_targets_isolated_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Без -L подсказка привела бы на сервер по умолчанию, где сессии из
+    # изолированной песочницы (CLAUDE_RC_TMUX_SOCKET) попросту нет.
+    monkeypatch.setenv(remote.TMUX_SOCKET_ENV, "claude-rc-pytest")
+    assert attach_command("rc-oms") == "tmux -L claude-rc-pytest attach -t rc-oms"
 
 
 async def test_list_sessions_parses_rows_and_ignores_foreign(

@@ -1776,6 +1776,37 @@ def test_sync_accepts_explicit_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert seen == [repo]
 
 
+def test_sync_names_explicit_path_that_is_not_a_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Опечатка в пути раньше молча выпадала из списка — «Репозиториев не
+    # нашлось» не объясняло, что путь просто не репозиторий.
+    typo = tmp_path / "typo"
+    typo.mkdir()
+
+    assert cli.main(["sync", str(typo)]) == cli.EXIT_ENVIRONMENT
+    err = capsys.readouterr().err
+    assert str(typo) in err
+    assert "не git-репозиторий" in err
+
+
+def test_sync_names_rejected_path_alongside_valid_ones(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "alpha"
+    (repo / ".git").mkdir(parents=True)
+    typo = tmp_path / "alpah"
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        return cli.sync.SyncResult(target, cli.sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+
+    assert cli.main(["sync", str(repo), str(typo)]) == 0
+    err = capsys.readouterr().err
+    assert str(typo) in err
+
+
 def test_sync_exception_in_one_repo_does_not_lose_the_others(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

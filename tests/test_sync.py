@@ -2,7 +2,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from clauderc import sync
+from clauderc import sync, worktrees
 from clauderc.remote import RemoteSession
 
 
@@ -203,6 +203,81 @@ async def test_sync_switches_branch_when_no_live_session(
     await sync.sync(clone, branch="dev")
 
     assert _run(clone, "rev-parse", "--abbrev-ref", "HEAD").strip() == "dev"
+
+
+async def test_is_worktree_distinguishes_worktree_from_plain_repo(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    assert await sync._is_worktree(repo) is False
+
+    wt = await worktrees.ensure(repo, "feature", tmp_path / "wt")
+    assert await sync._is_worktree(wt) is True
+
+
+async def test_sync_skips_branch_switch_in_worktree_even_without_live_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Живая сессия — не единственная причина не трогать ветку в worktree:
+    # переключение само по себе обнуляет unpushed и снимает защиту wtrm
+    # (см. CLAUDE.md, «Грабли»), сессия тут ни при чём.
+    _, clone = _make_origin_and_clone(tmp_path)
+    _run(clone, "branch", "dev")
+    wt = await worktrees.ensure(clone, "feature", tmp_path / "wt")
+    (wt / "scratch.txt").write_text("работа\n")
+    _run(wt, "add", "-A")
+    _run(wt, "commit", "-qm", "работа")
+
+    async def fake_find(cwd: str) -> RemoteSession | None:
+        return None
+
+    monkeypatch.setattr(sync, "_find_session", fake_find)
+
+    before = await worktrees.inspect(wt)
+    assert before is not None and before.blockers  # неотправленный коммит на feature
+
+    result = await sync.sync(wt, branch="dev")
+
+    assert result.outcome is sync.Outcome.skipped
+    assert "worktree" in result.detail.lower()
+    assert _run(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == "feature"
+    after = await worktrees.inspect(wt)
+    assert after is not None and after.blockers
+
+
+async def test_sync_fetch_and_pull_use_their_own_longer_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # fetch/pull ходят в сеть и не обязаны укладываться в общий локальный
+    # таймаут — тот же приём, что для `worktree add`. Шпионим за _git, а не
+    # укорачиваем _GIT_TIMEOUT_S глобально: status() тоже зовёт _git без
+    # переопределения, и общий таймаут обрушил бы его раньше, чем fetch/pull.
+    bare, clone = _make_origin_and_clone(tmp_path)
+    _commit_to_origin(tmp_path, bare, "second")
+
+    seen: list[tuple[str, float | None]] = []
+    real_git = worktrees._git
+
+    async def spy_git(cwd: Path, *args: str, timeout_s: float | None = None) -> tuple[int, str]:
+        if args:
+            seen.append((args[0], timeout_s))
+        return await real_git(cwd, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(sync, "_git", spy_git)
+
+    result = await sync.sync(clone)
+
+    assert result.outcome is sync.Outcome.updated
+    network_calls = [t for cmd, t in seen if cmd in ("fetch", "pull")]
+    assert network_calls and all(t == sync._NETWORK_TIMEOUT_S for t in network_calls)
+
+
+def test_rejected_paths_flags_non_repos(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    typo = tmp_path / "typo"
+    typo.mkdir()
+
+    assert sync.rejected_paths([repo, typo]) == [typo]
+    assert sync.rejected_paths([repo]) == []
 
 
 async def test_sync_creates_branch_tracking_origin(tmp_path: Path) -> None:
