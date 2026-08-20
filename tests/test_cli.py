@@ -1678,3 +1678,188 @@ def test_setup_does_not_keep_a_previously_stored_invalid_user_id(
 
     assert cli.main(["setup"]) == 0
     assert cli.load_config(target).allowed_user_id == 42
+
+
+def test_sync_without_repos_says_so(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["sync"]) == 2
+    assert capsys.readouterr().err.strip()
+
+
+def test_sync_reports_one_line_per_repo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = tmp_path / "alpha"
+    second = tmp_path / "beta"
+    for path in (first, second):
+        (path / ".git").mkdir(parents=True)
+
+    async def fake_sync(repo: Path, **kwargs: object) -> cli.sync.SyncResult:
+        return cli.sync.SyncResult(repo, cli.sync.Outcome.updated, "подтянуто коммитов: 2", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["sync"]) == 0
+    out = capsys.readouterr().out
+    assert "alpha" in out and "beta" in out
+
+
+def test_sync_prints_summary_at_the_end(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Спека («CLI»): «вывод — строка на репозиторий, в конце сводка».
+    alpha, beta, gamma = tmp_path / "alpha", tmp_path / "beta", tmp_path / "gamma"
+    for path in (alpha, beta, gamma):
+        (path / ".git").mkdir(parents=True)
+
+    async def fake_sync(repo: Path, **kwargs: object) -> cli.sync.SyncResult:
+        outcome = cli.sync.Outcome.failed if repo.name == "gamma" else cli.sync.Outcome.updated
+        return cli.sync.SyncResult(repo, outcome, "ok", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["sync"]) == 1
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(lines) == 4  # три репозитория плюс сводка
+    assert "Итого" in lines[-1]
+    assert "подтянуто: 2" in lines[-1]
+    assert "не получилось: 1" in lines[-1]
+
+
+def test_sync_returns_one_when_something_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "alpha"
+    (repo / ".git").mkdir(parents=True)
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        return cli.sync.SyncResult(target, cli.sync.Outcome.failed, "ветки разошлись", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["sync"]) == 1
+
+
+def test_sync_passes_branch_through(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = tmp_path / "alpha"
+    (repo / ".git").mkdir(parents=True)
+    seen: dict[str, object] = {}
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        seen.update(kwargs)
+        return cli.sync.SyncResult(target, cli.sync.Outcome.already, "ok", "dev")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    monkeypatch.chdir(tmp_path)
+
+    cli.main(["sync", "--branch", "dev", "--no-fetch"])
+    assert seen["branch"] == "dev"
+    assert seen["fetch"] is False
+
+
+def test_sync_accepts_explicit_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = tmp_path / "elsewhere"
+    (repo / ".git").mkdir(parents=True)
+    seen: list[Path] = []
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        seen.append(target)
+        return cli.sync.SyncResult(target, cli.sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    assert cli.main(["sync", str(repo)]) == 0
+    assert seen == [repo]
+
+
+def test_sync_names_explicit_path_that_is_not_a_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Опечатка в пути раньше молча выпадала из списка — «Репозиториев не
+    # нашлось» не объясняло, что путь просто не репозиторий.
+    typo = tmp_path / "typo"
+    typo.mkdir()
+
+    assert cli.main(["sync", str(typo)]) == cli.EXIT_ENVIRONMENT
+    err = capsys.readouterr().err
+    assert str(typo) in err
+    assert "не git-репозиторий" in err
+
+
+def test_sync_names_rejected_path_alongside_valid_ones(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "alpha"
+    (repo / ".git").mkdir(parents=True)
+    typo = tmp_path / "alpah"
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        return cli.sync.SyncResult(target, cli.sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+
+    assert cli.main(["sync", str(repo), str(typo)]) == 0
+    err = capsys.readouterr().err
+    assert str(typo) in err
+
+
+def test_sync_exception_in_one_repo_does_not_lose_the_others(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for name in ("alpha", "beta", "gamma"):
+        (tmp_path / name / ".git").mkdir(parents=True)
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        if target.name == "beta":
+            raise RuntimeError("boom")
+        return cli.sync.SyncResult(target, cli.sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["sync"]) == 1
+    out = capsys.readouterr().out
+    assert "alpha" in out and "gamma" in out
+    assert "boom" in out
+
+
+def test_sync_disambiguates_repos_with_the_same_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = tmp_path / "dirA" / "repo"
+    second = tmp_path / "dirB" / "repo"
+    for path in (first, second):
+        (path / ".git").mkdir(parents=True)
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        return cli.sync.SyncResult(target, cli.sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+
+    assert cli.main(["sync", str(first), str(second)]) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    repo_lines, summary_lines = lines[:2], lines[2:]
+    assert repo_lines[0] != repo_lines[1]
+    assert "dirA" in repo_lines[0] and "repo" in repo_lines[0]
+    assert "dirB" in repo_lines[1] and "repo" in repo_lines[1]
+    assert summary_lines and "Итого" in summary_lines[0]
+
+
+def test_sync_deduplicates_symlinked_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    (real / ".git").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    seen: list[Path] = []
+
+    async def fake_sync(target: Path, **kwargs: object) -> cli.sync.SyncResult:
+        seen.append(target)
+        return cli.sync.SyncResult(target, cli.sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    assert cli.main(["sync", str(real), str(link)]) == 0
+    assert seen == [real.resolve()]

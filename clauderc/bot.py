@@ -8,9 +8,11 @@ from collections import Counter
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -20,6 +22,7 @@ from aiogram.types import (
 )
 
 from clauderc import browse, history, paths, worktrees
+from clauderc import sync as sync_mod
 from clauderc.browse import BrowseError
 from clauderc.config import Config, load_config
 from clauderc.remote import (
@@ -38,6 +41,7 @@ from clauderc.remote import (
 )
 from clauderc.repos import discover, resolve
 from clauderc.state import State
+from clauderc.sync import Outcome, RepoStatus, SyncResult
 from clauderc.watch import Died, Watcher
 from clauderc.worktrees import Worktree, WorktreeError
 
@@ -47,6 +51,8 @@ DISCOVERY_TTL_S = 60.0
 MAX_CHOICES = 8
 MAX_PROJECT_BUTTONS = 60
 MAX_TREE_CARDS = 10
+MAX_SYNC_TARGETS = 20
+MAX_BRANCH_NAME_LEN = 100
 HELP = (
     "Поднимаю сессии Claude Code с Remote Control — дальше работа в приложении Claude.\n\n"
     "<b>Куда идём</b>\n"
@@ -59,6 +65,10 @@ HELP = (
     "<b>🌿 New worktree</b> — сессия в свежем worktree, ветка по времени; "
     "так работают параллельно с уже запущенной\n"
     "<code>/rc</code> &lt;репо&gt; [ветка] — то же по имени, без хождения\n\n"
+    "<b>Синхронизация</b>\n"
+    "<b>🔄 Sync</b> на карточке <code>/pwd</code> — режим выбора репозиториев в "
+    "каталоге: галочки, «Все»/«Никого», ветка перед подтягиванием, отчёт строкой "
+    "на репозиторий\n\n"
     "<b>Что запущено</b>\n"
     "<b>💬 Chats</b> (<code>/rc</code>) — живые сессии с кнопками "
     "<b>Open in Claude</b> и <b>⏹ Stop</b>, а следом worktree, оставшиеся без сессии: "
@@ -239,6 +249,8 @@ def _browse_card(cwd: Path) -> tuple[str, InlineKeyboardMarkup]:
     if browse.is_repo(cwd):
         launch_row.append(InlineKeyboardButton(text="🌿 New worktree", callback_data="nav:newwt"))
     rows.append(launch_row)
+    if _has_repos(cwd):
+        rows.append([InlineKeyboardButton(text="🔄 Sync", callback_data="sync:open")])
 
     text = f"📁 <code>{html.escape(str(cwd))}</code>{mark}"
     if not children:
@@ -272,6 +284,111 @@ def _projects_card(
     if len(paths) > len(shown):
         text += f"\nПоказал {len(shown)} из {len(paths)}, остальные через <b>/cd</b>."
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+_REPORT_CHUNK_CHARS = 4000  # запас от лимита Telegram в 4096 символов на сообщение
+
+
+def _chunk_report(lines: list[str], limit: int = _REPORT_CHUNK_CHARS) -> list[str]:
+    """Режет строки отчёта на части ≤`limit` символов, не разрывая строку пополам.
+
+    Двадцать репозиториев без сети дают по строке `fatal: unable to access …`
+    каждый — вместе они переваливают за лимит Telegram, и неразрезанный отчёт
+    не отправился бы вовсе.
+    """
+    chunks: list[str] = []
+    current: list[str] = []
+    length = 0
+    for line in lines:
+        added = len(line) + (1 if current else 0)  # +1 за перевод строки от join
+        if current and length + added > limit:
+            chunks.append("\n".join(current))
+            current, length = [], 0
+            added = len(line)
+        current.append(line)
+        length += added
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def _selected_targets(listing: list[Path], chosen: set[Path]) -> list[Path]:
+    """Пути из `chosen`, которых `listing` всё ещё касается — в порядке листинга.
+
+    Выбор хранится путями, а не индексами: листинг мог измениться между
+    отрисовкой карточки и тапом — не только сменой каталога (это ловит
+    `sync_cwd`), но и составом того же каталога (рядом склонировали ещё один
+    репозиторий). Индекс тогда указал бы на другой репозиторий; путь — нет.
+    Путь, которого в текущем листинге больше нет (исчез, укоротили до
+    MAX_SYNC_TARGETS), просто выпадает — тем же способом, что раньше выпадали
+    индексы вне диапазона.
+    """
+    return [p for p in listing if p in chosen]
+
+
+def _has_repos(cwd: Path) -> bool:
+    """Есть ли смысл предлагать Sync: `list_repos` даёт хоть один результат.
+
+    Одна и та же функция, что рисует карточку выбора — иначе кнопка может
+    появиться там, где сама карточка окажется пустой, или наоборот.
+    """
+    try:
+        return bool(sync_mod.list_repos(cwd))
+    except OSError:
+        return False
+
+
+def _sync_line(
+    status: RepoStatus, *, selected: bool, label: str, live_session: bool = False
+) -> str:
+    """Строка репозитория в режиме выбора: имя, ветка и в каком он состоянии.
+
+    `label` — не `status.path.name`: при одноимённых репозиториях (два клона,
+    каталог с ребёнком того же имени) имя без разрешения неоднозначности дало
+    бы две неотличимые строки — тем же способом, что и в CLI (`sync.display_names`).
+
+    `live_session` — тут прямо сейчас работает RC-сессия: `sync.sync` не станет
+    переключать ей ветку из-под ног (см. clauderc/sync.py), и об этом стоит
+    предупредить до тапа «Ветка», а не после тихого пропуска в отчёте.
+    """
+    box = "☑" if selected else "☐"
+    marks = []
+    if status.upstream is None:
+        marks.append("⚠")
+    if status.behind:
+        marks.append(f"↓{status.behind}")
+    if status.ahead:
+        marks.append(f"↑{status.ahead}")
+    marks.append("✎" if status.dirty else "✓")
+    if live_session:
+        marks.append("🔒")
+    return (
+        f"{box} <b>{html.escape(label)}</b> "
+        f"<code>{html.escape(status.branch)}</code> {' '.join(marks)}"
+    )
+
+
+def _sync_unavailable_line(label: str) -> str:
+    """Строка репозитория, чей `status()` не отработал (в т.ч. по таймауту).
+
+    Не показать вовсе — человек не узнает о существовании каталога. Дать
+    отметить — предложить синхронизировать то, о чём ничего не известно.
+    Показываем и явно объясняем, почему кнопки нет.
+    """
+    return f"❔ <b>{html.escape(label)}</b> — состояние не получено, пропущен"
+
+
+def _sync_report_line(result: SyncResult, *, label: str) -> str:
+    mark = {
+        Outcome.updated: "⤵",
+        Outcome.already: "=",
+        Outcome.skipped: "·",
+        Outcome.failed: "❌",
+    }[result.outcome]
+    return (
+        f"{mark} <b>{html.escape(label)}</b> "
+        f"<code>{html.escape(result.branch)}</code> — {html.escape(result.detail)}"
+    )
 
 
 class Discovery:
@@ -319,6 +436,29 @@ async def main() -> None:
     # Значение — (id карточки, выбор): выбор любого варианта гасит остальные
     # токены той же карточки, чтобы два тапа не подняли две сессии в одном каталоге.
     resume_pending: dict[str, tuple[str, ResumeChoice]] = {}
+    # Выбор живёт в памяти и привязан к сообщению: восстанавливать наполовину
+    # сделанный выбор после перезапуска опаснее, чем начать заново. Хранится
+    # путями, а не индексами: индекс — позиция в листинге на момент отрисовки,
+    # и если между отрисовками состав каталога поменялся (склонировали рядом
+    # ещё один репозиторий), тот же индекс указал бы уже на другой репозиторий.
+    sync_selection: dict[int, set[Path]] = {}
+    sync_listing: dict[int, list[Path]] = {}
+    sync_branch: dict[int, str] = {}
+    # Каталог, для которого карточка сейчас нарисована. Если он разошёлся с
+    # `state.cwd` — выбор в sync_selection описывает уже другой листинг, его
+    # нельзя использовать как есть (см. sync_card).
+    sync_cwd: dict[int, Path] = {}
+    # Repo, для которых status() не отработал: показаны строкой с объяснением,
+    # но без кнопки — «Все» их не подхватывает, отметить нельзя.
+    sync_unselectable: dict[int, set[Path]] = {}
+    # Сообщения, для которых сейчас идёт «Подтянуть»: второй тап по той же
+    # карточке, пока первый ещё не отработал, дал бы два параллельных `pull`
+    # по одним и тем же репозиториям — они подерутся за index.lock git'а.
+    sync_running: set[int] = set()
+    # Ключ — id сообщения с запросом имени ветки (ForceReply), значение — id
+    # карточки Sync. Ответ Telegram привязывает к запросу через reply_to_message,
+    # так что случайное текстовое сообщение не подставится вместо имени ветки.
+    branch_pending: dict[int, int] = {}
 
     async def start_session(
         message: Message, target: Path, branch: str | None, resume: str | None = None
@@ -475,6 +615,208 @@ async def main() -> None:
                 f"…и ещё {len(orphans) - MAX_TREE_CARDS} worktree без сессии — <code>/wt</code>",
                 parse_mode="HTML",
             )
+
+    def _drop_sync_state(message_id: int) -> None:
+        """Стирает всё, что помнит про карточку: и после «Подтянуть», и по «Отмена»."""
+        sync_selection.pop(message_id, None)
+        sync_listing.pop(message_id, None)
+        sync_branch.pop(message_id, None)
+        sync_cwd.pop(message_id, None)
+        sync_unselectable.pop(message_id, None)
+        for token in [t for t, mid in branch_pending.items() if mid == message_id]:
+            branch_pending.pop(token, None)
+
+    def _migrate_sync_state(old_id: int, new_id: int) -> None:
+        """Переносит состояние карточки на новый message_id — теми же значениями.
+
+        Нужно, когда `_sync_render` не смог отредактировать исходное сообщение
+        (не «не изменилось» — настоящая ошибка) и прислал карточку заново: без
+        переноса кнопки нового сообщения отвечали бы «Список устарел», включая
+        «Отмена».
+        """
+        if old_id == new_id:
+            return
+        if old_id in sync_selection:
+            sync_selection[new_id] = sync_selection.pop(old_id)
+        if old_id in sync_listing:
+            sync_listing[new_id] = sync_listing.pop(old_id)
+        if old_id in sync_branch:
+            sync_branch[new_id] = sync_branch.pop(old_id)
+        if old_id in sync_cwd:
+            sync_cwd[new_id] = sync_cwd.pop(old_id)
+        if old_id in sync_unselectable:
+            sync_unselectable[new_id] = sync_unselectable.pop(old_id)
+        for token, mid in list(branch_pending.items()):
+            if mid == old_id:
+                branch_pending[token] = new_id
+
+    async def _sync_render(
+        chat_id: int, message_id: int, text: str, keyboard: InlineKeyboardMarkup | None
+    ) -> int:
+        """Отрисовать карточку. Возвращает id сообщения, где она реально оказалась.
+
+        «Не изменилось» (второй тап по уже показанному состоянию, например
+        «Никого» при пустом выборе) — штатный случай, не ошибка: Telegram
+        отказывает редактировать тем же содержимым, и здесь просто ничего не
+        делаем — на экране и так верно. При настоящей ошибке редактирования
+        шлём карточку новым сообщением; вызывающий обязан перенести состояние
+        на вернувшийся id, если оно ведётся по message_id (см. `sync_card`).
+        """
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            return message_id
+        except Exception as exc:
+            if isinstance(exc, TelegramBadRequest) and "not modified" in exc.message.lower():
+                return message_id
+            sent = await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+            return sent.message_id
+
+    async def sync_card(chat_id: int, message_id: int, cwd: Path) -> None:
+        """(Пере)рисовать карточку выбора репозиториев для конкретного сообщения."""
+        if sync_cwd.get(message_id) != cwd:
+            # Каталог сменился с прошлой отрисовки этой самой карточки — прежний
+            # выбор относился к другому дереву, безопаснее сбросить его, чем
+            # угадывать, что из отмеченного означает то же самое здесь.
+            sync_selection[message_id] = set()
+        sync_cwd[message_id] = cwd
+
+        try:
+            listing = sync_mod.list_repos(cwd)
+        except OSError as exc:
+            sync_listing[message_id] = []
+            await _sync_render(chat_id, message_id, f"❌ {html.escape(str(exc))}", None)
+            return
+
+        truncated = len(listing) > MAX_SYNC_TARGETS
+        listing = listing[:MAX_SYNC_TARGETS]
+        sync_listing[message_id] = listing
+        chosen = sync_selection.setdefault(message_id, set())
+
+        try:
+            # Параллельно: на каждый репозиторий приходится несколько вызовов git,
+            # и десяток штук последовательно открывался бы заметно долго.
+            statuses = await asyncio.gather(*(sync_mod.status(path) for path in listing))
+        except OSError as exc:
+            await _sync_render(
+                chat_id, message_id, f"❌ git недоступен: {html.escape(str(exc))}", None
+            )
+            return
+
+        # Один вызов tmux на всю карточку, не на репозиторий: `sync` не станет
+        # переключать ветку там, где сессия уже работает (clauderc/sync.py),
+        # и это стоит показать до тапа «Ветка», а не после тихого skip в отчёте.
+        occupied = {os.path.realpath(s.cwd) for s in await list_sessions()}
+
+        labels = sync_mod.display_names(listing)
+        lines = [f"🔄 <code>{html.escape(str(cwd))}</code>"]
+        rows: list[list[InlineKeyboardButton]] = []
+        shown = False
+        has_locked = False
+        unselectable: set[Path] = set()
+        for index, (path, repo_status) in enumerate(zip(listing, statuses, strict=True)):
+            label = labels[path]
+            if repo_status is None:
+                # Не молчим: показываем строкой с причиной, но без кнопки —
+                # синхронизировать то, о чём ничего не известно, нечего.
+                unselectable.add(path)
+                lines.append(_sync_unavailable_line(label))
+                continue
+            shown = True
+            live = os.path.realpath(str(path)) in occupied
+            has_locked = has_locked or live
+            lines.append(
+                _sync_line(repo_status, selected=path in chosen, label=label, live_session=live)
+            )
+            rows.append([InlineKeyboardButton(text=label, callback_data=f"sync:{index}")])
+        sync_unselectable[message_id] = unselectable
+        chosen -= unselectable  # мог быть отмечен раньше, пока status() ещё отвечал
+        if shown:
+            # ↓/↑ считаются по последнему известному origin/* — без fetch они
+            # не свежее последнего похода в сеть, и это главное, ради чего
+            # карточку открывают.
+            lines.append("<i>↓/↑ — на момент последнего fetch, не сейчас.</i>")
+        if has_locked:
+            # 🔒 обещает только «ветку не переключим» — перемотка происходит,
+            # и файлы под работающей сессией меняются (подробнее — в README).
+            lines.append("<i>🔒 — ветку не тронем, но перемотка всё равно случится.</i>")
+        if truncated:
+            lines.append(f"…показал первые {MAX_SYNC_TARGETS}.")
+
+        branch = sync_branch.get(message_id, "")
+        rows.append(
+            [
+                InlineKeyboardButton(text="Все", callback_data="sync:all"),
+                InlineKeyboardButton(text="Никого", callback_data="sync:none"),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"Ветка: {branch or 'текущая'}", callback_data="sync:branch"
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(text="⤵️ Подтянуть", callback_data="sync:run"),
+                InlineKeyboardButton(text="Отмена", callback_data="sync:cancel"),
+            ]
+        )
+        rendered_id = await _sync_render(
+            chat_id, message_id, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+        )
+        _migrate_sync_state(message_id, rendered_id)
+
+    async def run_sync(message: Message) -> None:
+        # Второй тап «Подтянуть», пока первый ещё не отработал: два
+        # параллельных `pull` по одним и тем же репозиториям подерутся за
+        # index.lock, и придёт два отчёта, один из которых врёт. Проверка и
+        # пометка — до первого await, гонки между тапами тут не бывает.
+        if message.message_id in sync_running:
+            await message.answer("Уже идёт синхронизация — дождись отчёта.")
+            return
+        sync_running.add(message.message_id)
+        try:
+            listing = sync_listing.get(message.message_id) or []
+            chosen = sync_selection.get(message.message_id, set())
+            targets = _selected_targets(listing, chosen)
+            if not targets:
+                await message.answer("Ничего не выбрано.")
+                return
+
+            branch = sync_branch.get(message.message_id) or None
+            notice = await message.answer(f"⏳ Подтягиваю: {len(targets)}…")
+
+            try:
+                # sync_one, а не sync: одно исключение не должно уронить весь
+                # gather и оставить «⏳ Подтягиваю…» висеть навсегда без отчёта
+                # по остальным.
+                results = await asyncio.gather(
+                    *(sync_mod.sync_one(path, branch=branch) for path in targets)
+                )
+                labels = sync_mod.display_names(targets)
+                lines = [_sync_report_line(r, label=labels[r.path]) for r in results]
+                # Без сети 15-20 репозиториев дают по строке `fatal: unable to
+                # access …` каждый и переваливают за лимит Telegram в 4096
+                # символов на сообщение — тогда отчёт режем на части, а не
+                # теряем целиком.
+                chunks = _chunk_report(lines) or ["Пусто."]
+                await _sync_render(notice.chat.id, notice.message_id, chunks[0], None)
+                for extra in chunks[1:]:
+                    await bot.send_message(notice.chat.id, extra, parse_mode="HTML")
+            finally:
+                # Отчёт мог не дойти (сеть, Telegram) — но работа уже сделана,
+                # и держать карточку с галочками ради недоставленного текста
+                # не за чем.
+                _drop_sync_state(message.message_id)
+        finally:
+            sync_running.discard(message.message_id)
 
     @dp.message(lambda event: not _is_authorized(event.from_user, config.allowed_user_id))
     async def reject_strangers(message: Message) -> None:
@@ -853,6 +1195,100 @@ async def main() -> None:
         await message.edit_reply_markup(reply_markup=None)
         target, branch, resume = choice
         await start_session(message, target, branch, resume)
+
+    @dp.callback_query(F.data.startswith("sync:"))
+    async def on_sync(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        action = (query.data or "").removeprefix("sync:")
+        await query.answer()
+        message = _live_message(query)
+        if message is None:
+            return
+
+        listing = sync_listing.get(message.message_id)
+        if listing is None and action != "open":
+            await message.answer("Список устарел, повтори /pwd.")
+            return
+
+        if action == "open":
+            await sync_card(message.chat.id, message.message_id, state.cwd)
+            return
+
+        if action == "cancel":
+            _drop_sync_state(message.message_id)
+            text, keyboard = _browse_card(state.cwd)
+            # Состояние уже стёрто — мигрировать на новый id, если edit не
+            # выйдет (сообщение старше 48 часов — обычное дело для карточки
+            # Sync), нечего; но промолчать и оставить человека без ответа
+            # после «Отмена» нельзя, поэтому тот же приём, что и у sync_card.
+            await _sync_render(message.chat.id, message.message_id, text, keyboard)
+            return
+
+        if sync_cwd.get(message.message_id) != state.cwd:
+            # Карточка нарисована для другого каталога — прежний выбор к нему
+            # не относится, безопаснее начать заново, чем угадывать соответствие.
+            sync_selection[message.message_id] = set()
+            await message.answer("Каталог сменился — выбор сброшен, отметь заново.")
+            await sync_card(message.chat.id, message.message_id, state.cwd)
+            return
+
+        chosen = sync_selection.setdefault(message.message_id, set())
+        if action == "all":
+            unselectable = sync_unselectable.get(message.message_id, set())
+            chosen.update(p for p in (listing or []) if p not in unselectable)
+        elif action == "none":
+            chosen.clear()
+        elif action == "branch":
+            prompt = await message.answer(
+                "Пришли имя ветки <b>ответом на это сообщение</b> "
+                "или <code>-</code>, чтобы остаться на текущей.",
+                parse_mode="HTML",
+                reply_markup=ForceReply(
+                    force_reply=True, selective=True, input_field_placeholder="имя ветки или -"
+                ),
+            )
+            branch_pending[prompt.message_id] = message.message_id
+            return
+        elif action == "run":
+            await run_sync(message)
+            return
+        else:
+            try:
+                index = int(action)
+            except ValueError:
+                await message.answer("Список устарел, повтори /pwd.")
+                return
+            valid_listing = listing or []
+            if not 0 <= index < len(valid_listing):
+                await message.answer("Список устарел, повтори /pwd.")
+                return
+            chosen.symmetric_difference_update({valid_listing[index]})
+
+        await sync_card(message.chat.id, message.message_id, state.cwd)
+
+    @dp.message(F.reply_to_message & F.text)
+    async def on_branch_reply(message: Message) -> None:
+        """Имя ветки для карточки Sync приходит ответом на её же запрос.
+
+        Ответ через Telegram `reply_to_message` — не произвольное следующее
+        сообщение: так две открытые карточки не путают ветки между собой, а
+        забытая заявка не подхватывает случайный текст, не имеющий к ней
+        отношения.
+        """
+        if not _is_authorized(message.from_user, config.allowed_user_id):
+            return
+        reply = message.reply_to_message
+        if reply is None:
+            return
+        card_id = branch_pending.pop(reply.message_id, None)
+        if card_id is None:
+            return
+        text = (message.text or "").strip()
+        # Без обрезки длинное имя уезжает в текст кнопки «Ветка: …», и Telegram
+        # отвергает отрисовку карточки целиком.
+        sync_branch[card_id] = "" if text == "-" else text[:MAX_BRANCH_NAME_LEN]
+        await sync_card(message.chat.id, card_id, state.cwd)
 
     async def on_died(died: Died) -> None:
         # Watcher зовёт колбэк в цикле по всем упавшим за один опрос сессиям;

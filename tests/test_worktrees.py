@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 from clauderc import worktrees
@@ -36,6 +37,78 @@ async def repo(tmp_path: Path) -> Path:
 def test_slug_normalizes_branch_names() -> None:
     assert slug("feature/DEV-123_fix") == "feature-dev-123_fix"
     assert slug("///") == "wt"
+
+
+class _HangingProcess:
+    """Подменяет процесс, который никогда не завершится сам — только по kill()."""
+
+    def __init__(self) -> None:
+        self.killed = False
+        self.waited = False
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        await asyncio.sleep(3600)
+        return b"", b""  # pragma: no cover — недостижимо, ждём таймаут раньше
+
+    def kill(self) -> None:
+        self.killed = True
+
+    async def wait(self) -> int:
+        self.waited = True
+        return -9
+
+
+async def test_git_kills_process_that_exceeds_timeout(
+    monkeypatch: pytest.MonkeyPatch, repo: Path
+) -> None:
+    hanging = _HangingProcess()
+
+    async def fake_exec(*args: Any, **kwargs: Any) -> _HangingProcess:
+        return hanging
+
+    # worktrees.py делает `import asyncio` и зовёт asyncio.create_subprocess_exec —
+    # тот же объект модуля, что и здесь, так что патчим его напрямую.
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(worktrees, "_GIT_TIMEOUT_S", 0.05)
+
+    code, out = await worktrees._git(repo, "status")
+
+    assert code == 1
+    assert "не ответил" in out
+    assert hanging.killed is True  # процесс завершён, а не оставлен висеть
+    assert hanging.waited is True
+
+
+async def test_git_disables_terminal_prompt(monkeypatch: pytest.MonkeyPatch, repo: Path) -> None:
+    # Приватный remote не должен ждать пароль, который никто не введёт.
+    real_exec: Any = asyncio.create_subprocess_exec
+    captured: dict[str, object] = {}
+
+    async def spy_exec(*args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return await real_exec(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
+
+    await worktrees._git(repo, "rev-parse", "--show-toplevel")
+
+    env = captured.get("env")
+    assert isinstance(env, dict)
+    assert env.get("GIT_TERMINAL_PROMPT") == "0"
+
+
+async def test_ensure_worktree_add_uses_its_own_longer_timeout(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, tmp_path: Path
+) -> None:
+    # `worktree add` — полный чекаут дерева, не короткий локальный запрос;
+    # общий _GIT_TIMEOUT_S (30с) для него мал на крупном репозитории. Раз
+    # укоротив _GIT_TIMEOUT_S до микроскопического значения, убеждаемся, что
+    # `ensure` от этого не пострадал — значит, add идёт по отдельному таймауту.
+    monkeypatch.setattr(worktrees, "_GIT_TIMEOUT_S", 0.001)
+
+    path = await worktrees.ensure(repo, "feature-x", tmp_path / "wt")
+
+    assert (path / "README.md").exists()
 
 
 async def test_ensure_creates_worktree_on_new_branch(repo: Path, tmp_path: Path) -> None:
@@ -135,6 +208,32 @@ async def test_remove_force_deletes_anyway(repo: Path, tmp_path: Path) -> None:
 
     assert removed.branch == "topic"
     assert not path.exists()
+
+
+async def test_remove_uses_its_own_longer_timeout(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, tmp_path: Path
+) -> None:
+    # То же рассуждение, что у `worktree add`: remove — тоже запись, и общий
+    # _GIT_TIMEOUT_S для неё мал на крупном репозитории. Шпионим за _git, а не
+    # укорачиваем таймаут глобально: inspect() внутри remove() тоже зовёт _git
+    # без переопределения и не переживёт общий обвал раньше, чем дойдёт до remove.
+    root = tmp_path / "wt"
+    path = await worktrees.ensure(repo, "feature-x", root)
+    (path / "new.txt").write_text("x\n")
+
+    seen: list[float | None] = []
+    real_git = worktrees._git
+
+    async def spy_git(cwd: Path, *args: str, timeout_s: float | None = None) -> tuple[int, str]:
+        if args[:2] == ("worktree", "remove"):
+            seen.append(timeout_s)
+        return await real_git(cwd, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(worktrees, "_git", spy_git)
+
+    await worktrees.remove(root, path.name, force=True)
+
+    assert seen == [worktrees._WORKTREE_WRITE_TIMEOUT_S]
 
 
 async def test_remove_clean_worktree_without_force(repo: Path, tmp_path: Path) -> None:

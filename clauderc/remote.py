@@ -5,6 +5,11 @@
 
 `claude --remote-control` — интерактивная команда: без tty она уходит в режим
 `--print` и падает. Панель tmux даёт tty, а заодно переживает нас.
+
+Переменная `CLAUDE_RC_TMUX_SOCKET` переключает весь модуль на отдельный
+tmux-сервер (`tmux -L <имя>`), полностью изолированный от сервера по
+умолчанию — тот, где живут рабочие `rc-*` сессии. Полезно не только тестам:
+так можно поднять песочницу, не рискуя случайно задеть боевые сессии.
 """
 
 from __future__ import annotations
@@ -23,6 +28,9 @@ log = logging.getLogger("clauderc.remote")
 
 PREFIX = "rc-"
 CLAUDE_BIN = "claude"
+# Имя отдельного tmux-сервера (`tmux -L <имя>`). Пустая/отсутствующая — сервер
+# по умолчанию, тот же, где живут рабочие сессии.
+TMUX_SOCKET_ENV = "CLAUDE_RC_TMUX_SOCKET"
 # Ширину/высоту задаём явно: у панели без клиента размер по умолчанию мелкий,
 # и TUI переносит строки так, что ссылка рвётся пополам.
 _COLS, _ROWS = "120", "40"
@@ -71,6 +79,19 @@ class TrustRequired(RuntimeError):
         self.cwd = cwd
 
 
+def attach_command(tmux_name: str) -> str:
+    """Команда для подсадки к сессии с самой машины.
+
+    CLAUDE_RC_TMUX_SOCKET переключает весь модуль на отдельный сервер (см.
+    модульный докстринг); без `-L` подсказка привела бы на сервер по
+    умолчанию, где этой сессии нет — особенно заметно в песочнице, где
+    рабочий сервер вообще пуст.
+    """
+    socket = os.environ.get(TMUX_SOCKET_ENV)
+    socket_flag = f"-L {shlex.quote(socket)} " if socket else ""
+    return f"tmux {socket_flag}attach -t {tmux_name}"
+
+
 @dataclass(frozen=True)
 class RemoteSession:
     name: str  # имя репозитория, как его видит пользователь
@@ -84,7 +105,7 @@ class RemoteSession:
 
     @property
     def attach_hint(self) -> str:
-        return f"tmux attach -t {self.tmux_name}"
+        return attach_command(self.tmux_name)
 
 
 def session_name(repo: str) -> str:
@@ -97,8 +118,11 @@ def tmux_available() -> bool:
 
 
 async def _run(*args: str, check: bool = True) -> tuple[int, str]:
+    socket = os.environ.get(TMUX_SOCKET_ENV)
+    socket_flag = ("-L", socket) if socket else ()
     proc = await asyncio.create_subprocess_exec(
         "tmux",
+        *socket_flag,
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,

@@ -16,6 +16,7 @@ import subprocess as subprocess  # тесты подменяют cli.subprocess.
 import sys as sys
 import tempfile
 import tomllib
+from collections import Counter
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
@@ -23,12 +24,14 @@ from typing import Any, NamedTuple
 
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
 from clauderc import setup as setup  # тесты подменяют cli.setup.verify_token/catch_user_id
+from clauderc import sync as clauderc_sync  # _Commands.sync затенил бы модуль sync
 from clauderc import worktrees as worktrees  # тесты подменяют cli.worktrees.ensure
 from clauderc.config import load_config as load_config  # тесты читают cli.load_config
 from clauderc.remote import (
     LaunchError,
     RemoteSession,
     TrustRequired,
+    attach_command,
     await_url,
     confirm_trust,
     kill_all,
@@ -37,6 +40,11 @@ from clauderc.remote import (
     list_sessions,
 )
 from clauderc.worktrees import WorktreeError
+
+# Публичный алиас для тестов: `_Commands.sync` — метод класса и модулю не мешает,
+# но `cli.sync` без него указывал бы на функцию, а не на модуль clauderc.sync,
+# который тесты подменяют (`monkeypatch.setattr(cli.sync, "sync", ...)`).
+sync = clauderc_sync
 
 # Коды возврата: 1 — не получилось сделать, 2 — не с чем работать.
 EXIT_FAILED = 1
@@ -82,6 +90,11 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true", dest="as_json")
 
     sub.add_parser("setup", help="заполнить config.toml: токен, user_id, каталоги")
+
+    sync_cmd = sub.add_parser("sync", help="подтянуть репозитории из origin")
+    sync_cmd.add_argument("paths", nargs="*", help="каталоги (по умолчанию текущий)")
+    sync_cmd.add_argument("--branch", help="переключить на ветку перед подтягиванием")
+    sync_cmd.add_argument("--no-fetch", action="store_false", dest="fetch", help="не ходить в сеть")
 
     return parser
 
@@ -205,6 +218,33 @@ class _Commands:
             print("\nПрервано.", file=sys.stderr)
             return EXIT_ENVIRONMENT
 
+    @staticmethod
+    def sync(args: argparse.Namespace) -> int:
+        explicit = [Path(p) for p in args.paths]
+        targets = clauderc_sync.resolve_targets(explicit)
+        # Только для явных путей: без них «отбросить нечего» — resolve_targets
+        # сам берёт репозитории из текущего каталога, там опечатки не бывает.
+        for path in clauderc_sync.rejected_paths(explicit):
+            print(f"⚠ не git-репозиторий, пропущен: {path}", file=sys.stderr)
+        if not targets:
+            print("Репозиториев не нашлось.", file=sys.stderr)
+            return EXIT_ENVIRONMENT
+        results = asyncio.run(clauderc_sync.sync_all(targets, branch=args.branch, fetch=args.fetch))
+        labels = clauderc_sync.display_names([r.path for r in results])
+        for result in results:
+            print(
+                f"{_MARK[result.outcome]} {labels[result.path]}\t{result.branch}\t{result.detail}"
+            )
+        counts = Counter(r.outcome for r in results)
+        summary = ", ".join(
+            f"{_OUTCOME_LABEL[outcome]}: {counts[outcome]}"
+            for outcome in clauderc_sync.Outcome
+            if counts[outcome]
+        )
+        print(f"Итого — {summary}." if summary else "Итого: пусто.")
+        failed = counts[clauderc_sync.Outcome.failed]
+        return EXIT_FAILED if failed else 0
+
 
 class _TrustDeclined(RuntimeError):
     """Каталог требует подтверждения доверия, а подтвердить некому или отказались."""
@@ -216,6 +256,21 @@ class _TrustDeclined(RuntimeError):
 
 class _StopFailed(RuntimeError):
     """Сессия нашлась, но tmux не смог её погасить — не путать с «не найдена»."""
+
+
+_MARK = {
+    clauderc_sync.Outcome.updated: "⤵",
+    clauderc_sync.Outcome.already: "=",
+    clauderc_sync.Outcome.skipped: "·",
+    clauderc_sync.Outcome.failed: "✗",
+}
+
+_OUTCOME_LABEL = {
+    clauderc_sync.Outcome.updated: "подтянуто",
+    clauderc_sync.Outcome.already: "актуально",
+    clauderc_sync.Outcome.skipped: "пропущено",
+    clauderc_sync.Outcome.failed: "не получилось",
+}
 
 
 def _as_dict(session: RemoteSession) -> dict[str, Any]:
@@ -245,7 +300,7 @@ async def _ask_trust(need: TrustRequired) -> RemoteSession:
         # Нечем спросить — это «не с чем работать», EXIT_ENVIRONMENT.
         raise _TrustDeclined(
             f"Каталог {need.cwd} ждёт подтверждения доверия, а stdin не терминал.\n"
-            f"Подтверди в панели: tmux attach -t {need.tmux_name}",
+            f"Подтверди в панели: {attach_command(need.tmux_name)}",
             exit_code=EXIT_ENVIRONMENT,
         )
     answer = input(f"Claude впервые видит {need.cwd}. Доверяешь каталогу? [y/N] ")
