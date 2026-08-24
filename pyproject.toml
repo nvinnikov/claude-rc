@@ -1,10 +1,31 @@
 [project]
 name = "claude-rc"
 version = "0.2.0"
+description = "Telegram bot that starts Claude Code Remote Control sessions on your own machine"
+readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Nikita Vinnikov", email = "nvvinnikov@gmail.com" }]
+keywords = ["claude", "claude-code", "telegram", "tmux", "remote-control", "git-worktree"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
+]
 dependencies = [
     "aiogram>=3.15",
 ]
+
+[project.urls]
+Homepage = "https://github.com/nvinnikov/claude-rc"
+Source = "https://github.com/nvinnikov/claude-rc"
+Issues = "https://github.com/nvinnikov/claude-rc/issues"
+Changelog = "https://github.com/nvinnikov/claude-rc/releases"
 
 [project.scripts]
 claude-rc = "clauderc.cli:run"
@@ -45,7 +66,7 @@ module = "aiogram.*"
 ignore_missing_imports = true
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

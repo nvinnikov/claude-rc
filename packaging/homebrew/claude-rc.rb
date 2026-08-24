@@ -5,8 +5,7 @@ class ClaudeRc < Formula
   homepage "https://github.com/nvinnikov/claude-rc"
   url "https://github.com/nvinnikov/claude-rc/releases/download/v0.2.0/claude_rc-0.2.0.tar.gz"
   sha256 "757c9544cc600c657f504df16114ad717e2aedc6b63f88bb30e8704c26c4788e"
-  # Проект пока не объявил лицензию (нет ни LICENSE, ни `license` в
-  # pyproject.toml) — строку не добавляем сами, это решение автора, не наше.
+  license "MIT"
 
   # pydantic-core (транзитивная зависимость aiogram → pydantic) — Rust-расширение,
   # ставится только из sdist. Её build backend maturin сам собирается из
