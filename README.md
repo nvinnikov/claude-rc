@@ -60,6 +60,53 @@ From the phone it looks like this:
 3. `▶️ Start Claude RC` — or `🌿 New worktree`, if something is already running there;
 4. the link arrives → `Open in Claude` → you're working.
 
+## The four surfaces of a session
+
+A running Claude Code session can be reached in four different ways, and they are easy to
+confuse with one another. Two are built into Claude Code; two are what this project is for.
+
+| Surface | What reaches it | Built in? |
+|---|---|---|
+| **Conversation** — from a phone, a browser, a second computer | Remote Control: claude.ai/code, the Claude mobile app, Claude Desktop | yes |
+| **Terminal** — from any machine | `ssh` + `tmux attach`, into the pane the session lives in | yes, provided the session was started inside tmux |
+| **Creating** a session anywhere in your tree while away from the machine | — | **no — this is what claude-rc is for** |
+| **Managing** sessions: what's alive, stop one, add a worktree, sync repositories | — | **no — claude-rc as well** |
+
+The first two are Claude Code's own, and this project deliberately doesn't rebuild them.
+What we found while checking where the line runs:
+
+- **A terminal can't join a Remote Control session over the network.** No client mode exists
+  for it. `claude --resume <id>` in a second terminal starts a *new local process* over the
+  same transcript instead of joining the live one — the docs say Claude Code "prints a notice
+  in the second terminal and leaves Remote Control off there instead of taking the session
+  away from the first", and two terminals on one transcript merely "interleave into one
+  transcript". `--teleport` picks up a Claude Code *on the web* session, not a Remote Control
+  one. So the only way into a live session's terminal is to reach the terminal it runs in.
+  That is why sessions here live in tmux: `tmux attach` then works from any machine over ssh.
+
+- **Third-party session orchestrators are in the same category.** Remote Control exposes no
+  public client API, so they don't attach to a session either — they run the agent over SSH
+  themselves and stream its I/O into their own window. In effect that is `ssh` + `tmux` with
+  a different client. On macOS, `ssh -t host tmux -CC attach` gives you iTerm2 native tabs
+  for the price of one flag.
+
+- **Starting a session anywhere in a tree has no built-in answer.** `claude remote-control`
+  server mode comes closest — one process, sessions created on demand from the app, each in
+  its own worktree — but it is bound to the single directory it was started in. Reaching any
+  repository across `rc_roots` from a phone is what this project adds.
+
+- **An umbrella directory works, and beats `--add-dir`.** For a `/services/repo-1 … repo-n`
+  layout whose parent has no `.git` of its own, start the session in `/services`: everything
+  stays inside one working tree, so nested `CLAUDE.md` files and per-repository settings load
+  the usual way. Directories added with `--add-dir` never have their `.claude/` discovered.
+
+- **Nothing here opens an inbound port.** Remote Control makes outbound HTTPS requests only
+  and never listens on your machine; the Telegram bot polls outward; tmux is local. A web
+  terminal would break that property, which is why there isn't one.
+
+The full write-up, including the design of a `claude-rc connect` command for the second row,
+is in [docs/superpowers/specs/2026-09-04-connect-and-umbrella-design.md](docs/superpowers/specs/2026-09-04-connect-and-umbrella-design.md).
+
 ## How it works
 
 `claude --remote-control` is an **interactive** command. Without a tty it falls back to
