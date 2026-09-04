@@ -298,6 +298,16 @@ itself.
 
 Tool only, no app (e.g. a headless machine): `make install-tool`.
 
+### Updating
+
+`make update` is the whole update in one command: `git pull --rebase`, the `make check`
+gate, a reinstall, and the app started back up. It refuses on a dirty tree rather than
+stashing your work for you — to install code you haven't committed, use `make install`.
+
+Only the install itself takes the bot down. Running tmux sessions (`rc-*`) survive it:
+they live in the tmux server, and the bot reads their links back out of the `@rc_url`
+tmux option on startup.
+
 ## First run
 
 Right after installing there's no config yet — the bot fails at startup and `Reveal config`
