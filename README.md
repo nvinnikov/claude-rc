@@ -111,8 +111,9 @@ is in [docs/superpowers/specs/2026-09-04-connect-and-umbrella-design.md](docs/su
 
 `claude --remote-control` is an **interactive** command. Without a tty it falls back to
 `--print` mode and dies with `Input must be provided either through stdin or as a prompt
-argument`. A tmux pane provides that tty, so every session lives in its own tmux session
-named `rc-<name>` — and the bot is only a client that hands tmux commands.
+argument`. A tmux pane provides that tty, so every session lives in its own tmux session —
+created as `rc-<name>` and renamed to its `session_…` id as soon as Claude prints the link —
+and the bot is only a client that hands tmux commands.
 
 ```mermaid
 flowchart LR
@@ -126,8 +127,8 @@ flowchart LR
         BOT["claude-rc bot<br/>(aiogram)"]
         CLI["claude-rc CLI"]
         subgraph tmux ["tmux server"]
-            S1["rc-my-service<br/>claude --remote-control<br/>@rc_url"]
-            S2["rc-my-service-feat<br/>(git worktree)"]
+            S1["session_01ABCdef<br/>claude --remote-control<br/>@rc_url"]
+            S2["session_01XYZghi<br/>(git worktree)"]
         end
         REPOS[("git repos<br/>rc_roots")]
     end
@@ -146,9 +147,9 @@ flowchart LR
 Two consequences fall out of that design:
 
 - **sessions survive a bot restart** — the registry lives in tmux, not in the bot's memory;
-- **you can attach from any machine**: `ssh -t home tmux attach -d -t =rc-oms` opens the
-  very same live terminal you're driving from your phone. The session card carries the id
-  (`rc-oms`), so you never have to go looking for it.
+- **you can attach from any machine**: `ssh -t home tmux attach -d -t =session_01ABCdef`
+  opens the very same live terminal you're driving from your phone — addressed by the very
+  id you already see in the Claude app.
 
 The session link is stored in the tmux user option `@rc_url`: the TUI repaints the pane and
 wipes the link out of the visible buffer, and after a bot restart there would be nowhere
@@ -210,26 +211,31 @@ A persistent keyboard sits under the input field: `📁 PWD`, `💬 Chats`, `�
 If a session is already alive in a directory you get its link back rather than a second
 session — sessions are keyed by working directory, not by name.
 
-Every session card carries **two ways in**: the link, which opens the session in the Claude
-app, and the session id (`🖥 rc-oms`), which opens it in a terminal. Telegram copies anything
-in `<code>` on a tap. The card carries the id rather than a whole command because `ssh` and
-the host differ per machine while the id is the only part that changes — put the rest in an
-alias on each of your machines:
+Every session card carries **two ways in**, and they share one identifier: the link, which
+opens the session in the Claude app, and the same `session_…` id (`🖥`), which opens it in a
+terminal. As soon as Claude prints the link, the tmux session is renamed to the id from it —
+so the thing you already have in front of you in the app *is* the attach target. Nothing to
+look up, and no way to end up in the wrong session: ids are unique where directory names are
+not.
+
+Telegram copies anything in `<code>` on a tap. The card carries the id rather than a whole
+command because `ssh` and the host differ per machine while the id is the only part that
+changes — put the rest in an alias on each of your machines:
 
 ```bash
-rc() { ssh -t home tmux attach -d -t "=$1"; }   # rc rc-oms
+rc() { ssh -t home tmux attach -d -t "=$1"; }   # rc session_01ABCdef
 ```
 
 Both flags are there on purpose. `-d` detaches other *tmux* clients — a pane is created at
 120×40 with no client, and a second client with a narrow window would reflow the TUI for
 whoever is working right now. The Claude app is unaffected: it talks to the session over the
-API, not through tmux. `=rc-oms` is an exact match, so it can't land on `rc-oms-2`.
+API, not through tmux. `=` means an exact match, so a target can't land on a session whose
+name merely starts the same way.
 
-Ids stay readable when directory names collide. Two clones of one repository can't both be
-`rc-oms`, so the second one is named after the directory that tells them apart —
-`rc-forks-oms`, not `rc-oms-a1b2c3`. Enough parent directories are added to make the id
-unique, and a path hash is the last resort for paths that match in full (a symlink to a
-directory that already has a session).
+Because ids identify sessions and directory names no longer have to, cards, `/rckill` and
+`claude-rc stop` show and take the directory name as a label. Where a label matches more than
+one session — three clones of one repository — nothing is killed: you get the ids back and
+pick.
 
 ### Repository sync
 
@@ -516,9 +522,14 @@ and shaped the code:
 - **A new config key must be added to `_EXTRA_KEYS`.** The setup wizard rewrites
   `config.toml` from scratch and carries over only the keys on that list, so a key left off
   it is silently erased the next time someone runs `claude-rc setup`.
-- **A colliding session id names its parent directory, not a hash.** The id is something a
-  person reads on a card and types into `/rckill`; `oms-a1b2c3` and `oms-9f8e7d` can only be
-  told apart by the path printed next to them, while `forks-oms` tells you itself.
+- **A session is renamed to its Claude session id once the link appears.** The id can't be
+  the name from the start — the server issues it, and it doesn't exist until Claude prints
+  it — so the session is created under a name derived from the directory and renamed after
+  the fact. Two things follow. `list_sessions` recognises its own by the `rc-` prefix *or* a
+  set `@rc_url`: the prefix alone would lose renamed sessions, the option alone would lose
+  ones that died before printing a link. And the `Watcher` doesn't call a vanished name a
+  death while a session with the same working directory is alive — otherwise every launch
+  would report a crash.
 - **`CLAUDE_CODE_*` is scrubbed inside the pane.** The tmux server may have been started
   from within Claude Code; an inherited `CLAUDE_CODE_CHILD_SESSION` starts the session with
   "Transcript saving is off" — that is, with no history.

@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from clauderc import cli
+from clauderc import cli, remote
 from clauderc.remote import LaunchError, RemoteSession, TrustRequired
 
 
@@ -266,7 +266,7 @@ def test_stop_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
         killed.append(tmux_name)
         return True
 
-    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(remote, "list_sessions", fake_list)
     monkeypatch.setattr(cli, "kill_tmux", fake_kill)
     assert cli.main(["stop", "oms"]) == 0
     assert killed == ["rc-oms"]
@@ -282,7 +282,7 @@ def test_stop_by_path(monkeypatch: pytest.MonkeyPatch) -> None:
         killed.append(tmux_name)
         return True
 
-    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(remote, "list_sessions", fake_list)
     monkeypatch.setattr(cli, "kill_tmux", fake_kill)
     assert cli.main(["stop", "/repos/oms"]) == 0
     assert killed == ["rc-oms"]
@@ -299,7 +299,7 @@ def test_stop_kill_failure_is_not_reported_as_not_found(
     async def fake_kill(tmux_name: str) -> bool:
         return False
 
-    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(remote, "list_sessions", fake_list)
     monkeypatch.setattr(cli, "kill_tmux", fake_kill)
     assert cli.main(["stop", "oms"]) == 1
     err = capsys.readouterr().err
@@ -313,7 +313,7 @@ def test_stop_unknown_target_fails(
     async def fake_list() -> list[RemoteSession]:
         return []
 
-    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(remote, "list_sessions", fake_list)
     assert cli.main(["stop", "ghost"]) == 1
     assert capsys.readouterr().err.strip()
 
@@ -1863,3 +1863,57 @@ def test_sync_deduplicates_symlinked_repo(monkeypatch: pytest.MonkeyPatch, tmp_p
     monkeypatch.setattr(cli.sync, "sync", fake_sync)
     assert cli.main(["sync", str(real), str(link)]) == 0
     assert seen == [real.resolve()]
+
+
+def test_stop_refuses_to_guess_between_same_named_sessions(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Имя сессии — имя каталога, и у трёх клонов оно одно на всех. Погасить
+    # первую попавшуюся значит убить чужую работу; отвечаем списком id.
+    killed: list[str] = []
+
+    async def fake_list() -> list[RemoteSession]:
+        return [
+            RemoteSession(
+                name="oms", tmux_name="session_01A", cwd="/repos/oms", url="", created_at=0
+            ),
+            RemoteSession(
+                name="oms", tmux_name="session_01B", cwd="/forks/oms", url="", created_at=0
+            ),
+        ]
+
+    async def fake_kill(tmux_name: str) -> bool:
+        killed.append(tmux_name)
+        return True
+
+    monkeypatch.setattr(remote, "list_sessions", fake_list)
+    monkeypatch.setattr(cli, "kill_tmux", fake_kill)
+
+    assert cli.main(["stop", "oms"]) == 1
+    err = capsys.readouterr().err
+    assert "session_01A" in err and "session_01B" in err
+    assert killed == []
+
+
+def test_stop_by_session_id_is_unambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
+    killed: list[str] = []
+
+    async def fake_list() -> list[RemoteSession]:
+        return [
+            RemoteSession(
+                name="oms", tmux_name="session_01A", cwd="/repos/oms", url="", created_at=0
+            ),
+            RemoteSession(
+                name="oms", tmux_name="session_01B", cwd="/forks/oms", url="", created_at=0
+            ),
+        ]
+
+    async def fake_kill(tmux_name: str) -> bool:
+        killed.append(tmux_name)
+        return True
+
+    monkeypatch.setattr(remote, "list_sessions", fake_list)
+    monkeypatch.setattr(cli, "kill_tmux", fake_kill)
+
+    assert cli.main(["stop", "session_01B"]) == 0
+    assert killed == ["session_01B"]

@@ -38,6 +38,7 @@ from clauderc.remote import (
     kill_tmux,
     launch,
     list_sessions,
+    resolve,
 )
 from clauderc.worktrees import WorktreeError
 
@@ -179,6 +180,11 @@ class _Commands:
             return EXIT_ENVIRONMENT
         try:
             killed = asyncio.run(_stop(args.target))
+        except _StopAmbiguous as exc:
+            print("Таких сессий несколько — назови id:", file=sys.stderr)
+            for session in exc.sessions:
+                print(f"  {session.tmux_name}\t{session.cwd}", file=sys.stderr)
+            return EXIT_FAILED
         except _StopFailed as exc:
             print(f"Нашёл, но не погасил: {exc}", file=sys.stderr)
             return EXIT_FAILED
@@ -256,6 +262,14 @@ class _TrustDeclined(RuntimeError):
 
 class _StopFailed(RuntimeError):
     """Сессия нашлась, но tmux не смог её погасить — не путать с «не найдена»."""
+
+
+class _StopAmbiguous(RuntimeError):
+    """Под цель подошло несколько сессий: выбирать за человека нельзя."""
+
+    def __init__(self, sessions: list[RemoteSession]) -> None:
+        super().__init__("под цель подошло несколько сессий")
+        self.sessions = sessions
 
 
 _MARK = {
@@ -700,18 +714,27 @@ def _ask_roots(current: tuple[Path, ...] | None) -> tuple[Path, ...]:
 
 
 async def _stop(target: str) -> str | None:
-    """Гасит сессию по имени или каталогу.
+    """Гасит сессию по id, имени или каталогу.
 
     Существования каталога не требуем: worktree мог быть удалён, а сессия в нём
     остаться — именно её и нужно погасить.
+
+    Имя — это имя каталога, и оно не уникально: у трёх клонов одного репозитория
+    оно одно на всех. Выбрать за человека, какую из трёх гасить, нельзя, поэтому
+    на неоднозначность отвечаем отказом со списком id, а не гасим первую попавшуюся.
     """
-    wanted = os.path.realpath(Path(target).expanduser())
-    for session in await list_sessions():
-        if session.name == target or os.path.realpath(session.cwd) == wanted:
-            if not await kill_tmux(session.tmux_name):
-                raise _StopFailed(session.name)
-            return session.name
-    return None
+    matches = await resolve(target)
+    if not matches:
+        # `~/code/oms` как есть не совпадёт ни с чем: realpath тильду не разворачивает.
+        matches = await resolve(str(Path(target).expanduser()))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise _StopAmbiguous(matches)
+    session = matches[0]
+    if not await kill_tmux(session.tmux_name):
+        raise _StopFailed(session.name)
+    return session.name
 
 
 def _allowed_user_id_detail(value: int) -> str:

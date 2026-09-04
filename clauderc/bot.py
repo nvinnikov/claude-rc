@@ -39,6 +39,9 @@ from clauderc.remote import (
     list_sessions,
     tmux_available,
 )
+from clauderc.remote import (
+    resolve as resolve_sessions,
+)
 from clauderc.repos import discover, resolve
 from clauderc.state import State
 from clauderc.sync import Outcome, RepoStatus, SyncResult
@@ -916,12 +919,28 @@ async def main() -> None:
             await message.reply(f"Погашено сессий: {killed}." if killed else "Гасить нечего.")
             return
         name = parts[1]
-        if await watcher.kill_named(name):
+        matches = await resolve_sessions(name)
+        if not matches:
+            await message.reply(
+                f"Нет живой сессии <code>{html.escape(name)}</code>.", parse_mode="HTML"
+            )
+            return
+        if len(matches) > 1:
+            # Имя каталога в дереве не уникально; выбирать за человека, какую
+            # из трёх сессий погасить, нельзя — называем id, они различаются.
+            listing = "\n".join(
+                f"<code>{html.escape(s.tmux_name)}</code> · {html.escape(s.cwd)}" for s in matches
+            )
+            await message.reply(
+                f"Таких сессий несколько — назови id:\n{listing}", parse_mode="HTML"
+            )
+            return
+        if await watcher.kill(matches[0].tmux_name):
             # Worktree намеренно остаётся: в нём может лежать несохранённая работа.
             await message.reply(f"Сессия <b>{html.escape(name)}</b> погашена.", parse_mode="HTML")
         else:
             await message.reply(
-                f"Нет живой сессии <code>{html.escape(name)}</code>.", parse_mode="HTML"
+                f"Не удалось погасить <code>{html.escape(name)}</code>.", parse_mode="HTML"
             )
 
     @dp.message(Command("wt"))

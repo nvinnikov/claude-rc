@@ -196,20 +196,24 @@ async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch: pytest.Monk
         session = await remote.launch(repo, str(tmp_path), timeout_s=20)
 
         assert session.url == url
-        assert session.tmux_name == f"rc-{repo}"
+        # Сессия переименована в id из ссылки — один идентификатор и для
+        # приложения, и для `tmux attach`. Настоящий tmux принял его как имя.
+        assert session.tmux_name == url.rsplit("/", 1)[-1]
+        assert session.name == tmp_path.name
         # tmux отдаёт разрешённый путь: на macOS /var — симлинк на /private/var
         assert Path(session.cwd).resolve() == tmp_path.resolve()
-        assert repo in {s.name for s in await remote.list_sessions()}
+        assert session.tmux_name in {s.tmux_name for s in await remote.list_sessions()}
 
         # Главное доказательство изоляции: на сервере по умолчанию сессии нет —
         # именно её отсутствие/появление там видит watcher бота.
-        assert f"rc-{repo}" not in _default_server_sessions()
+        assert session.tmux_name not in _default_server_sessions()
         assert _default_server_sessions() == before
 
-        assert await remote.kill_session(repo) is True
-        assert repo not in {s.name for s in await remote.list_sessions()}
+        assert await remote.kill_tmux(session.tmux_name) is True
+        assert not await remote.list_sessions()
     finally:
         await remote._run("kill-session", "-t", f"=rc-{repo}", check=False)
+        await remote._run("kill-session", "-t", f"={url.rsplit('/', 1)[-1]}", check=False)
         # Гасим и сам изолированный сервер, иначе процесс tmux -L останется висеть.
         await remote._run("kill-server", check=False)
 
@@ -425,3 +429,77 @@ def _sessions(*names: str) -> Callable[[], Coroutine[None, None, list[RemoteSess
         ]
 
     return listing
+
+
+async def test_await_url_renames_the_session_to_the_claude_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ссылка появилась — имя сессии становится id из неё."""
+    url = "https://claude.ai/code/session_01ABCdef"
+    renamed: list[tuple[str, ...]] = []
+
+    def handler(*args: str) -> tuple[int, str]:
+        if args[0] == "capture-pane":
+            return 0, f"remote control active at\n{url}"
+        if args[0] == "rename-session":
+            renamed.append(args)
+            return 0, ""
+        if args[0] == "list-sessions":
+            return 0, "session_01ABCdef\t/repos/oms\t1000\t" + url
+        return 0, ""
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    monkeypatch.setattr(remote, "_POLL_S", 0.0)
+
+    session = await remote.await_url("rc-oms", "/repos/oms", timeout_s=1.0)
+
+    assert renamed == [("rename-session", "-t", "=rc-oms", "session_01ABCdef")]
+    assert session.tmux_name == "session_01ABCdef"
+    assert session.name == "oms"  # в карточке — каталог, id человеку ничего не говорит
+
+
+async def test_await_url_survives_a_failed_rename(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Переименование не удалось — сессия жива под прежним именем, ссылка на месте."""
+    url = "https://claude.ai/code/session_01ABCdef"
+
+    def handler(*args: str) -> tuple[int, str]:
+        if args[0] == "capture-pane":
+            return 0, url
+        if args[0] == "rename-session":
+            return 1, "duplicate session"
+        if args[0] == "list-sessions":
+            return 0, f"rc-oms\t/repos/oms\t1000\t{url}"
+        return 0, ""
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    monkeypatch.setattr(remote, "_POLL_S", 0.0)
+
+    session = await remote.await_url("rc-oms", "/repos/oms", timeout_s=1.0)
+    assert session.tmux_name == "rc-oms"
+    assert session.url == url
+
+
+async def test_list_sessions_keeps_renamed_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """После переименования префикса нет — узнаём своих по `@rc_url`."""
+    rows = (
+        "session_01ABCdef\t/repos/oms\t1000\thttps://claude.ai/code/session_01ABCdef\n"
+        "rc-fresh\t/repos/fresh\t1001\t\n"  # ещё не дождалась ссылки
+        "work\t/repos/work\t1002\t\n"  # чужая
+    )
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, rows)))
+
+    assert [s.tmux_name for s in await remote.list_sessions()] == ["rc-fresh", "session_01ABCdef"]
+
+
+async def test_resolve_matches_id_name_and_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = (
+        "session_01A\t/repos/oms\t1000\thttps://claude.ai/code/session_01A\n"
+        "session_01B\t/forks/oms\t1001\thttps://claude.ai/code/session_01B\n"
+    )
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, rows)))
+
+    assert [s.tmux_name for s in await remote.resolve("session_01B")] == ["session_01B"]
+    assert [s.tmux_name for s in await remote.resolve("/forks/oms")] == ["session_01B"]
+    # Имя каталога не уникально — обе, выбирать за человека нечего.
+    assert [s.tmux_name for s in await remote.resolve("oms")] == ["session_01A", "session_01B"]
+    assert await remote.resolve("nope") == []

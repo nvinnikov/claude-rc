@@ -15,7 +15,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from clauderc.remote import RemoteSession, kill_tmux, list_sessions, session_name
+from clauderc.remote import RemoteSession, kill_tmux, list_sessions, same_path
 
 log = logging.getLogger("clauderc.watch")
 
@@ -54,9 +54,6 @@ class Watcher:
             self._expected.discard(tmux_name)
         return killed
 
-    async def kill_named(self, repo: str) -> bool:
-        return await self.kill(session_name(repo))
-
     async def kill_all(self) -> int:
         killed = 0
         for session in await list_sessions():
@@ -77,6 +74,12 @@ class Watcher:
 
         for tmux_name, session in previous.items():
             if tmux_name in current or tmux_name in expected_gone:
+                continue
+            # Имя пропало, но сессия в том же каталоге жива — значит её
+            # переименовали, а не потеряли: `await_url` даёт ей id сессии
+            # Claude, как только тот появится. Каталог здесь надёжнее имени
+            # ровно потому же, почему он ключ у `find`.
+            if any(same_path(alive.cwd, session.cwd) for alive in current.values()):
                 continue
             await on_died(Died(name=session.name, tmux_name=tmux_name, cwd=session.cwd))
 

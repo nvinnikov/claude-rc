@@ -155,11 +155,15 @@ async def list_sessions() -> list[RemoteSession]:
         if len(parts) != 4:
             continue
         tmux_name, path, created, url = parts
-        if not tmux_name.startswith(PREFIX):
+        # Наши сессии — либо ещё не переименованные (префикс), либо уже
+        # названные id сессии Claude (тогда имя ни о чём не говорит, но
+        # `@rc_url` выставлен). Одного признака мало: по префиксу не видно
+        # переименованных, а по опции — тех, кто умер, не дождавшись ссылки.
+        if not tmux_name.startswith(PREFIX) and not url:
             continue  # чужие tmux-сессии не трогаем
         sessions.append(
             RemoteSession(
-                name=tmux_name[len(PREFIX) :],
+                name=_display_name(path, tmux_name),
                 tmux_name=tmux_name,
                 cwd=path,
                 url=url,
@@ -169,20 +173,35 @@ async def list_sessions() -> list[RemoteSession]:
     return sorted(sessions, key=lambda s: s.name)
 
 
-def _same_path(a: str, b: str) -> bool:
+def _display_name(cwd: str, tmux_name: str) -> str:
+    """Как сессию зовут в карточке. Имя tmux после переименования — id сессии
+    Claude, и человеку он не говорит ничего; каталог говорит.
+    """
+    return os.path.basename(cwd.rstrip(os.sep)) or tmux_name.removeprefix(PREFIX)
+
+
+def same_path(a: str, b: str) -> bool:
     try:
         return os.path.realpath(a) == os.path.realpath(b)
     except OSError:
         return a == b
 
 
-async def get_session(repo: str) -> RemoteSession | None:
-    """Сессия по видимому имени — то, что показывает `/rc` и принимает `/rckill`."""
-    name = session_name(repo)
-    for session in await list_sessions():
-        if session.tmux_name == name:
-            return session
-    return None
+async def resolve(target: str) -> list[RemoteSession]:
+    """Сессии, к которым относится строка от человека: id, имя или каталог.
+
+    Список, а не одна: имя каталога в дереве не уникально (два клона одного
+    репо), и «погасить oms», когда их три, — не то, что можно решить за
+    человека. Уникален только id, поэтому им и различают.
+    """
+    wanted = target.strip()
+    if not wanted:
+        return []
+    sessions = await list_sessions()
+    exact = [s for s in sessions if s.tmux_name == wanted]
+    if exact:
+        return exact
+    return [s for s in sessions if s.name == wanted or same_path(s.cwd, wanted)]
 
 
 async def find(cwd: str) -> RemoteSession | None:
@@ -193,7 +212,7 @@ async def find(cwd: str) -> RemoteSession | None:
     в чужом каталоге.
     """
     for session in await list_sessions():
-        if _same_path(session.cwd, cwd):
+        if same_path(session.cwd, cwd):
             return session
     return None
 
@@ -228,10 +247,6 @@ async def _unique_name(repo: str, cwd: str) -> str:
 async def kill_tmux(tmux_name: str) -> bool:
     code, _ = await _run("kill-session", "-t", f"={tmux_name}", check=False)
     return code == 0
-
-
-async def kill_session(repo: str) -> bool:
-    return await kill_tmux(session_name(repo))
 
 
 async def confirm_trust(tmux_name: str) -> None:
@@ -305,6 +320,7 @@ async def await_url(
 
         url = match.group(0)
         await _run("set-option", "-t", f"={name}:", _URL_OPTION, url, check=False)
+        name = await _rename_to_session_id(name, url)
         session = await find(cwd)
         if session is None:  # успела умереть между capture и list
             raise LaunchError(_failure("сессия исчезла сразу после запуска", pane), tmux_name=name)
@@ -313,6 +329,31 @@ async def await_url(
 
     await _run("kill-session", "-t", f"={name}", check=False)
     raise LaunchError(_failure(f"ссылка не появилась за {int(timeout_s)}с", pane), tmux_name=name)
+
+
+async def _rename_to_session_id(name: str, url: str) -> str:
+    """Переименовывает tmux-сессию в id сессии Claude из ссылки.
+
+    Смысл — один идентификатор на обе поверхности: тот же `session_...`, что
+    человек видит в приложении, годится как цель `tmux attach -t =<id>`. Раньше
+    цель приходилось выяснять отдельно, и при совпадении имён каталогов она ещё
+    и обрастала различающим хвостом.
+
+    Раньше ссылки имени взяться неоткуда: id выдаёт сервер, а не мы, и до
+    первой печати в панели его не существует. Отсюда переименование по факту,
+    а не имя сразу.
+
+    Неудача не фатальна: сессия жива и работает под прежним именем, `@rc_url`
+    уже выставлен, и `find(cwd)` найдёт её в любом случае.
+    """
+    session_id = url.rsplit("/", 1)[-1]
+    if session_id == name:
+        return name
+    code, out = await _run("rename-session", "-t", f"={name}", session_id, check=False)
+    if code != 0:
+        log.warning("rename %s -> %s failed: %s", name, session_id, out.strip())
+        return name
+    return session_id
 
 
 def _failure(reason: str, pane: str) -> str:
