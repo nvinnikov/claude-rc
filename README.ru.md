@@ -296,6 +296,9 @@ claude-rc setup
 
 Приложение в меню-баре. `make app` собирает `ClaudeRC.app` в `app/build/` —
 Xcode не нужен, бандл складывается скриптом `app/make-app.sh` из бинаря SPM.
+Каталог сборки закрыт от Spotlight маркером `.metadata_never_index`: bundle id у
+сборочной копии тот же, что у установленной, и без него поиск и Launchpad показывают
+два ClaudeRC.
 Перенеси `ClaudeRC.app` в `/Applications` и запусти: бот живёт внутри
 приложения как дочерний процесс, иконка в меню-баре показывает его состояние,
 `Stop bot`/`Start bot` включают и гасят его вручную. Галочка `Launch at login`
