@@ -319,8 +319,12 @@ async def await_url(
             continue
 
         url = match.group(0)
-        await _run("set-option", "-t", f"={name}:", _URL_OPTION, url, check=False)
-        name = await _rename_to_session_id(name, url)
+        stored, _ = await _run("set-option", "-t", f"={name}:", _URL_OPTION, url, check=False)
+        if stored == 0:
+            # Переименование только после сохранённой ссылки: своих `list_sessions`
+            # узнаёт по префиксу `rc-` или по `@rc_url`, и сессия без обоих признаков
+            # стала бы невидимой — живой процесс, до которого не дотянуться.
+            name = await _rename_to_session_id(name, url)
         session = await find(cwd)
         if session is None:  # успела умереть между capture и list
             raise LaunchError(_failure("сессия исчезла сразу после запуска", pane), tmux_name=name)

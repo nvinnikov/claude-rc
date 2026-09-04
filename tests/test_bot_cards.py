@@ -28,6 +28,11 @@ from clauderc.watch import Died
 # грепе при следующей правке bot.py.
 _DIRECT_KILL = re.compile(r"(?<!watcher\.)\b(?:kill_tmux|kill_all|kill_session)\(")
 
+# Имя сессии меняется у неё под ногами: `await_url` переименовывает её в id
+# Claude, как только появится ссылка. Всё, что переживает показ карточки,
+# обязано держать каталог — он ключ и он не меняется.
+_STORED_NAME = re.compile(r"stop_pending\[[^\]]+\]\s*=.*tmux_name")
+
 
 def test_resume_keyboard_lists_new_continue_and_conversations() -> None:
     markup = _resume_keyboard(
@@ -280,3 +285,15 @@ def test_cards_keep_the_id_when_the_url_is_unknown() -> None:
     text = _list_item(_session(url=""))
     assert "ссылка неизвестна" in text
     assert "rc-oms" in text
+
+
+def test_stop_button_does_not_remember_a_session_name() -> None:
+    """Кнопка Stop держит каталог, а не имя.
+
+    Карточку могли показать до того, как сессия получила ссылку и была
+    переименована в свой id. Запомненное имя к моменту нажатия уже не
+    существует: `kill-session` промахивается, бот отвечает «уже не жива»,
+    а живая сессия остаётся работать.
+    """
+    source = Path(bot_module.__file__).read_text(encoding="utf-8")
+    assert not _STORED_NAME.findall(source), "кнопка Stop запомнила имя сессии вместо каталога"

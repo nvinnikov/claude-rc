@@ -236,3 +236,21 @@ async def test_death_after_rename_is_still_reported(monkeypatch: pytest.MonkeyPa
     _sessions(monkeypatch, [_session("oms", "/repos/oms")], [renamed], [])
     (died,) = await _collect(Watcher(), 3)
     assert died == Died(name="oms", tmux_name="session_01ABC", cwd="/repos/oms")
+
+
+async def test_relaunch_in_the_same_directory_still_reports_the_death(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Упала и тут же поднялась заново — это смерть, а не переименование.
+
+    Одного совпадения каталога мало: перезапуск внутри одного опроса проглотил
+    бы настоящее падение. `session_created` переименование сохраняет, а
+    перезапуск — нет, поэтому сверяем и его.
+    """
+    old = RemoteSession(
+        name="oms", tmux_name="session_01A", cwd="/repos/oms", url="https://x", created_at=1000
+    )
+    fresh = RemoteSession(name="oms", tmux_name="rc-oms", cwd="/repos/oms", url="", created_at=2000)
+    _sessions(monkeypatch, [old], [fresh])
+    (died,) = await _collect(Watcher(), 2)
+    assert died.tmux_name == "session_01A"

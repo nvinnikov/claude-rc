@@ -20,4 +20,3 @@ state_path = "~/.claude-rc/state.json"
 
 # Сколько секунд ждать, пока claude напечатает ссылку на сессию.
 launch_timeout_s = 90
-

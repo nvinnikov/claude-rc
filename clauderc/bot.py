@@ -26,9 +26,6 @@ from clauderc import sync as sync_mod
 from clauderc.browse import BrowseError
 from clauderc.config import Config, load_config
 from clauderc.remote import (
-    PREFIX as REMOTE_PREFIX,
-)
-from clauderc.remote import (
     LaunchError,
     RemoteSession,
     TrustRequired,
@@ -605,9 +602,11 @@ async def main() -> None:
             real = os.path.realpath(session.cwd)
             occupied.add(real)
             token = uuid.uuid4().hex[:8]
-            # Имя в callback_data не кладём: там 64 байта, а путь worktree с кириллицей
-            # за лимит выходит легко.
-            stop_pending[token] = session.tmux_name
+            # Путь в callback_data не кладём: там 64 байта, а путь worktree с кириллицей
+            # за лимит выходит легко. Но держим именно путь, а не имя: имя сессии
+            # меняется у неё под ногами — `await_url` переименовывает её в id, как
+            # только появится ссылка, и запомненное имя перестало бы существовать.
+            stop_pending[token] = real
             rows = []
             if session.url:
                 rows.append([InlineKeyboardButton(text="Open in Claude", url=session.url)])
@@ -1076,19 +1075,21 @@ async def main() -> None:
     async def on_stop(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        tmux_name = stop_pending.pop((query.data or "").removeprefix("stop:"), None)
+        cwd = stop_pending.pop((query.data or "").removeprefix("stop:"), None)
         message = _live_message(query)
-        if tmux_name is None:
+        if cwd is None:
             await query.answer("Список устарел")
             if message is not None:
                 await message.edit_reply_markup(reply_markup=None)
             return
 
-        killed = await watcher.kill(tmux_name)
+        # Имя берём заново: с момента показа карточки сессию могли переименовать.
+        session = await find(cwd)
+        killed = session is not None and await watcher.kill(session.tmux_name)
         await query.answer("Погашена" if killed else "Уже не жива")
         if message is None:
             return
-        name = tmux_name.removeprefix(REMOTE_PREFIX)
+        name = session.name if session is not None else os.path.basename(cwd)
         # Worktree намеренно остаётся: там может лежать несохранённая работа.
         await message.edit_text(
             f"⏹ Сессия <b>{html.escape(name)}</b> погашена."

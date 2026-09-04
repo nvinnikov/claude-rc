@@ -503,3 +503,35 @@ async def test_resolve_matches_id_name_and_directory(monkeypatch: pytest.MonkeyP
     # Имя каталога не уникально — обе, выбирать за человека нечего.
     assert [s.tmux_name for s in await remote.resolve("oms")] == ["session_01A", "session_01B"]
     assert await remote.resolve("nope") == []
+
+
+async def test_await_url_keeps_the_name_when_the_url_was_not_stored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`@rc_url` не записался — переименовывать нельзя.
+
+    Своих `list_sessions` узнаёт по префиксу `rc-` или по `@rc_url`. Сессия без
+    обоих признаков исчезает из выдачи насовсем: живой процесс, до которого не
+    дотянуться ни `/rckill`, ни watcher'у.
+    """
+    url = "https://claude.ai/code/session_01ABCdef"
+    renamed: list[tuple[str, ...]] = []
+
+    def handler(*args: str) -> tuple[int, str]:
+        if args[0] == "capture-pane":
+            return 0, url
+        if args[0] == "set-option":
+            return 1, "no such session"
+        if args[0] == "rename-session":
+            renamed.append(args)
+            return 0, ""
+        if args[0] == "list-sessions":
+            return 0, f"rc-oms\t/repos/oms\t1000\t{url}"
+        return 0, ""
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    monkeypatch.setattr(remote, "_POLL_S", 0.0)
+
+    session = await remote.await_url("rc-oms", "/repos/oms", timeout_s=1.0)
+    assert renamed == []
+    assert session.tmux_name == "rc-oms"
