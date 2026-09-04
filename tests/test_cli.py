@@ -198,7 +198,7 @@ def test_start_trust_without_tty_fails_without_confirming(
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=False))
 
     assert cli.main(["start", str(tmp_path)]) == 2
-    assert "tmux attach -t rc-oms" in capsys.readouterr().err
+    assert "tmux attach -d -t =rc-oms" in capsys.readouterr().err
     assert confirmed == []
 
 

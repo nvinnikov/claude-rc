@@ -146,8 +146,9 @@ flowchart LR
 Two consequences fall out of that design:
 
 - **sessions survive a bot restart** — the registry lives in tmux, not in the bot's memory;
-- **you can attach from the machine itself**: `tmux attach -t rc-oms` opens the very same
-  live terminal you're driving from your phone.
+- **you can attach from any machine**: `ssh -t home tmux attach -d -t =rc-oms` opens the
+  very same live terminal you're driving from your phone. The session card hands you that
+  command ready to copy, so you never have to look up the tmux session name.
 
 The session link is stored in the tmux user option `@rc_url`: the TUI repaints the pane and
 wipes the link out of the visible buffer, and after a bot restart there would be nowhere
@@ -173,8 +174,8 @@ else to read it from.
 
 All the logic lives in the modules; `bot.py` only assembles messages out of it.
 
-Not a single character typed. Sessions live in tmux, so they survive a bot restart, and once
-you're home you can attach to them straight from a terminal: `tmux attach -t rc-<name>`.
+Not a single character typed. Sessions live in tmux, so they survive a bot restart, and you
+can attach to one from a terminal on any machine — the card carries the whole command.
 
 ## Using it from Telegram
 
@@ -208,6 +209,17 @@ A persistent keyboard sits under the input field: `📁 PWD`, `💬 Chats`, `�
 
 If a session is already alive in a directory you get its link back rather than a second
 session — sessions are keyed by working directory, not by name.
+
+Every session card carries **two ways in**: the link, which opens the session in the Claude
+app, and a copy-ready attach command, which opens it in a terminal. Telegram copies anything
+in `<code>` on a tap, so continuing on a laptop is: tap the command on your phone, paste it
+there. Set `ssh_host` in the config and the command comes with `ssh` in front of it; without
+it the command is local and only good on the machine itself.
+
+The command carries two flags on purpose. `-d` detaches other *tmux* clients — a pane is
+created at 120×40 with no client, and a second client with a narrow window would reflow the
+TUI for whoever is working right now. The Claude app is unaffected: it talks to the session
+over the API, not through tmux. `=rc-oms` is an exact match, so it can't land on `rc-oms-2`.
 
 ### Repository sync
 
@@ -370,8 +382,8 @@ It writes `~/.config/claude-rc/config.toml` with mode `600` (and the directory `
 that file holds a live token; a repeat run narrows the permissions even if the file used to
 be wider. A repeat `claude-rc setup` pre-fills the previous values as hints and changes only
 what you answer — an empty answer keeps the old value. Four technical fields the wizard
-never asks about (`worktree_root`, `state_path`, `scan_depth`, `launch_timeout_s`) are
-carried over verbatim on rewrite; anything else outside that list (including human
+never asks about (`worktree_root`, `state_path`, `scan_depth`, `launch_timeout_s`,
+`ssh_host`) are carried over verbatim on rewrite; anything else outside that list (including human
 comments) is not preserved.
 
 Then open the ClaudeRC app or run `claude-rc bot`.
@@ -389,13 +401,17 @@ Then open the ClaudeRC app or run `claude-rc bot`.
    - `bot_token` — from @BotFather
    - `allowed_user_id` — your Telegram user_id (ask @userinfobot)
    - `rc_roots` — where to look for repositories
+   - `ssh_host` — optional: the host the sessions run on, as in `ssh <host>` (an
+     `~/.ssh/config` alias or a Tailscale name works). With it, session cards show the
+     whole attach command including `ssh`.
 3. `chmod 600 config.toml`
 
 The config is looked up in order: the path in `$CLAUDE_RC_CONFIG` if set; otherwise
 `~/.config/claude-rc/config.toml`; otherwise `config.toml` in the current directory. The
 first file that exists wins.
 
-**Field types are strict.** `bot_token`, `worktree_root`, `state_path` are strings;
+**Field types are strict.** `bot_token`, `worktree_root`, `state_path`, `ssh_host` are
+strings (`ssh_host` may be absent; blank counts as absent);
 `allowed_user_id`, `scan_depth` are integers; `launch_timeout_s` is a number; `rc_roots` is
 a string or a list of strings. A wrongly typed value used to slip silently through
 `int()`/`float()` (a quoted number like `allowed_user_id = "123"` — a common way to write
@@ -438,7 +454,8 @@ uv tool install .
 The trust dialog for an unfamiliar directory is asked straight on stdin: there's a human at
 the terminal, and their answer *is* the decision about access to that directory — no
 auto-confirm here either. With no tty (in a script, say) `start` doesn't hang waiting for
-input: it exits with code 2 and a hint to `tmux attach -t rc-<name>` and answer in the pane.
+input: it exits with code 2 and a hint to `tmux attach -d -t =rc-<name>` and answer in the
+pane.
 
 ### Repository sync
 
@@ -486,6 +503,13 @@ and shaped the code:
   restart there's nowhere to read it from — hence the tmux user option `@rc_url`.
 - **The pane size is set explicitly** (`-x 120 -y 40`). A pane with no attached client is
   tiny, and the TUI wraps lines so that the link breaks in half.
+- **The attach command detaches other clients (`-d`).** Sizing follows from the point above:
+  a second tmux client with a narrow window shrinks the pane for everyone, reflowing the TUI
+  under the hands of whoever is working right now. This never touches the Claude app — that
+  one talks to the session over the API, not through tmux.
+- **A new config key must be added to `_EXTRA_KEYS`.** The setup wizard rewrites
+  `config.toml` from scratch and carries over only the keys on that list, so a key left off
+  it is silently erased the next time someone runs `claude-rc setup`.
 - **`CLAUDE_CODE_*` is scrubbed inside the pane.** The tmux server may have been started
   from within Claude Code; an inherited `CLAUDE_CODE_CHILD_SESSION` starts the session with
   "Transcript saving is off" — that is, with no history.

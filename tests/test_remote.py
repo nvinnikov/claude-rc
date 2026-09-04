@@ -36,14 +36,35 @@ def test_attach_command_uses_default_server_when_no_socket_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
-    assert attach_command("rc-oms") == "tmux attach -t rc-oms"
+    assert attach_command("rc-oms") == "tmux attach -d -t =rc-oms"
 
 
 def test_attach_command_targets_isolated_socket(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Без -L подсказка привела бы на сервер по умолчанию, где сессии из
+    # Без -L подсадка пришла бы на сервер по умолчанию, где сессии из
     # изолированной песочницы (CLAUDE_RC_TMUX_SOCKET) попросту нет.
     monkeypatch.setenv(remote.TMUX_SOCKET_ENV, "claude-rc-pytest")
-    assert attach_command("rc-oms") == "tmux -L claude-rc-pytest attach -t rc-oms"
+    assert attach_command("rc-oms") == "tmux -L claude-rc-pytest attach -d -t =rc-oms"
+
+
+def test_attach_command_prefixes_ssh_when_host_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Смысл команды в карточке — скопировать её на другой машине, а там без
+    # ssh она никуда не ведёт.
+    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
+    assert attach_command("rc-oms", host="home") == "ssh -t home tmux attach -d -t =rc-oms"
+
+
+def test_attach_command_quotes_a_host_with_spaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Хост приходит из конфига, то есть снаружи: в строку он попадает
+    # проквотированным, а не как есть.
+    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
+    assert attach_command("rc-oms", host="a b") == "ssh -t 'a b' tmux attach -d -t =rc-oms"
+
+
+def test_attach_argv_detaches_others_and_matches_exactly(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `-d`: второй клиент с узким окном ужал бы панель тому, кто работает
+    # прямо сейчас. `=`: без него `rc-oms` рискует поймать `rc-oms-2`.
+    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
+    assert remote.attach_argv("rc-oms") == ["tmux", "attach", "-d", "-t", "=rc-oms"]
 
 
 async def test_list_sessions_parses_rows_and_ignores_foreign(

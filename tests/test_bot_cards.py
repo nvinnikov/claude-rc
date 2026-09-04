@@ -1,12 +1,18 @@
 import re
+import time
 from pathlib import Path
 
+import pytest
 from clauderc import bot as bot_module
+from clauderc import remote
 from clauderc.bot import (
     ResumeChoice,
+    _attach_line,
     _chunk_report,
     _died_text,
+    _fresh_text,
     _has_repos,
+    _list_item,
     _pop_resume_group,
     _resume_keyboard,
     _selected_targets,
@@ -14,6 +20,7 @@ from clauderc.bot import (
     _sync_report_line,
     _sync_unavailable_line,
 )
+from clauderc.remote import RemoteSession
 from clauderc.sync import Outcome, RepoStatus, SyncResult
 from clauderc.watch import Died
 
@@ -239,3 +246,49 @@ def test_sync_unavailable_line_names_repo_and_reason() -> None:
 def test_sync_unavailable_line_escapes_html() -> None:
     line = _sync_unavailable_line("a&b")
     assert "&amp;" in line
+
+
+def _session(url: str = "https://claude.ai/code/session_01ABC") -> RemoteSession:
+    return RemoteSession(
+        name="oms",
+        tmux_name="rc-oms",
+        cwd="/Users/n/code/oms",
+        url=url,
+        created_at=int(time.time()) - 60,
+    )
+
+
+def test_attach_line_carries_the_whole_command_with_ssh(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Команду забирают с телефона, чтобы вставить в терминал другой машины:
+    # без ssh она там никуда не ведёт.
+    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
+    assert _attach_line(_session(), "home") == (
+        "⌨️ <code>ssh -t home tmux attach -d -t =rc-oms</code>"
+    )
+
+
+def test_attach_line_without_host_stays_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
+    assert _attach_line(_session(), None) == "⌨️ <code>tmux attach -d -t =rc-oms</code>"
+
+
+def test_attach_line_escapes_html(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
+    assert "&lt;evil&gt;" in _attach_line(_session(), "<evil>")
+
+
+def test_cards_show_both_ways_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Ссылка ведёт в приложение, команда — в терминал; карточка обязана давать
+    # обе, иначе с телефона второй способ попросту неоткуда взять.
+    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
+    session = _session()
+    for text in (_fresh_text(session, "home"), _list_item(session, host="home")):
+        assert session.url in text
+        assert "ssh -t home tmux attach -d -t =rc-oms" in text
+
+
+def test_cards_keep_the_command_when_the_url_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
+    text = _list_item(_session(url=""), host="home")
+    assert "ссылка неизвестна" in text
+    assert "ssh -t home tmux attach -d -t =rc-oms" in text

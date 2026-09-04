@@ -79,17 +79,34 @@ class TrustRequired(RuntimeError):
         self.cwd = cwd
 
 
-def attach_command(tmux_name: str) -> str:
-    """Команда для подсадки к сессии с самой машины.
+def attach_argv(tmux_name: str, *, host: str | None = None) -> list[str]:
+    """Аргументы подсадки к сессии.
+
+    `host` — машина, на которой живёт tmux: с ним команда годится для другого
+    компьютера, без него — только для самой машины. Имя сессии чистится
+    `session_name` до `[A-Za-z0-9_-]`, поэтому через удалённый shell оно
+    проходит без сюрпризов; хост из конфига квотится при сборке строки.
 
     CLAUDE_RC_TMUX_SOCKET переключает весь модуль на отдельный сервер (см.
-    модульный докстринг); без `-L` подсказка привела бы на сервер по
-    умолчанию, где этой сессии нет — особенно заметно в песочнице, где
-    рабочий сервер вообще пуст.
+    модульный докстринг); без `-L` подсадка пришла бы на сервер по умолчанию,
+    где этой сессии нет — особенно заметно в песочнице, где рабочий сервер пуст.
     """
     socket = os.environ.get(TMUX_SOCKET_ENV)
-    socket_flag = f"-L {shlex.quote(socket)} " if socket else ""
-    return f"tmux {socket_flag}attach -t {tmux_name}"
+    argv = ["tmux"]
+    if socket:
+        argv += ["-L", socket]
+    # `-d` отцепляет прочих tmux-клиентов. Панель создаётся _COLS x _ROWS без
+    # клиента, и второй клиент с узким окном ужал бы её всем сразу — TUI
+    # переверстался бы под руками у того, кто работает прямо сейчас. Приложения
+    # Claude это не касается: оно говорит с сессией через API, а не через tmux.
+    # `=` — точное совпадение: без него `rc-oms` рискует поймать `rc-oms-2`.
+    argv += ["attach", "-d", "-t", f"={tmux_name}"]
+    return ["ssh", "-t", host, *argv] if host else argv
+
+
+def attach_command(tmux_name: str, *, host: str | None = None) -> str:
+    """Готовая к копированию команда подсадки — одной строкой."""
+    return shlex.join(attach_argv(tmux_name, host=host))
 
 
 @dataclass(frozen=True)
@@ -102,10 +119,6 @@ class RemoteSession:
 
     def uptime_s(self) -> float:
         return max(0.0, time.time() - self.created_at)
-
-    @property
-    def attach_hint(self) -> str:
-        return attach_command(self.tmux_name)
 
 
 def session_name(repo: str) -> str:

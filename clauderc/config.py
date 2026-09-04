@@ -13,6 +13,7 @@ class Config:
     state_path: Path
     scan_depth: int
     launch_timeout_s: float
+    ssh_host: str | None
 
 
 def load_config(path: Path) -> Config:
@@ -38,6 +39,7 @@ def load_config(path: Path) -> Config:
     state_path = _require_path(raw, "state_path", "~/.claude-rc/state.json")
     scan_depth = _require_int(raw, "scan_depth", default=3)
     launch_timeout_s = _require_number(raw, "launch_timeout_s", default=90)
+    ssh_host = _optional_str(raw, "ssh_host")
 
     missing = [str(p) for p in roots if not p.is_dir()]
     if missing:
@@ -52,6 +54,7 @@ def load_config(path: Path) -> Config:
         state_path=state_path,
         scan_depth=scan_depth,
         launch_timeout_s=launch_timeout_s,
+        ssh_host=ssh_host,
     )
 
 
@@ -60,6 +63,19 @@ def _require_str(raw: dict[str, Any], key: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{key}: ожидалась строка")
     return value
+
+
+def _optional_str(raw: dict[str, Any], key: str) -> str | None:
+    """Строка или None, если ключа нет. Пустая строка — тоже None: в команде
+    подсадки пустой хост дал бы `ssh -t  tmux ...`, то есть молча сломанную
+    строку вместо отсутствующей.
+    """
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{key}: ожидалась строка")
+    return value.strip() or None
 
 
 def _require_int(raw: dict[str, Any], key: str, *, default: int | None = None) -> int:
