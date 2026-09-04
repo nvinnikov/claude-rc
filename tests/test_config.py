@@ -21,8 +21,7 @@ def test_load_config_reads_all_fields(tmp_path: Path) -> None:
         f'worktree_root = "{tmp_path / "wt"}"\n'
         f'state_path = "{tmp_path / "state.json"}"\n'
         "scan_depth = 2\n"
-        "launch_timeout_s = 30\n"
-        'ssh_host = "home"\n',
+        "launch_timeout_s = 30\n",
     )
 
     assert load_config(cfg) == Config(
@@ -33,7 +32,6 @@ def test_load_config_reads_all_fields(tmp_path: Path) -> None:
         state_path=tmp_path / "state.json",
         scan_depth=2,
         launch_timeout_s=30.0,
-        ssh_host="home",
     )
 
 
@@ -174,28 +172,4 @@ def test_wrong_typed_state_path_raises_value_error(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="state_path"):
-        load_config(cfg)
-
-
-def test_ssh_host_absent_is_none(tmp_path: Path) -> None:
-    cfg = _write(tmp_path, f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n')
-    assert load_config(cfg).ssh_host is None
-
-
-def test_ssh_host_blank_is_none(tmp_path: Path) -> None:
-    # Пустая строка в команде подсадки дала бы `ssh -t  tmux ...` — молча
-    # сломанную строку вместо отсутствующей.
-    cfg = _write(
-        tmp_path,
-        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\nssh_host = "  "\n',
-    )
-    assert load_config(cfg).ssh_host is None
-
-
-def test_ssh_host_rejects_non_string(tmp_path: Path) -> None:
-    cfg = _write(
-        tmp_path,
-        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\nssh_host = 42\n',
-    )
-    with pytest.raises(ValueError, match="ssh_host"):
         load_config(cfg)

@@ -2,9 +2,7 @@ import re
 import time
 from pathlib import Path
 
-import pytest
 from clauderc import bot as bot_module
-from clauderc import remote
 from clauderc.bot import (
     ResumeChoice,
     _attach_line,
@@ -258,37 +256,27 @@ def _session(url: str = "https://claude.ai/code/session_01ABC") -> RemoteSession
     )
 
 
-def test_attach_line_carries_the_whole_command_with_ssh(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Команду забирают с телефона, чтобы вставить в терминал другой машины:
-    # без ssh она там никуда не ведёт.
-    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
-    assert _attach_line(_session(), "home") == (
-        "⌨️ <code>ssh -t home tmux attach -d -t =rc-oms</code>"
-    )
+def test_attach_line_carries_the_session_id() -> None:
+    # Id — то, что подставляется в `tmux attach -t =<id>`: `ssh` и хост у каждой
+    # машины свои, меняется здесь только имя.
+    assert _attach_line(_session()) == "🖥 <code>rc-oms</code>"
 
 
-def test_attach_line_without_host_stays_local(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
-    assert _attach_line(_session(), None) == "⌨️ <code>tmux attach -d -t =rc-oms</code>"
+def test_attach_line_escapes_html() -> None:
+    session = RemoteSession(name="x", tmux_name="rc-<evil>", cwd="/x", url="", created_at=0)
+    assert "&lt;evil&gt;" in _attach_line(session)
 
 
-def test_attach_line_escapes_html(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
-    assert "&lt;evil&gt;" in _attach_line(_session(), "<evil>")
-
-
-def test_cards_show_both_ways_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Ссылка ведёт в приложение, команда — в терминал; карточка обязана давать
-    # обе, иначе с телефона второй способ попросту неоткуда взять.
-    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
+def test_cards_show_both_ways_in() -> None:
+    # Ссылка ведёт в приложение, id — в терминал; карточка обязана давать обе,
+    # иначе с телефона второй способ попросту неоткуда взять.
     session = _session()
-    for text in (_fresh_text(session, "home"), _list_item(session, host="home")):
+    for text in (_fresh_text(session), _list_item(session)):
         assert session.url in text
-        assert "ssh -t home tmux attach -d -t =rc-oms" in text
+        assert "rc-oms" in text
 
 
-def test_cards_keep_the_command_when_the_url_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
-    text = _list_item(_session(url=""), host="home")
+def test_cards_keep_the_id_when_the_url_is_unknown() -> None:
+    text = _list_item(_session(url=""))
     assert "ссылка неизвестна" in text
-    assert "ssh -t home tmux attach -d -t =rc-oms" in text
+    assert "rc-oms" in text

@@ -1,11 +1,11 @@
 import subprocess
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
 
 import pytest
 from clauderc import remote
-from clauderc.remote import LaunchError, attach_command, session_name
+from clauderc.remote import LaunchError, RemoteSession, attach_command, session_name
 
 # Обработчик подменённого tmux: (команда, аргументы…) -> (код возврата, вывод)
 Handler = Callable[..., tuple[int, str]]
@@ -44,20 +44,6 @@ def test_attach_command_targets_isolated_socket(monkeypatch: pytest.MonkeyPatch)
     # изолированной песочницы (CLAUDE_RC_TMUX_SOCKET) попросту нет.
     monkeypatch.setenv(remote.TMUX_SOCKET_ENV, "claude-rc-pytest")
     assert attach_command("rc-oms") == "tmux -L claude-rc-pytest attach -d -t =rc-oms"
-
-
-def test_attach_command_prefixes_ssh_when_host_given(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Смысл команды в карточке — скопировать её на другой машине, а там без
-    # ssh она никуда не ведёт.
-    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
-    assert attach_command("rc-oms", host="home") == "ssh -t home tmux attach -d -t =rc-oms"
-
-
-def test_attach_command_quotes_a_host_with_spaces(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Хост приходит из конфига, то есть снаружи: в строку он попадает
-    # проквотированным, а не как есть.
-    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
-    assert attach_command("rc-oms", host="a b") == "ssh -t 'a b' tmux attach -d -t =rc-oms"
 
 
 def test_attach_argv_detaches_others_and_matches_exactly(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -268,9 +254,9 @@ async def test_launch_does_not_reuse_session_from_another_directory(
         await remote.launch("oms", "/other/oms", timeout_s=0.05)
 
     assert created, "для другого каталога нужна новая сессия"
-    # имя занято сессией из /repos/oms → к базовому добавляется хвост от пути
+    # имя занято сессией из /repos/oms → различаем родительским каталогом
     name = created[0][created[0].index("-s") + 1]
-    assert name.startswith("rc-oms-") and name != "rc-oms"
+    assert name == "rc-other-oms"
 
 
 async def test_await_url_raises_trust_required_and_keeps_session(
@@ -400,3 +386,42 @@ async def test_launch_with_resume_returns_existing_session(
 
     assert session.tmux_name == "rc-oms"
     assert started == []
+
+
+async def test_unique_name_takes_the_base_when_it_is_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(remote, "list_sessions", _sessions())
+    assert await remote._unique_name("oms", "/Users/n/code/oms") == "rc-oms"
+
+
+async def test_unique_name_disambiguates_by_parent_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Хеш пути уникальность давал, но человеку не говорил ничего: имя сессии
+    # он видит в карточке и набирает в /rckill.
+    monkeypatch.setattr(remote, "list_sessions", _sessions("rc-oms"))
+    assert await remote._unique_name("oms", "/Users/n/forks/oms") == "rc-forks-oms"
+
+
+async def test_unique_name_adds_levels_until_unique(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(remote, "list_sessions", _sessions("rc-oms", "rc-forks-oms"))
+    assert await remote._unique_name("oms", "/Users/n/forks/oms") == "rc-n-forks-oms"
+
+
+async def test_unique_name_falls_back_to_a_hash_when_paths_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Путь совпал целиком — так бывает у симлинка на уже занятый каталог.
+    taken = ("rc-oms", "rc-code-oms", "rc-n-code-oms", "rc-Users-n-code-oms")
+    monkeypatch.setattr(remote, "list_sessions", _sessions(*taken))
+    name = await remote._unique_name("oms", "/Users/n/code/oms")
+    assert name.startswith("rc-oms-") and name not in taken
+
+
+def _sessions(*names: str) -> Callable[[], Coroutine[None, None, list[RemoteSession]]]:
+    async def listing() -> list[RemoteSession]:
+        return [
+            RemoteSession(name=n.removeprefix("rc-"), tmux_name=n, cwd="/x", url="", created_at=0)
+            for n in names
+        ]
+
+    return listing

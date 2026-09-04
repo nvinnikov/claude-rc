@@ -502,7 +502,7 @@ def _read_raw_toml(target: Path) -> dict[str, object] | None:
         return None
 
 
-_EXTRA_KEYS = ("worktree_root", "state_path", "scan_depth", "launch_timeout_s", "ssh_host")
+_EXTRA_KEYS = ("worktree_root", "state_path", "scan_depth", "launch_timeout_s")
 
 
 def _current_extras(target: Path) -> dict[str, object]:

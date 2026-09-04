@@ -32,7 +32,6 @@ from clauderc.remote import (
     LaunchError,
     RemoteSession,
     TrustRequired,
-    attach_command,
     await_url,
     confirm_trust,
     find,
@@ -181,29 +180,28 @@ def _link_line(session: RemoteSession) -> str:
     return html.escape(session.url) if session.url else "ссылка неизвестна"
 
 
-def _attach_line(session: RemoteSession, host: str | None) -> str:
-    """Команда подсадки — второй способ попасть в сессию, кроме ссылки.
+def _attach_line(session: RemoteSession) -> str:
+    """Имя tmux-сессии — второй вход в неё, кроме ссылки.
 
-    Показывается всегда, а не только когда ссылку добыть не удалось: забрать её
-    с телефона и надо, чтобы продолжить в терминале на другой машине. В Telegram
-    <code> копируется одним тапом, поэтому команда даётся целиком, вместе с `ssh`
-    до хоста из конфига.
+    Показывается всегда, а не только когда ссылку добыть не удалось: забрать имя
+    с телефона и надо, чтобы подсесть из терминала на другой машине. Дальше оно
+    подставляется в `tmux attach -d -t =<имя>` (см. README про алиас) — команду
+    целиком карточка не носит: `ssh` и хост у каждой машины свои, а меняется
+    здесь только имя. В Telegram <code> копируется одним тапом.
     """
-    return f"⌨️ <code>{html.escape(attach_command(session.tmux_name, host=host))}</code>"
+    return f"🖥 <code>{html.escape(session.tmux_name)}</code>"
 
 
-def _fresh_text(session: RemoteSession, host: str | None = None) -> str:
+def _fresh_text(session: RemoteSession) -> str:
     return (
         f"✅ Сессия <b>{html.escape(session.name)}</b> поднята\n"
         f"<code>{html.escape(session.cwd)}</code>\n"
         f"{_link_line(session)}\n"
-        f"{_attach_line(session, host)}"
+        f"{_attach_line(session)}"
     )
 
 
-def _list_item(
-    session: RemoteSession, tree: Worktree | None = None, *, host: str | None = None
-) -> str:
+def _list_item(session: RemoteSession, tree: Worktree | None = None) -> str:
     lines = [
         f"▸ <b>{html.escape(session.name)}</b> · {_uptime(session.uptime_s())}",
         f"<code>{html.escape(session.cwd)}</code>",
@@ -211,7 +209,7 @@ def _list_item(
     if tree is not None:
         lines.append(f"🌿 <code>{html.escape(tree.branch)}</code> · {_tree_state(tree)}")
     lines.append(_link_line(session))
-    lines.append(_attach_line(session, host))
+    lines.append(_attach_line(session))
     return "\n".join(lines)
 
 
@@ -496,7 +494,7 @@ async def main() -> None:
         alive = await find(str(cwd))
         if alive is not None:
             await notice.edit_text(
-                f"Уже поднята.\n{_list_item(alive, host=config.ssh_host)}",
+                f"Уже поднята.\n{_list_item(alive)}",
                 parse_mode="HTML",
                 reply_markup=_open_keyboard(alive.url),
             )
@@ -538,9 +536,7 @@ async def main() -> None:
             return
 
         await notice.edit_text(
-            _fresh_text(session, config.ssh_host),
-            parse_mode="HTML",
-            reply_markup=_open_keyboard(session.url),
+            _fresh_text(session), parse_mode="HTML", reply_markup=_open_keyboard(session.url)
         )
 
     async def offer_start(message: Message, target: Path, branch: str | None) -> None:
@@ -614,7 +610,7 @@ async def main() -> None:
                 rows.append([InlineKeyboardButton(text="Open in Claude", url=session.url)])
             rows.append([InlineKeyboardButton(text="⏹ Stop", callback_data=f"stop:{token}")])
             await message.answer(
-                _list_item(session, trees.get(real), host=config.ssh_host),
+                _list_item(session, trees.get(real)),
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
@@ -1177,9 +1173,7 @@ async def main() -> None:
             return
 
         await message.answer(
-            _fresh_text(session, config.ssh_host),
-            parse_mode="HTML",
-            reply_markup=_open_keyboard(session.url),
+            _fresh_text(session), parse_mode="HTML", reply_markup=_open_keyboard(session.url)
         )
 
     @dp.callback_query(F.data.startswith("rc:"))
@@ -1330,7 +1324,7 @@ async def main() -> None:
         for session in await list_sessions():
             await bot.send_message(
                 config.allowed_user_id,
-                _list_item(session, host=config.ssh_host),
+                _list_item(session),
                 parse_mode="HTML",
                 reply_markup=_open_keyboard(session.url),
             )

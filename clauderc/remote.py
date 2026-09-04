@@ -79,13 +79,8 @@ class TrustRequired(RuntimeError):
         self.cwd = cwd
 
 
-def attach_argv(tmux_name: str, *, host: str | None = None) -> list[str]:
+def attach_argv(tmux_name: str) -> list[str]:
     """Аргументы подсадки к сессии.
-
-    `host` — машина, на которой живёт tmux: с ним команда годится для другого
-    компьютера, без него — только для самой машины. Имя сессии чистится
-    `session_name` до `[A-Za-z0-9_-]`, поэтому через удалённый shell оно
-    проходит без сюрпризов; хост из конфига квотится при сборке строки.
 
     CLAUDE_RC_TMUX_SOCKET переключает весь модуль на отдельный сервер (см.
     модульный докстринг); без `-L` подсадка пришла бы на сервер по умолчанию,
@@ -101,12 +96,12 @@ def attach_argv(tmux_name: str, *, host: str | None = None) -> list[str]:
     # Claude это не касается: оно говорит с сессией через API, а не через tmux.
     # `=` — точное совпадение: без него `rc-oms` рискует поймать `rc-oms-2`.
     argv += ["attach", "-d", "-t", f"={tmux_name}"]
-    return ["ssh", "-t", host, *argv] if host else argv
+    return argv
 
 
-def attach_command(tmux_name: str, *, host: str | None = None) -> str:
-    """Готовая к копированию команда подсадки — одной строкой."""
-    return shlex.join(attach_argv(tmux_name, host=host))
+def attach_command(tmux_name: str) -> str:
+    """Команда подсадки одной строкой."""
+    return shlex.join(attach_argv(tmux_name))
 
 
 @dataclass(frozen=True)
@@ -204,11 +199,28 @@ async def find(cwd: str) -> RemoteSession | None:
 
 
 async def _unique_name(repo: str, cwd: str) -> str:
-    """Свободное имя сессии: базовое, а при коллизии — с хвостом от пути."""
+    """Свободное имя сессии: базовое, а при коллизии — с родительскими каталогами.
+
+    Имя сессии человек видит в карточке и набирает сам — в `/rckill` и в
+    `tmux attach`. Хеш пути уникальность давал, но человеку не говорил ничего:
+    `oms-a1b2c3` и `oms-9f8e7d` различимы только по строке пути рядом с ними.
+    Родительский каталог различает их сам, поэтому в имя добавляется он, и
+    ровно столько уровней, сколько нужно для уникальности.
+    """
     base = session_name(repo)
     taken = {s.tmux_name for s in await list_sessions()}
     if base not in taken:
         return base
+
+    parts = [part for part in os.path.realpath(cwd).split(os.sep) if part]
+    for depth in range(2, len(parts) + 1):
+        candidate = session_name("-".join(parts[-depth:]))
+        if candidate not in taken:
+            return candidate
+
+    # Сюда попадают только пути, совпавшие целиком: занятый каталог и симлинк
+    # на него. Живая сессия в том же каталоге до `_unique_name` не доходит —
+    # `launch` возвращает её раньше.
     tag = hashlib.sha1(os.path.realpath(cwd).encode()).hexdigest()[:6]
     return f"{base}-{tag}"
 
