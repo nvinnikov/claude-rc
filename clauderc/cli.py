@@ -725,9 +725,6 @@ async def _stop(target: str) -> str | None:
     """
     matches = await resolve(target)
     if not matches:
-        # `~/code/oms` как есть не совпадёт ни с чем: realpath тильду не разворачивает.
-        matches = await resolve(str(Path(target).expanduser()))
-    if not matches:
         return None
     if len(matches) > 1:
         raise _StopAmbiguous(matches)

@@ -535,3 +535,12 @@ async def test_await_url_keeps_the_name_when_the_url_was_not_stored(
     session = await remote.await_url("rc-oms", "/repos/oms", timeout_s=1.0)
     assert renamed == []
     assert session.tmux_name == "rc-oms"
+
+
+async def test_resolve_expands_a_tilde_in_the_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`/rckill ~/code/oms` — realpath тильду не разворачивает, resolve обязан."""
+    home = Path.home()
+    rows = f"session_01A\t{home}/code/oms\t1000\thttps://claude.ai/code/session_01A\n"
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, rows)))
+
+    assert [s.tmux_name for s in await remote.resolve("~/code/oms")] == ["session_01A"]

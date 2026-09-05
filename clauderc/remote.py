@@ -1,7 +1,8 @@
 """RC-сессии Claude Code, живущие в tmux.
 
-Сессия принадлежит tmux, а не боту: рестарт бота её не гасит, и с самой машины
-к ней можно подсесть через `tmux attach -t rc-<имя>`.
+Сессия принадлежит tmux, а не боту: рестарт бота её не гасит, и подсесть к ней
+можно с любой машины — `tmux attach -d -t =<id>`, где id тот же `session_…`, что
+в ссылке: `await_url` переименовывает сессию в него, как только ссылка появилась.
 
 `claude --remote-control` — интерактивная команда: без tty она уходит в режим
 `--print` и падает. Панель tmux даёт tty, а заодно переживает нас.
@@ -201,7 +202,11 @@ async def resolve(target: str) -> list[RemoteSession]:
     exact = [s for s in sessions if s.tmux_name == wanted]
     if exact:
         return exact
-    return [s for s in sessions if s.name == wanted or same_path(s.cwd, wanted)]
+    # Тильду разворачиваем здесь, а не у каждого вызывающего: `realpath` её не
+    # трогает, и `~/code/oms` из сообщения не совпал бы ни с чем. Строке без
+    # тильды `expanduser` ничего не делает, так что имени это не мешает.
+    path = os.path.expanduser(wanted)
+    return [s for s in sessions if s.name == wanted or same_path(s.cwd, path)]
 
 
 async def find(cwd: str) -> RemoteSession | None:
@@ -319,8 +324,12 @@ async def await_url(
             continue
 
         url = match.group(0)
-        stored, _ = await _run("set-option", "-t", f"={name}:", _URL_OPTION, url, check=False)
-        if stored == 0:
+        stored, why = await _run("set-option", "-t", f"={name}:", _URL_OPTION, url, check=False)
+        if stored != 0:
+            # Не фатально — сессия жива и работает, — но после рестарта бота
+            # ссылку взять будет неоткуда, и переименования не будет тоже.
+            log.warning("set %s on %s failed: %s", _URL_OPTION, name, why.strip())
+        else:
             # Переименование только после сохранённой ссылки: своих `list_sessions`
             # узнаёт по префиксу `rc-` или по `@rc_url`, и сессия без обоих признаков
             # стала бы невидимой — живой процесс, до которого не дотянуться.

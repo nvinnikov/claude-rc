@@ -176,7 +176,7 @@ else to read it from.
 All the logic lives in the modules; `bot.py` only assembles messages out of it.
 
 Not a single character typed. Sessions live in tmux, so they survive a bot restart, and you
-can attach to one from a terminal on any machine — the card carries the whole command.
+can attach to one from a terminal on any machine — the card carries the id to attach to.
 
 ## Using it from Telegram
 

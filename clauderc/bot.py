@@ -180,6 +180,18 @@ def _link_line(session: RemoteSession) -> str:
     return html.escape(session.url) if session.url else "ссылка неизвестна"
 
 
+def _same_session(session: RemoteSession | None, created_at: int) -> RemoteSession | None:
+    """Та ли это сессия, что была на карточке, когда её показывали.
+
+    Каталог — ключ сессии, но не её удостоверение: прежняя могла умереть, а в том
+    же каталоге подняться новая. Устаревшая кнопка Stop тогда погасила бы чужую
+    работу. `session_created` переименование сохраняет, а перезапуск — нет.
+    """
+    if session is None or session.created_at != created_at:
+        return None
+    return session
+
+
 def _attach_line(session: RemoteSession) -> str:
     """Имя tmux-сессии — второй вход в неё, кроме ссылки.
 
@@ -443,7 +455,11 @@ async def main() -> None:
     pending: dict[str, tuple[Path, str | None]] = {}
     # Сессии, которые ждут ответа на диалог доверия каталогу.
     trust_pending: dict[str, tuple[str, str]] = {}
-    stop_pending: dict[str, str] = {}
+    # (каталог, время создания): каталог — ключ сессии, а время отличает ту самую
+    # сессию от новой, поднятой в том же каталоге после смерти прежней. Имя не годится:
+    # `await_url` переименовывает сессию в её id, и запомненное имя перестаёт
+    # существовать. Переименование `session_created` сохраняет, перезапуск — нет.
+    stop_pending: dict[str, tuple[str, int]] = {}
     tree_pending: dict[str, Path] = {}
     # Значение — (id карточки, выбор): выбор любого варианта гасит остальные
     # токены той же карточки, чтобы два тапа не подняли две сессии в одном каталоге.
@@ -606,7 +622,7 @@ async def main() -> None:
             # за лимит выходит легко. Но держим именно путь, а не имя: имя сессии
             # меняется у неё под ногами — `await_url` переименовывает её в id, как
             # только появится ссылка, и запомненное имя перестало бы существовать.
-            stop_pending[token] = real
+            stop_pending[token] = (real, session.created_at)
             rows = []
             if session.url:
                 rows.append([InlineKeyboardButton(text="Open in Claude", url=session.url)])
@@ -1075,16 +1091,17 @@ async def main() -> None:
     async def on_stop(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        cwd = stop_pending.pop((query.data or "").removeprefix("stop:"), None)
+        pending = stop_pending.pop((query.data or "").removeprefix("stop:"), None)
         message = _live_message(query)
-        if cwd is None:
+        if pending is None:
             await query.answer("Список устарел")
             if message is not None:
                 await message.edit_reply_markup(reply_markup=None)
             return
 
+        cwd, created_at = pending
         # Имя берём заново: с момента показа карточки сессию могли переименовать.
-        session = await find(cwd)
+        session = _same_session(await find(cwd), created_at)
         killed = session is not None and await watcher.kill(session.tmux_name)
         await query.answer("Погашена" if killed else "Уже не жива")
         if message is None:
