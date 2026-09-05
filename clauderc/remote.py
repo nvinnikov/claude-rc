@@ -42,6 +42,9 @@ _URL = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_-]+")
 # отвечать приходится в панель. Решение оставляем человеку: наткнувшись на диалог,
 # поднимаем TrustRequired, а Enter шлём только после явного подтверждения.
 _TRUST_PROMPT = re.compile(r"Yes, I trust this folder")
+# Номер пункта «доверяю» в списке. Диалог печатает его сам, и это единственное,
+# на что можно опереться: какой пункт подсвечен по умолчанию, решает claude.
+_TRUST_CHOICE = re.compile(r"(\d+)[.)]\s*Yes, I trust this folder")
 _UNSAFE = re.compile(r"[^A-Za-z0-9_-]+")
 _POLL_S = 0.7
 _TAIL_CHARS = 400
@@ -255,7 +258,23 @@ async def kill_tmux(tmux_name: str) -> bool:
 
 
 async def confirm_trust(tmux_name: str) -> None:
-    """Подтверждает диалог доверия каталогу: выбор по умолчанию — «доверяю»."""
+    """Подтверждает диалог доверия каталогу, выбирая пункт по его номеру.
+
+    Слепой Enter подтверждает не «доверяю», а тот пункт, который подсвечен
+    сейчас, — а какой подсвечен, решает claude, и это уже менялось. Подсвеченным
+    оказался отказ, отказ означает выход claude, выход — конец tmux-сессии, и
+    человек получал «сессия завершилась, не отдав ссылку» вместо ответа на свой
+    же тап. Номер печатает сам диалог, поэтому опираемся на него.
+
+    Enter следом безвреден в обоих случаях: список, который подтверждается
+    номером сразу, к этому моменту уже закрыт, а пустой Enter в поле ввода
+    claude игнорирует. Не нашли номера — остаётся прежнее поведение, лучше
+    попытаться, чем не ответить вовсе.
+    """
+    code, pane = await _run("capture-pane", "-p", "-J", "-t", f"={tmux_name}:", check=False)
+    choice = _TRUST_CHOICE.search(pane) if code == 0 else None
+    if choice is not None:
+        await _run("send-keys", "-t", f"={tmux_name}:", choice.group(1), check=False)
     await _run("send-keys", "-t", f"={tmux_name}:", "Enter", check=False)
 
 
@@ -310,13 +329,18 @@ async def await_url(
     живой: ответить за пользователя мы не вправе, но и терять запущенный процесс
     незачем — после подтверждения ожидание продолжится с `watch_trust=False`.
     """
+    # Держим последнюю удачную панель, а не вывод неудачного capture: когда
+    # сессия исчезла, tmux печатает «can't find session», и раньше именно это
+    # уезжало человеку вместо того, что было на экране перед смертью, — то есть
+    # вместо единственной подсказки, почему всё кончилось.
     pane = ""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         await asyncio.sleep(_POLL_S)
-        code, pane = await _run("capture-pane", "-p", "-J", "-t", f"={name}:", check=False)
+        code, captured = await _run("capture-pane", "-p", "-J", "-t", f"={name}:", check=False)
         if code != 0:
             raise LaunchError(_failure("сессия завершилась, не отдав ссылку", pane), tmux_name=name)
+        pane = captured
         match = _URL.search(pane)
         if match is None:
             if watch_trust and _TRUST_PROMPT.search(pane):

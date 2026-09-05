@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 from clauderc import remote
-from clauderc.remote import LaunchError, RemoteSession, attach_command, session_name
+from clauderc.remote import (
+    LaunchError,
+    RemoteSession,
+    TrustRequired,
+    attach_command,
+    session_name,
+)
 
 # Обработчик подменённого tmux: (команда, аргументы…) -> (код возврата, вывод)
 Handler = Callable[..., tuple[int, str]]
@@ -544,3 +550,46 @@ async def test_resolve_expands_a_tilde_in_the_target(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, rows)))
 
     assert [s.tmux_name for s in await remote.resolve("~/code/oms")] == ["session_01A"]
+
+
+@pytest.mark.skipif(not remote.tmux_available(), reason="нет tmux")
+async def test_trust_is_confirmed_by_choice_number_not_by_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Настоящий tmux, claude-заглушка с диалогом, где Enter — это отказ.
+
+    Ровно тот случай, что пришёл с боевой машины: подсвечен оказался отказ,
+    claude по Enter вышел, tmux-сессия кончилась вместе с ним, и человек
+    получил «сессия завершилась, не отдав ссылку» вместо ссылки.
+    """
+    socket_name = f"claude-rc-pytest-{uuid.uuid4().hex[:8]}"
+    monkeypatch.setenv(remote.TMUX_SOCKET_ENV, socket_name)
+
+    url = "https://claude.ai/code/session_" + uuid.uuid4().hex[:16]
+    stub = tmp_path / "fake-claude"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "echo 'Do you trust the files in this folder?'\n"
+        "echo '  1. Yes, I trust this folder'\n"
+        "echo '  2. No, exit'\n"
+        # Пустая строка (Enter) — отказ и выход, как у настоящего диалога,
+        # когда подсвечен не тот пункт.
+        "read answer\n"
+        'if [ "$answer" != "1" ]; then echo "declined"; exit 1; fi\n'
+        f"echo '{url}'\n"
+        "sleep 30\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setattr(remote, "CLAUDE_BIN", str(stub))
+
+    try:
+        with pytest.raises(TrustRequired) as need:
+            await remote.launch("trust-probe", str(tmp_path), timeout_s=15)
+
+        await remote.confirm_trust(need.value.tmux_name)
+        session = await remote.await_url(
+            need.value.tmux_name, str(tmp_path), timeout_s=15, watch_trust=False
+        )
+        assert session.url == url
+    finally:
+        await remote._run("kill-server", check=False)

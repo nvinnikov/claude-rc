@@ -535,8 +535,16 @@ and shaped the code:
   from within Claude Code; an inherited `CLAUDE_CODE_CHILD_SESSION` starts the session with
   "Transcript saving is off" — that is, with no history.
 - **The trust dialog is never bypassed silently.** `await_url` raises `TrustRequired` without
-  killing the session, and `Enter` reaches the pane only after a human presses the button.
+  killing the session, and the answer reaches the pane only after a human presses the button.
   Auto-confirm is not our call to make: it's a decision about access to a directory.
+- **The trust dialog is answered by the option's number, not by `Enter`.** `Enter` confirms
+  whichever option is highlighted, and which one that is is Claude Code's call — it has
+  changed. When the highlighted option turned out to be the decline, Claude exited, the tmux
+  session ended with it, and the human got "the session ended without a link" in reply to
+  their own "I trust it" tap. The dialog prints the number itself, so that's what we use.
+- **A dead session is reported with the last pane we saw, not the failed `capture-pane`.**
+  Once the session is gone tmux prints `can't find session`, and that used to reach the human
+  instead of what was on screen before it died — the only clue as to why.
 - **Telegram serves `InaccessibleMessage`** for messages that are too old — it has no
   `edit_text`. Callbacks narrow through `_live_message(query)`, not `if query.message is None`.
 - **`callback_data` holds 64 bytes.** No paths or names go in there: either an index into the
