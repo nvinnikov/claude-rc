@@ -3,7 +3,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from clauderc import cli
+from clauderc import cli, remote
+from clauderc import update as update_mod
 from clauderc.remote import LaunchError, RemoteSession, TrustRequired
 
 
@@ -198,7 +199,7 @@ def test_start_trust_without_tty_fails_without_confirming(
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=False))
 
     assert cli.main(["start", str(tmp_path)]) == 2
-    assert "tmux attach -t rc-oms" in capsys.readouterr().err
+    assert "tmux attach -d -t =rc-oms" in capsys.readouterr().err
     assert confirmed == []
 
 
@@ -266,7 +267,7 @@ def test_stop_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
         killed.append(tmux_name)
         return True
 
-    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(remote, "list_sessions", fake_list)
     monkeypatch.setattr(cli, "kill_tmux", fake_kill)
     assert cli.main(["stop", "oms"]) == 0
     assert killed == ["rc-oms"]
@@ -282,7 +283,7 @@ def test_stop_by_path(monkeypatch: pytest.MonkeyPatch) -> None:
         killed.append(tmux_name)
         return True
 
-    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(remote, "list_sessions", fake_list)
     monkeypatch.setattr(cli, "kill_tmux", fake_kill)
     assert cli.main(["stop", "/repos/oms"]) == 0
     assert killed == ["rc-oms"]
@@ -299,7 +300,7 @@ def test_stop_kill_failure_is_not_reported_as_not_found(
     async def fake_kill(tmux_name: str) -> bool:
         return False
 
-    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(remote, "list_sessions", fake_list)
     monkeypatch.setattr(cli, "kill_tmux", fake_kill)
     assert cli.main(["stop", "oms"]) == 1
     err = capsys.readouterr().err
@@ -313,7 +314,7 @@ def test_stop_unknown_target_fails(
     async def fake_list() -> list[RemoteSession]:
         return []
 
-    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(remote, "list_sessions", fake_list)
     assert cli.main(["stop", "ghost"]) == 1
     assert capsys.readouterr().err.strip()
 
@@ -1863,3 +1864,276 @@ def test_sync_deduplicates_symlinked_repo(monkeypatch: pytest.MonkeyPatch, tmp_p
     monkeypatch.setattr(cli.sync, "sync", fake_sync)
     assert cli.main(["sync", str(real), str(link)]) == 0
     assert seen == [real.resolve()]
+
+
+def test_stop_refuses_to_guess_between_same_named_sessions(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Имя сессии — имя каталога, и у трёх клонов оно одно на всех. Погасить
+    # первую попавшуюся значит убить чужую работу; отвечаем списком id.
+    killed: list[str] = []
+
+    async def fake_list() -> list[RemoteSession]:
+        return [
+            RemoteSession(
+                name="oms", tmux_name="session_01A", cwd="/repos/oms", url="", created_at=0
+            ),
+            RemoteSession(
+                name="oms", tmux_name="session_01B", cwd="/forks/oms", url="", created_at=0
+            ),
+        ]
+
+    async def fake_kill(tmux_name: str) -> bool:
+        killed.append(tmux_name)
+        return True
+
+    monkeypatch.setattr(remote, "list_sessions", fake_list)
+    monkeypatch.setattr(cli, "kill_tmux", fake_kill)
+
+    assert cli.main(["stop", "oms"]) == 1
+    err = capsys.readouterr().err
+    assert "session_01A" in err and "session_01B" in err
+    assert killed == []
+
+
+def test_stop_by_session_id_is_unambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
+    killed: list[str] = []
+
+    async def fake_list() -> list[RemoteSession]:
+        return [
+            RemoteSession(
+                name="oms", tmux_name="session_01A", cwd="/repos/oms", url="", created_at=0
+            ),
+            RemoteSession(
+                name="oms", tmux_name="session_01B", cwd="/forks/oms", url="", created_at=0
+            ),
+        ]
+
+    async def fake_kill(tmux_name: str) -> bool:
+        killed.append(tmux_name)
+        return True
+
+    monkeypatch.setattr(remote, "list_sessions", fake_list)
+    monkeypatch.setattr(cli, "kill_tmux", fake_kill)
+
+    assert cli.main(["stop", "session_01B"]) == 0
+    assert killed == ["session_01B"]
+
+
+def _no_network(monkeypatch: pytest.MonkeyPatch, latest: str | None = None) -> None:
+    monkeypatch.setattr(update_mod, "latest_release", lambda **kw: latest)
+
+
+def test_update_check_says_what_is_available_and_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    ran: list[list[str]] = []
+    _no_network(monkeypatch, "9.9.9")
+    monkeypatch.setattr(
+        update_mod, "detect", lambda: update_mod.Install(update_mod.Channel.uv_tool)
+    )
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: ran.append(cmd))
+
+    assert cli.main(["update", "--check"]) == 0
+    out = capsys.readouterr().out
+    assert "uv tool" in out
+    assert "9.9.9" in out
+    assert ran == [], "--check не имеет права ничего запускать"
+
+
+def test_update_reports_an_unreachable_github_without_failing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Обновиться можно и вслепую — недоступная сеть не повод отказывать.
+    _no_network(monkeypatch, None)
+    monkeypatch.setattr(
+        update_mod, "detect", lambda: update_mod.Install(update_mod.Channel.uv_tool)
+    )
+    assert cli.main(["update", "--check"]) == 0
+    assert "сеть недоступна" in capsys.readouterr().out
+
+
+def test_update_refuses_when_the_install_is_not_recognised(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _no_network(monkeypatch, None)
+    monkeypatch.setattr(
+        update_mod, "detect", lambda: update_mod.Install(update_mod.Channel.unknown)
+    )
+    assert cli.main(["update"]) == 2
+    assert "не опознан" in capsys.readouterr().err
+
+
+def test_update_runs_the_channel_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ran: list[list[str]] = []
+
+    class _Ok:
+        returncode = 0
+
+    _no_network(monkeypatch, None)
+    monkeypatch.setattr(
+        update_mod, "detect", lambda: update_mod.Install(update_mod.Channel.uv_tool)
+    )
+
+    def record(cmd: list[str], **kwargs: object) -> _Ok:
+        ran.append(cmd)
+        return _Ok()
+
+    monkeypatch.setattr(cli.subprocess, "run", record)
+
+    assert cli.main(["update"]) == 0
+    assert ran == [["uv", "tool", "install", "--force", f"git+{update_mod.REPO_URL}"]]
+    # Бот работает старым кодом, пока его не перезапустить — об этом надо сказать.
+    assert "перезапустить" in capsys.readouterr().out
+
+
+def test_update_stops_when_a_command_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class _Failed:
+        returncode = 1
+
+    _no_network(monkeypatch, None)
+    monkeypatch.setattr(
+        update_mod,
+        "detect",
+        lambda: update_mod.Install(update_mod.Channel.brew, formula="claude-rc"),
+    )
+    monkeypatch.setattr(update_mod, "APP_PATH", tmp_path)  # существующий каталог = «есть»
+    ran: list[list[str]] = []
+
+    def record(cmd: list[str], **kwargs: object) -> _Failed:
+        ran.append(cmd)
+        return _Failed()
+
+    monkeypatch.setattr(cli.subprocess, "run", record)
+
+    assert cli.main(["update"]) == 1
+    assert len(ran) == 1, "вторая команда не должна запускаться после провала первой"
+
+
+def test_update_from_a_clone_pulls_before_reinstalling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Клон сначала подтягивается — и по правилам sync, а не по своим."""
+    ran: list[list[str]] = []
+    pulled: list[Path] = []
+
+    class _Ok:
+        returncode = 0
+
+    async def fake_sync(repo: Path, **kwargs: object) -> cli.sync.SyncResult:
+        pulled.append(repo)
+        return cli.sync.SyncResult(repo, cli.sync.Outcome.updated, "подтянуто", "master")
+
+    _no_network(monkeypatch, None)
+    monkeypatch.setattr(
+        update_mod, "detect", lambda: update_mod.Install(update_mod.Channel.clone, root=tmp_path)
+    )
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+
+    def record(cmd: list[str], **kwargs: object) -> _Ok:
+        ran.append(cmd)
+        return _Ok()
+
+    monkeypatch.setattr(cli.subprocess, "run", record)
+
+    assert cli.main(["update"]) == 0
+    assert pulled == [tmp_path]
+    assert ran and ran[0][:3] == ["make", "-C", str(tmp_path)]
+
+
+def test_update_does_not_reinstall_a_clone_it_could_not_pull(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Грязное дерево sync пропускает; переустанавливать тот же код бессмысленно.
+    ran: list[list[str]] = []
+
+    async def skipped(repo: Path, **kwargs: object) -> cli.sync.SyncResult:
+        return cli.sync.SyncResult(repo, cli.sync.Outcome.skipped, "незакоммиченные", "master")
+
+    _no_network(monkeypatch, None)
+    monkeypatch.setattr(
+        update_mod, "detect", lambda: update_mod.Install(update_mod.Channel.clone, root=tmp_path)
+    )
+    monkeypatch.setattr(cli.sync, "sync", skipped)
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: ran.append(cmd))
+
+    assert cli.main(["update"]) == 1
+    assert ran == []
+
+
+def test_update_json_is_machine_readable_and_never_installs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Этот вывод читает приложение в меню-баре."""
+    ran: list[list[str]] = []
+    _no_network(monkeypatch, "0.3.0")
+    monkeypatch.setattr(
+        update_mod, "detect", lambda: update_mod.Install(update_mod.Channel.uv_tool)
+    )
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: ran.append(cmd))
+
+    assert cli.main(["update", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["channel"] == "uv-tool"
+    assert payload["latest"] == "0.3.0"
+    assert payload["available"] is True
+    # --json подразумевает --check: машинный вывод нужен, чтобы решить, а не чтобы
+    # обновиться молча.
+    assert ran == []
+
+
+def test_update_json_says_nothing_is_available_without_network(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _no_network(monkeypatch, None)
+    monkeypatch.setattr(
+        update_mod, "detect", lambda: update_mod.Install(update_mod.Channel.uv_tool)
+    )
+    assert cli.main(["update", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["latest"] is None
+    assert payload["available"] is False
+
+
+def test_update_json_is_not_available_when_there_is_nothing_to_install(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Приложение по `available` решает, гасить ли себя вместе с ботом.
+
+    На неопознанном канале обновлять нечем, и «есть версия новее» здесь
+    означало бы, что оно погасится впустую и упрётся в отказ.
+    """
+    _no_network(monkeypatch, "9.9.9")
+    monkeypatch.setattr(
+        update_mod, "detect", lambda: update_mod.Install(update_mod.Channel.unknown)
+    )
+    assert cli.main(["update", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["latest"] == "9.9.9"
+    assert payload["available"] is False
+
+
+def test_start_pull_leaves_a_directory_with_a_live_session_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Перематывать дерево, в котором прямо сейчас работает claude, нельзя."""
+    pulled: list[Path] = []
+
+    async def fake_find(cwd: str) -> RemoteSession:
+        return _session()
+
+    async def fake_sync(repo: Path, **kwargs: object) -> None:
+        pulled.append(repo)
+
+    async def fake_launch(*args: object, **kwargs: object) -> RemoteSession:
+        return _session()
+
+    monkeypatch.setattr(cli, "find", fake_find)
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    monkeypatch.setattr(cli, "launch", fake_launch)
+
+    assert cli.main(["start", str(tmp_path), "--pull"]) == 0
+    assert pulled == []
+    assert "не тяну" in capsys.readouterr().out

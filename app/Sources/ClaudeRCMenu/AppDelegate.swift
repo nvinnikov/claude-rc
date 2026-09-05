@@ -18,6 +18,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let loginRow = NSMenuItem(title: "Launch at login", action: nil, keyEquivalent: "")
     private let loginNoteRow = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private var loginItemError: String?
+    private let updateRow = NSMenuItem(title: "Check for updates…", action: nil, keyEquivalent: "")
+    private let updateNoteRow = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let autoUpdateRow = NSMenuItem(
+        title: "Update automatically", action: nil, keyEquivalent: ""
+    )
+    private var updateStatus: Updater.Status?
+    private var updateError: String?
+    private var updateCheckInFlight = false
+    private var updateTimer: Timer?
     private var signalSources: [DispatchSourceSignal] = []
 
     /// Без супервизора (CLI не нашли или это второй экземпляр) `menuNeedsUpdate`
@@ -62,6 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             self.supervisor = supervisor
             supervisor.start()
+            scheduleUpdateChecks()
         } else {
             Log.app("cli not found; searchPaths=\(CLILocator.defaultSearchPaths)")
             render(.crashed(reason: "CLI not found"))
@@ -140,6 +150,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        // Действие ставится в renderUpdate вместе с заголовком: пункт с
+        // надписью «Check for updates…» не должен гасить бота и переустанавливать
+        // тулзу.
+        updateRow.target = self
+        menu.addItem(updateRow)
+
+        updateNoteRow.isEnabled = false
+        updateNoteRow.isHidden = true
+        menu.addItem(updateNoteRow)
+
+        autoUpdateRow.action = #selector(toggleAutoUpdate)
+        autoUpdateRow.target = self
+        menu.addItem(autoUpdateRow)
+
+        menu.addItem(.separator())
+
         loginRow.action = #selector(toggleLoginItem)
         loginRow.target = self
         menu.addItem(loginRow)
@@ -163,6 +189,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         renderSetupNote()
         loginRow.state = LoginItem.isEnabled ? .on : .off
         renderLoginNote()
+        renderUpdate()
         // Человек мог пройти визард в соседнем Терминале, не возвращаясь в
         // приложение, — не заставляем его ещё и кликать "Start bot" вслепую,
         // чтобы просто узнать, подхватился ли конфиг. Метод сам не запускает
@@ -298,15 +325,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // shellQuoted, а не просто "\(cli.path)" в кавычках: путь пользователя может
         // содержать пробел или саму одинарную кавычку (`/Users/имя фамилия/...`,
         // `/Users/o'brien/...`) — без честного экранирования это разваливает скрипт.
-        let script = "clear; \(shellQuoted(cli.path)) setup"
+        let script = "#!/bin/sh\nclear\n\(shellQuoted(cli.path)) setup\n"
         let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
-        // Имя с UUID — второй клик до того, как первый скрипт дочитан Терминалом,
-        // не должен переписать файл, который тот ещё открывает.
-        let temp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("claude-rc-setup-\(UUID().uuidString).command")
+        let temp: URL
         do {
-            try "#!/bin/sh\n\(script)\n".write(to: temp, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: temp.path)
+            temp = try temporaryCommand(script, prefix: "setup")
         } catch {
             setupError = "не удалось подготовить скрипт визарда: \(error.localizedDescription)"
             Log.app("runSetup: \(setupError!)")
@@ -332,6 +355,162 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.renderSetupNote()
             }
         }
+    }
+
+    // MARK: - Обновление
+
+    /// Раз в шесть часов и один раз при старте. Чаще незачем: релизы выходят
+    /// реже, а каждая проверка — поход в сеть.
+    private static let updateInterval: TimeInterval = 6 * 60 * 60
+    private static let autoUpdateKey = "autoUpdate"
+    private static let autoUpdateAttemptKey = "autoUpdateAttempt"
+
+    private var autoUpdateEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.autoUpdateKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.autoUpdateKey) }
+    }
+
+    /// Версия, которую тумблер уже пробовал поставить. Переживает перезапуск
+    /// приложения намеренно: обновление само его и перезапускает, так что
+    /// память в оперативке от неудачной попытки не осталась бы.
+    private var autoUpdateAttempt: String? {
+        get { UserDefaults.standard.string(forKey: Self.autoUpdateAttemptKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.autoUpdateAttemptKey) }
+    }
+
+    private func scheduleUpdateChecks() {
+        checkForUpdate()
+        updateTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.updateInterval, repeats: true
+        ) { _ in
+            Task { @MainActor [weak self] in self?.checkForUpdate() }
+        }
+    }
+
+    /// Проверка уходит в фон: она ходит в сеть, а меню-бар не должен ждать
+    /// вместе с ней — те же грабли, что у `doctor --json` на главном потоке,
+    /// только там таймаут секунды, а здесь сетевой.
+    private func checkForUpdate() {
+        guard let cli, !updateCheckInFlight else { return }
+        updateCheckInFlight = true
+        DispatchQueue.global(qos: .utility).async {
+            let status = Updater.check(cli: cli)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.updateCheckInFlight = false
+                if let status {
+                    self.updateStatus = status
+                    Log.app("update check: \(status.current) -> \(status.latest ?? "?") available=\(status.available)")
+                } else {
+                    Log.app("update check: не удалось спросить claude-rc")
+                }
+                self.renderUpdate()
+                if Updater.shouldRunAutomatically(
+                    status: self.updateStatus,
+                    enabled: self.autoUpdateEnabled,
+                    lastAttempt: self.autoUpdateAttempt
+                ) {
+                    // Метку ставим до запуска, а не после: обновление гасит нас,
+                    // и «после» может не наступить.
+                    self.autoUpdateAttempt = self.updateStatus?.latest
+                    Log.app("update: обновляемся сами, тумблер включён")
+                    self.runUpdate()
+                }
+            }
+        }
+    }
+
+    private func renderUpdate() {
+        updateRow.title = Updater.menuTitle(for: updateStatus)
+        updateRow.action =
+            Updater.installsOnClick(status: updateStatus)
+            ? #selector(runUpdate) : #selector(checkForUpdateNow)
+        updateRow.isEnabled = cli != nil && !updateCheckInFlight
+        autoUpdateRow.state = autoUpdateEnabled ? .on : .off
+        autoUpdateRow.isEnabled = cli != nil
+
+        if let updateError {
+            updateNoteRow.title = "⚠ \(updateError)"
+            updateNoteRow.isHidden = false
+            return
+        }
+        let note = Updater.menuNote(for: updateStatus)
+        updateNoteRow.title = note
+        updateNoteRow.isHidden = note.isEmpty
+    }
+
+    /// Обёртка для пункта меню: `checkForUpdate` зовётся и из таймера, и из
+    /// колбэка, а `@objc` нужен только меню.
+    @objc private func checkForUpdateNow() {
+        checkForUpdate()
+    }
+
+    /// Тумблер включили — проверяем сразу: ждать шесть часов с уже вышедшим
+    /// релизом человек не просил.
+    @objc private func toggleAutoUpdate() {
+        autoUpdateEnabled = !autoUpdateEnabled
+        Log.app("auto-update: \(autoUpdateEnabled ? "включён" : "выключен")")
+        if autoUpdateEnabled {
+            // Включение — это и есть «попробуй ещё раз»: память о неудачной
+            // попытке иначе молча съела бы намерение человека.
+            autoUpdateAttempt = nil
+            renderUpdate()
+            checkForUpdate()
+        } else {
+            renderUpdate()
+        }
+    }
+
+    /// Обновление идёт в Терминале, а не дочерним процессом: см. `Updater.script`.
+    @objc private func runUpdate() {
+        updateError = nil
+        guard let cli else {
+            updateError = "CLI не найден"
+            renderUpdate()
+            return
+        }
+        let script = Updater.script(cli: cli.path, bundle: Bundle.main.bundleURL.path)
+        let temp: URL
+        do {
+            temp = try temporaryCommand(script, prefix: "update")
+        } catch {
+            updateError = "не удалось подготовить скрипт обновления: \(error.localizedDescription)"
+            Log.app("runUpdate: \(updateError!)")
+            renderUpdate()
+            return
+        }
+        let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+        NSWorkspace.shared.open(
+            [temp], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration()
+        ) { [weak self] _, error in
+            DispatchQueue.main.async {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    try? FileManager.default.removeItem(at: temp)
+                }
+                guard let self else { return }
+                if let error {
+                    self.updateError = "не удалось открыть Терминал: \(error.localizedDescription)"
+                    Log.app("runUpdate: \(self.updateError!)")
+                } else {
+                    self.updateError = nil
+                }
+                self.renderUpdate()
+            }
+        }
+    }
+
+    /// Исполняемый `.command` во временном каталоге.
+    ///
+    /// Имя с UUID — второй клик до того, как первый скрипт дочитан Терминалом,
+    /// не должен переписать файл, который тот ещё открывает.
+    private func temporaryCommand(_ script: String, prefix: String) throws -> URL {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-rc-\(prefix)-\(UUID().uuidString).command")
+        try script.write(to: temp, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: temp.path
+        )
+        return temp
     }
 
     @objc private func openLog() {

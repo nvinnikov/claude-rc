@@ -60,12 +60,79 @@ From the phone it looks like this:
 3. `▶️ Start Claude RC` — or `🌿 New worktree`, if something is already running there;
 4. the link arrives → `Open in Claude` → you're working.
 
+## What a session starts with
+
+A session that stops to ask something is a session you have to be at a keyboard for, so two
+things are decided before it starts rather than during it.
+
+**Fresh code.** With `pull_before_start = true` the working directory is fast-forwarded from
+origin first, by `claude-rc sync` — the same rules as everywhere else, so a dirty tree or a
+detached HEAD is left alone and history only ever fast-forwards. With `--branch`, the
+*repository* is pulled before the worktree is created: `git worktree add` branches from the
+current HEAD, so pulling afterwards would leave the new worktree on stale code. The card says
+what the pull did, because a session silently started on old code is worse than no pull.
+
+**Permissions.** `permission_mode` picks what the session starts with — `manual`,
+`acceptEdits`, `plan`, `auto`, `dontAsk` or `bypassPermissions` — and it's checked when the
+config is read, since Claude refuses to start on an unknown mode and you'd see a dead session
+rather than a typo. This adds no gate on the bot's side; see
+[Permissions and trade-offs](#permissions-and-trade-offs). The CLI takes the same two as
+flags: `claude-rc start --pull --permission-mode acceptEdits`.
+
+## The four surfaces of a session
+
+A running Claude Code session can be reached in four different ways, and they are easy to
+confuse with one another. Two are built into Claude Code; two are what this project is for.
+
+| Surface | What reaches it | Built in? |
+|---|---|---|
+| **Conversation** — from a phone, a browser, a second computer | Remote Control: claude.ai/code, the Claude mobile app, Claude Desktop | yes |
+| **Terminal** — from any machine | `ssh` + `tmux attach`, into the pane the session lives in | yes, provided the session was started inside tmux |
+| **Creating** a session anywhere in your tree while away from the machine | — | **no — this is what claude-rc is for** |
+| **Managing** sessions: what's alive, stop one, add a worktree, sync repositories | — | **no — claude-rc as well** |
+
+The first two are Claude Code's own, and this project deliberately doesn't rebuild them.
+What we found while checking where the line runs:
+
+- **A terminal can't join a Remote Control session over the network.** No client mode exists
+  for it. `claude --resume <id>` in a second terminal starts a *new local process* over the
+  same transcript instead of joining the live one — the docs say Claude Code "prints a notice
+  in the second terminal and leaves Remote Control off there instead of taking the session
+  away from the first", and two terminals on one transcript merely "interleave into one
+  transcript". `--teleport` picks up a Claude Code *on the web* session, not a Remote Control
+  one. So the only way into a live session's terminal is to reach the terminal it runs in.
+  That is why sessions here live in tmux: `tmux attach` then works from any machine over ssh.
+
+- **Third-party session orchestrators are in the same category.** Remote Control exposes no
+  public client API, so they don't attach to a session either — they run the agent over SSH
+  themselves and stream its I/O into their own window. In effect that is `ssh` + `tmux` with
+  a different client. On macOS, `ssh -t host tmux -CC attach` gives you iTerm2 native tabs
+  for the price of one flag.
+
+- **Starting a session anywhere in a tree has no built-in answer.** `claude remote-control`
+  server mode comes closest — one process, sessions created on demand from the app, each in
+  its own worktree — but it is bound to the single directory it was started in. Reaching any
+  repository across `rc_roots` from a phone is what this project adds.
+
+- **An umbrella directory works, and beats `--add-dir`.** For a `/services/repo-1 … repo-n`
+  layout whose parent has no `.git` of its own, start the session in `/services`: everything
+  stays inside one working tree, so nested `CLAUDE.md` files and per-repository settings load
+  the usual way. Directories added with `--add-dir` never have their `.claude/` discovered.
+
+- **Nothing here opens an inbound port.** Remote Control makes outbound HTTPS requests only
+  and never listens on your machine; the Telegram bot polls outward; tmux is local. A web
+  terminal would break that property, which is why there isn't one.
+
+The full write-up, including the design of a `claude-rc connect` command for the second row,
+is in [docs/superpowers/specs/2026-09-04-connect-and-umbrella-design.md](docs/superpowers/specs/2026-09-04-connect-and-umbrella-design.md).
+
 ## How it works
 
 `claude --remote-control` is an **interactive** command. Without a tty it falls back to
 `--print` mode and dies with `Input must be provided either through stdin or as a prompt
-argument`. A tmux pane provides that tty, so every session lives in its own tmux session
-named `rc-<name>` — and the bot is only a client that hands tmux commands.
+argument`. A tmux pane provides that tty, so every session lives in its own tmux session —
+created as `rc-<name>` and renamed to its `session_…` id as soon as Claude prints the link —
+and the bot is only a client that hands tmux commands.
 
 ```mermaid
 flowchart LR
@@ -79,8 +146,8 @@ flowchart LR
         BOT["claude-rc bot<br/>(aiogram)"]
         CLI["claude-rc CLI"]
         subgraph tmux ["tmux server"]
-            S1["rc-my-service<br/>claude --remote-control<br/>@rc_url"]
-            S2["rc-my-service-feat<br/>(git worktree)"]
+            S1["session_01ABCdef<br/>claude --remote-control<br/>@rc_url"]
+            S2["session_01XYZghi<br/>(git worktree)"]
         end
         REPOS[("git repos<br/>rc_roots")]
     end
@@ -99,8 +166,9 @@ flowchart LR
 Two consequences fall out of that design:
 
 - **sessions survive a bot restart** — the registry lives in tmux, not in the bot's memory;
-- **you can attach from the machine itself**: `tmux attach -t rc-oms` opens the very same
-  live terminal you're driving from your phone.
+- **you can attach from any machine**: `ssh -t home tmux attach -d -t =session_01ABCdef`
+  opens the very same live terminal you're driving from your phone — addressed by the very
+  id you already see in the Claude app.
 
 The session link is stored in the tmux user option `@rc_url`: the TUI repaints the pane and
 wipes the link out of the visible buffer, and after a bot restart there would be nowhere
@@ -126,8 +194,8 @@ else to read it from.
 
 All the logic lives in the modules; `bot.py` only assembles messages out of it.
 
-Not a single character typed. Sessions live in tmux, so they survive a bot restart, and once
-you're home you can attach to them straight from a terminal: `tmux attach -t rc-<name>`.
+Not a single character typed. Sessions live in tmux, so they survive a bot restart, and you
+can attach to one from a terminal on any machine — the card carries the id to attach to.
 
 ## Using it from Telegram
 
@@ -161,6 +229,32 @@ A persistent keyboard sits under the input field: `📁 PWD`, `💬 Chats`, `�
 
 If a session is already alive in a directory you get its link back rather than a second
 session — sessions are keyed by working directory, not by name.
+
+Every session card carries **two ways in**, and they share one identifier: the link, which
+opens the session in the Claude app, and the same `session_…` id (`🖥`), which opens it in a
+terminal. As soon as Claude prints the link, the tmux session is renamed to the id from it —
+so the thing you already have in front of you in the app *is* the attach target. Nothing to
+look up, and no way to end up in the wrong session: ids are unique where directory names are
+not.
+
+Telegram copies anything in `<code>` on a tap. The card carries the id rather than a whole
+command because `ssh` and the host differ per machine while the id is the only part that
+changes — put the rest in an alias on each of your machines:
+
+```bash
+rc() { ssh -t home tmux attach -d -t "=$1"; }   # rc session_01ABCdef
+```
+
+Both flags are there on purpose. `-d` detaches other *tmux* clients — a pane is created at
+120×40 with no client, and a second client with a narrow window would reflow the TUI for
+whoever is working right now. The Claude app is unaffected: it talks to the session over the
+API, not through tmux. `=` means an exact match, so a target can't land on a session whose
+name merely starts the same way.
+
+Because ids identify sessions and directory names no longer have to, cards, `/rckill` and
+`claude-rc stop` show and take the directory name as a label. Where a label matches more than
+one session — three clones of one repository — nothing is killed: you get the ids back and
+pick.
 
 ### Repository sync
 
@@ -322,9 +416,9 @@ It asks three things:
 It writes `~/.config/claude-rc/config.toml` with mode `600` (and the directory `700`) —
 that file holds a live token; a repeat run narrows the permissions even if the file used to
 be wider. A repeat `claude-rc setup` pre-fills the previous values as hints and changes only
-what you answer — an empty answer keeps the old value. Four technical fields the wizard
-never asks about (`worktree_root`, `state_path`, `scan_depth`, `launch_timeout_s`) are
-carried over verbatim on rewrite; anything else outside that list (including human
+what you answer — an empty answer keeps the old value. Six technical fields the wizard
+never asks about (`worktree_root`, `state_path`, `scan_depth`, `launch_timeout_s`,
+`permission_mode`, `pull_before_start`) are carried over verbatim on rewrite; anything else outside that list (including human
 comments) is not preserved.
 
 Then open the ClaudeRC app or run `claude-rc bot`.
@@ -342,6 +436,9 @@ Then open the ClaudeRC app or run `claude-rc bot`.
    - `bot_token` — from @BotFather
    - `allowed_user_id` — your Telegram user_id (ask @userinfobot)
    - `rc_roots` — where to look for repositories
+   - `permission_mode` — optional: what a session starts with, so it doesn't stop and
+     ask at every step while you're holding a phone
+   - `pull_before_start` — optional: fetch origin before a session starts
 3. `chmod 600 config.toml`
 
 The config is looked up in order: the path in `$CLAUDE_RC_CONFIG` if set; otherwise
@@ -381,17 +478,19 @@ uv tool install .
 |---|---|
 | `claude-rc version` | version |
 | `claude-rc sessions [--json]` | live RC sessions |
-| `claude-rc start [path] [--branch b] [--resume last\|id]` | start a session (default: current directory) |
+| `claude-rc start [path] [--branch b] [--resume last\|id] [--pull] [--permission-mode m]` | start a session (default: current directory) |
 | `claude-rc stop <name\|path>` / `claude-rc stop --all` | kill a session |
 | `claude-rc doctor [--json]` | check tmux, claude and the config |
 | `claude-rc setup` | first-run wizard — token, user_id, directories |
+| `claude-rc update [--check] [--json]` | update the tool the same way it was installed |
 | `claude-rc sync [paths…] [--branch b] [--no-fetch]` | fast-forward repositories from origin |
 | `claude-rc bot` | run the Telegram bot in the foreground — same as `make run` |
 
 The trust dialog for an unfamiliar directory is asked straight on stdin: there's a human at
 the terminal, and their answer *is* the decision about access to that directory — no
 auto-confirm here either. With no tty (in a script, say) `start` doesn't hang waiting for
-input: it exits with code 2 and a hint to `tmux attach -t rc-<name>` and answer in the pane.
+input: it exits with code 2 and a hint to `tmux attach -d -t =rc-<name>` and answer in the
+pane.
 
 ### Repository sync
 
@@ -439,12 +538,35 @@ and shaped the code:
   restart there's nowhere to read it from — hence the tmux user option `@rc_url`.
 - **The pane size is set explicitly** (`-x 120 -y 40`). A pane with no attached client is
   tiny, and the TUI wraps lines so that the link breaks in half.
+- **The attach command detaches other clients (`-d`).** Sizing follows from the point above:
+  a second tmux client with a narrow window shrinks the pane for everyone, reflowing the TUI
+  under the hands of whoever is working right now. This never touches the Claude app — that
+  one talks to the session over the API, not through tmux.
+- **A new config key must be added to `_EXTRA_KEYS`.** The setup wizard rewrites
+  `config.toml` from scratch and carries over only the keys on that list, so a key left off
+  it is silently erased the next time someone runs `claude-rc setup`.
+- **A session is renamed to its Claude session id once the link appears.** The id can't be
+  the name from the start — the server issues it, and it doesn't exist until Claude prints
+  it — so the session is created under a name derived from the directory and renamed after
+  the fact. Two things follow. `list_sessions` recognises its own by the `rc-` prefix *or* a
+  set `@rc_url`: the prefix alone would lose renamed sessions, the option alone would lose
+  ones that died before printing a link. And the `Watcher` doesn't call a vanished name a
+  death while a session with the same working directory is alive — otherwise every launch
+  would report a crash.
 - **`CLAUDE_CODE_*` is scrubbed inside the pane.** The tmux server may have been started
   from within Claude Code; an inherited `CLAUDE_CODE_CHILD_SESSION` starts the session with
   "Transcript saving is off" — that is, with no history.
 - **The trust dialog is never bypassed silently.** `await_url` raises `TrustRequired` without
-  killing the session, and `Enter` reaches the pane only after a human presses the button.
+  killing the session, and the answer reaches the pane only after a human presses the button.
   Auto-confirm is not our call to make: it's a decision about access to a directory.
+- **The trust dialog is answered by the option's number, not by `Enter`.** `Enter` confirms
+  whichever option is highlighted, and which one that is is Claude Code's call — it has
+  changed. When the highlighted option turned out to be the decline, Claude exited, the tmux
+  session ended with it, and the human got "the session ended without a link" in reply to
+  their own "I trust it" tap. The dialog prints the number itself, so that's what we use.
+- **A dead session is reported with the last pane we saw, not the failed `capture-pane`.**
+  Once the session is gone tmux prints `can't find session`, and that used to reach the human
+  instead of what was on screen before it died — the only clue as to why.
 - **Telegram serves `InaccessibleMessage`** for messages that are too old — it has no
   `edit_text`. Callbacks narrow through `_live_message(query)`, not `if query.message is None`.
 - **`callback_data` holds 64 bytes.** No paths or names go in there: either an index into the
@@ -492,6 +614,55 @@ ends up on Telegram's servers. A deliberate trade-off for the convenience of res
 be turned off without touching code: don't use the resume fork — start sessions via
 `🌿 New worktree` or `/rc <repo> <branch>`; a fresh worktree has no history and nothing to
 preview.
+
+### Updating
+
+```bash
+claude-rc update --check    # what's installed, what version, is there a newer one
+claude-rc update            # update it
+```
+
+There is nothing to configure and nothing to remember: the command works out how this copy
+was installed from the environment it is running in, and runs that channel's own command.
+A clone is fast-forwarded and reinstalled (`make install`, or `make install-tool` when the
+app isn't there); a `uv tool` install is reinstalled from git at the release tag it just
+named; a Homebrew install is `brew upgrade`d, with the cask too when the app is present.
+
+The channel is read from the running environment rather than from `claude-rc` on `PATH` —
+the name is the same in all three cases, the path is not. `make install` and an install from
+a git URL land in the same place, so what tells them apart is uv's own `uv-receipt.toml`
+next to the environment: an install from a directory records `directory` there, one from git
+records `git`. Without that, updating the documented main way of installing would pull master
+over the clone, and never reinstall the app.
+
+The clone is pulled by `claude-rc sync`, so its rules apply as they do everywhere else: a
+dirty tree or a detached HEAD is left alone, and history only ever fast-forwards. Nothing is
+reinstalled when nothing was pulled.
+
+Checking the latest release needs the network, but updating doesn't: an unreachable GitHub is
+reported and the update goes ahead anyway.
+
+**The bot keeps running the old code until it is restarted** — `Stop bot` / `Start bot` in the
+menu bar app, or `claude-rc bot` again.
+
+#### From the menu bar
+
+The app checks for a new release at launch and every six hours, and the menu row says what it
+found: `Check for updates…` with the current version under it, or `Update to 0.3.0…` when
+there is something to install. `Update automatically` runs it without asking; the check
+itself happens either way.
+
+The check runs off the main thread (it goes to the network) and reads
+`claude-rc update --check --json` — the app never works out versions or install channels for
+itself, so the two can't disagree about them. `--json` implies `--check` and installs nothing.
+
+Updating opens Terminal rather than running silently, for two reasons at once. The update
+kills the app — reinstalling puts files under a running process, so both `make install` and
+the cask stop it first — and a child process would die with it half-way through. And the
+output of `git`, `make` or `brew` is worth seeing: a silent update that didn't work is worse
+than no update. The script stops the app itself before reinstalling (SIGTERM, so it shuts the
+bot down cleanly), and reopens it afterwards whether or not the update succeeded. Live
+sessions don't care: they belong to tmux, not to the bot.
 
 ## Releases
 

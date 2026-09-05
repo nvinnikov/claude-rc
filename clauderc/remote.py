@@ -1,7 +1,8 @@
 """RC-сессии Claude Code, живущие в tmux.
 
-Сессия принадлежит tmux, а не боту: рестарт бота её не гасит, и с самой машины
-к ней можно подсесть через `tmux attach -t rc-<имя>`.
+Сессия принадлежит tmux, а не боту: рестарт бота её не гасит, и подсесть к ней
+можно с любой машины — `tmux attach -d -t =<id>`, где id тот же `session_…`, что
+в ссылке: `await_url` переименовывает сессию в него, как только ссылка появилась.
 
 `claude --remote-control` — интерактивная команда: без tty она уходит в режим
 `--print` и падает. Панель tmux даёт tty, а заодно переживает нас.
@@ -28,6 +29,23 @@ log = logging.getLogger("clauderc.remote")
 
 PREFIX = "rc-"
 CLAUDE_BIN = "claude"
+# Режимы прав, которые понимает claude. Проверяем на своей стороне, чтобы
+# опечатка называлась при чтении конфига, а не гасила сессию при старте.
+#
+# Список списан с `claude --help`, а не с документации: `default` — имя ручного
+# режима для `permissions.defaultMode` в settings.json, но `--permission-mode`
+# его не принимает и с ним не стартует. В примерах документации он при этом
+# встречается, поэтому соблазн внести его сюда прямой — и он бы ровно ту ошибку
+# и пропустил, ради предотвращения которой список заведён. Ручной режим здесь
+# зовётся `manual`.
+PERMISSION_MODES = (
+    "manual",
+    "acceptEdits",
+    "plan",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+)
 # Имя отдельного tmux-сервера (`tmux -L <имя>`). Пустая/отсутствующая — сервер
 # по умолчанию, тот же, где живут рабочие сессии.
 TMUX_SOCKET_ENV = "CLAUDE_RC_TMUX_SOCKET"
@@ -41,6 +59,9 @@ _URL = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_-]+")
 # отвечать приходится в панель. Решение оставляем человеку: наткнувшись на диалог,
 # поднимаем TrustRequired, а Enter шлём только после явного подтверждения.
 _TRUST_PROMPT = re.compile(r"Yes, I trust this folder")
+# Номер пункта «доверяю» в списке. Диалог печатает его сам, и это единственное,
+# на что можно опереться: какой пункт подсвечен по умолчанию, решает claude.
+_TRUST_CHOICE = re.compile(r"(\d+)[.)]\s*Yes, I trust this folder")
 _UNSAFE = re.compile(r"[^A-Za-z0-9_-]+")
 _POLL_S = 0.7
 _TAIL_CHARS = 400
@@ -79,17 +100,29 @@ class TrustRequired(RuntimeError):
         self.cwd = cwd
 
 
-def attach_command(tmux_name: str) -> str:
-    """Команда для подсадки к сессии с самой машины.
+def attach_argv(tmux_name: str) -> list[str]:
+    """Аргументы подсадки к сессии.
 
     CLAUDE_RC_TMUX_SOCKET переключает весь модуль на отдельный сервер (см.
-    модульный докстринг); без `-L` подсказка привела бы на сервер по
-    умолчанию, где этой сессии нет — особенно заметно в песочнице, где
-    рабочий сервер вообще пуст.
+    модульный докстринг); без `-L` подсадка пришла бы на сервер по умолчанию,
+    где этой сессии нет — особенно заметно в песочнице, где рабочий сервер пуст.
     """
     socket = os.environ.get(TMUX_SOCKET_ENV)
-    socket_flag = f"-L {shlex.quote(socket)} " if socket else ""
-    return f"tmux {socket_flag}attach -t {tmux_name}"
+    argv = ["tmux"]
+    if socket:
+        argv += ["-L", socket]
+    # `-d` отцепляет прочих tmux-клиентов. Панель создаётся _COLS x _ROWS без
+    # клиента, и второй клиент с узким окном ужал бы её всем сразу — TUI
+    # переверстался бы под руками у того, кто работает прямо сейчас. Приложения
+    # Claude это не касается: оно говорит с сессией через API, а не через tmux.
+    # `=` — точное совпадение: без него `rc-oms` рискует поймать `rc-oms-2`.
+    argv += ["attach", "-d", "-t", f"={tmux_name}"]
+    return argv
+
+
+def attach_command(tmux_name: str) -> str:
+    """Команда подсадки одной строкой."""
+    return shlex.join(attach_argv(tmux_name))
 
 
 @dataclass(frozen=True)
@@ -102,10 +135,6 @@ class RemoteSession:
 
     def uptime_s(self) -> float:
         return max(0.0, time.time() - self.created_at)
-
-    @property
-    def attach_hint(self) -> str:
-        return attach_command(self.tmux_name)
 
 
 def session_name(repo: str) -> str:
@@ -147,11 +176,15 @@ async def list_sessions() -> list[RemoteSession]:
         if len(parts) != 4:
             continue
         tmux_name, path, created, url = parts
-        if not tmux_name.startswith(PREFIX):
+        # Наши сессии — либо ещё не переименованные (префикс), либо уже
+        # названные id сессии Claude (тогда имя ни о чём не говорит, но
+        # `@rc_url` выставлен). Одного признака мало: по префиксу не видно
+        # переименованных, а по опции — тех, кто умер, не дождавшись ссылки.
+        if not tmux_name.startswith(PREFIX) and not url:
             continue  # чужие tmux-сессии не трогаем
         sessions.append(
             RemoteSession(
-                name=tmux_name[len(PREFIX) :],
+                name=_display_name(path, tmux_name),
                 tmux_name=tmux_name,
                 cwd=path,
                 url=url,
@@ -161,20 +194,39 @@ async def list_sessions() -> list[RemoteSession]:
     return sorted(sessions, key=lambda s: s.name)
 
 
-def _same_path(a: str, b: str) -> bool:
+def _display_name(cwd: str, tmux_name: str) -> str:
+    """Как сессию зовут в карточке. Имя tmux после переименования — id сессии
+    Claude, и человеку он не говорит ничего; каталог говорит.
+    """
+    return os.path.basename(cwd.rstrip(os.sep)) or tmux_name.removeprefix(PREFIX)
+
+
+def same_path(a: str, b: str) -> bool:
     try:
         return os.path.realpath(a) == os.path.realpath(b)
     except OSError:
         return a == b
 
 
-async def get_session(repo: str) -> RemoteSession | None:
-    """Сессия по видимому имени — то, что показывает `/rc` и принимает `/rckill`."""
-    name = session_name(repo)
-    for session in await list_sessions():
-        if session.tmux_name == name:
-            return session
-    return None
+async def resolve(target: str) -> list[RemoteSession]:
+    """Сессии, к которым относится строка от человека: id, имя или каталог.
+
+    Список, а не одна: имя каталога в дереве не уникально (два клона одного
+    репо), и «погасить oms», когда их три, — не то, что можно решить за
+    человека. Уникален только id, поэтому им и различают.
+    """
+    wanted = target.strip()
+    if not wanted:
+        return []
+    sessions = await list_sessions()
+    exact = [s for s in sessions if s.tmux_name == wanted]
+    if exact:
+        return exact
+    # Тильду разворачиваем здесь, а не у каждого вызывающего: `realpath` её не
+    # трогает, и `~/code/oms` из сообщения не совпал бы ни с чем. Строке без
+    # тильды `expanduser` ничего не делает, так что имени это не мешает.
+    path = os.path.expanduser(wanted)
+    return [s for s in sessions if s.name == wanted or same_path(s.cwd, path)]
 
 
 async def find(cwd: str) -> RemoteSession | None:
@@ -185,17 +237,34 @@ async def find(cwd: str) -> RemoteSession | None:
     в чужом каталоге.
     """
     for session in await list_sessions():
-        if _same_path(session.cwd, cwd):
+        if same_path(session.cwd, cwd):
             return session
     return None
 
 
 async def _unique_name(repo: str, cwd: str) -> str:
-    """Свободное имя сессии: базовое, а при коллизии — с хвостом от пути."""
+    """Свободное имя сессии: базовое, а при коллизии — с родительскими каталогами.
+
+    Имя сессии человек видит в карточке и набирает сам — в `/rckill` и в
+    `tmux attach`. Хеш пути уникальность давал, но человеку не говорил ничего:
+    `oms-a1b2c3` и `oms-9f8e7d` различимы только по строке пути рядом с ними.
+    Родительский каталог различает их сам, поэтому в имя добавляется он, и
+    ровно столько уровней, сколько нужно для уникальности.
+    """
     base = session_name(repo)
     taken = {s.tmux_name for s in await list_sessions()}
     if base not in taken:
         return base
+
+    parts = [part for part in os.path.realpath(cwd).split(os.sep) if part]
+    for depth in range(2, len(parts) + 1):
+        candidate = session_name("-".join(parts[-depth:]))
+        if candidate not in taken:
+            return candidate
+
+    # Сюда попадают только пути, совпавшие целиком: занятый каталог и симлинк
+    # на него. Живая сессия в том же каталоге до `_unique_name` не доходит —
+    # `launch` возвращает её раньше.
     tag = hashlib.sha1(os.path.realpath(cwd).encode()).hexdigest()[:6]
     return f"{base}-{tag}"
 
@@ -205,12 +274,24 @@ async def kill_tmux(tmux_name: str) -> bool:
     return code == 0
 
 
-async def kill_session(repo: str) -> bool:
-    return await kill_tmux(session_name(repo))
-
-
 async def confirm_trust(tmux_name: str) -> None:
-    """Подтверждает диалог доверия каталогу: выбор по умолчанию — «доверяю»."""
+    """Подтверждает диалог доверия каталогу, выбирая пункт по его номеру.
+
+    Слепой Enter подтверждает не «доверяю», а тот пункт, который подсвечен
+    сейчас, — а какой подсвечен, решает claude, и это уже менялось. Подсвеченным
+    оказался отказ, отказ означает выход claude, выход — конец tmux-сессии, и
+    человек получал «сессия завершилась, не отдав ссылку» вместо ответа на свой
+    же тап. Номер печатает сам диалог, поэтому опираемся на него.
+
+    Enter следом безвреден в обоих случаях: список, который подтверждается
+    номером сразу, к этому моменту уже закрыт, а пустой Enter в поле ввода
+    claude игнорирует. Не нашли номера — остаётся прежнее поведение, лучше
+    попытаться, чем не ответить вовсе.
+    """
+    code, pane = await _run("capture-pane", "-p", "-J", "-t", f"={tmux_name}:", check=False)
+    choice = _TRUST_CHOICE.search(pane) if code == 0 else None
+    if choice is not None:
+        await _run("send-keys", "-t", f"={tmux_name}:", choice.group(1), check=False)
     await _run("send-keys", "-t", f"={tmux_name}:", "Enter", check=False)
 
 
@@ -220,6 +301,16 @@ async def kill_all() -> int:
         code, _ = await _run("kill-session", "-t", f"={session.tmux_name}", check=False)
         killed += code == 0
     return killed
+
+
+def _permission_flag(mode: str | None) -> str:
+    """Хвост командной строки для режима прав.
+
+    Права выдаются в приложении Claude, и гейта на нашей стороне не появляется:
+    флаг только говорит claude, с чем начинать, чтобы сессия не останавливалась
+    на каждом шаге у человека, который сейчас с телефоном в руках.
+    """
+    return f" --permission-mode {shlex.quote(mode)}" if mode else ""
 
 
 def _resume_flag(resume: str | None) -> str:
@@ -232,12 +323,19 @@ def _resume_flag(resume: str | None) -> str:
 
 
 async def launch(
-    repo: str, cwd: str, *, timeout_s: float = 90.0, resume: str | None = None
+    repo: str,
+    cwd: str,
+    *,
+    timeout_s: float = 90.0,
+    resume: str | None = None,
+    permission_mode: str | None = None,
 ) -> RemoteSession:
     """Поднимает RC-сессию в `cwd` и ждёт, пока claude напечатает ссылку.
 
     `resume` продолжает прежний диалог (`"last"` — последний, id — конкретный);
     проверка на уже живую сессию в `cwd` его не отменяет — сессия одна на каталог.
+
+    `permission_mode` — с какими правами начинать (см. `PERMISSION_MODES`).
     """
     if not tmux_available():
         raise LaunchError("tmux не найден в PATH — поставь через `brew install tmux`")
@@ -250,6 +348,7 @@ async def launch(
     command = (
         _SCRUB_ENV
         + f"exec {shlex.quote(CLAUDE_BIN)} --remote-control {shlex.quote(repo)}"
+        + _permission_flag(permission_mode)
         + _resume_flag(resume)
     )
     await _run("new-session", "-d", "-s", name, "-x", _COLS, "-y", _ROWS, "-c", cwd, command)
@@ -265,13 +364,18 @@ async def await_url(
     живой: ответить за пользователя мы не вправе, но и терять запущенный процесс
     незачем — после подтверждения ожидание продолжится с `watch_trust=False`.
     """
+    # Держим последнюю удачную панель, а не вывод неудачного capture: когда
+    # сессия исчезла, tmux печатает «can't find session», и раньше именно это
+    # уезжало человеку вместо того, что было на экране перед смертью, — то есть
+    # вместо единственной подсказки, почему всё кончилось.
     pane = ""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         await asyncio.sleep(_POLL_S)
-        code, pane = await _run("capture-pane", "-p", "-J", "-t", f"={name}:", check=False)
+        code, captured = await _run("capture-pane", "-p", "-J", "-t", f"={name}:", check=False)
         if code != 0:
             raise LaunchError(_failure("сессия завершилась, не отдав ссылку", pane), tmux_name=name)
+        pane = captured
         match = _URL.search(pane)
         if match is None:
             if watch_trust and _TRUST_PROMPT.search(pane):
@@ -279,7 +383,16 @@ async def await_url(
             continue
 
         url = match.group(0)
-        await _run("set-option", "-t", f"={name}:", _URL_OPTION, url, check=False)
+        stored, why = await _run("set-option", "-t", f"={name}:", _URL_OPTION, url, check=False)
+        if stored != 0:
+            # Не фатально — сессия жива и работает, — но после рестарта бота
+            # ссылку взять будет неоткуда, и переименования не будет тоже.
+            log.warning("set %s on %s failed: %s", _URL_OPTION, name, why.strip())
+        else:
+            # Переименование только после сохранённой ссылки: своих `list_sessions`
+            # узнаёт по префиксу `rc-` или по `@rc_url`, и сессия без обоих признаков
+            # стала бы невидимой — живой процесс, до которого не дотянуться.
+            name = await _rename_to_session_id(name, url)
         session = await find(cwd)
         if session is None:  # успела умереть между capture и list
             raise LaunchError(_failure("сессия исчезла сразу после запуска", pane), tmux_name=name)
@@ -288,6 +401,31 @@ async def await_url(
 
     await _run("kill-session", "-t", f"={name}", check=False)
     raise LaunchError(_failure(f"ссылка не появилась за {int(timeout_s)}с", pane), tmux_name=name)
+
+
+async def _rename_to_session_id(name: str, url: str) -> str:
+    """Переименовывает tmux-сессию в id сессии Claude из ссылки.
+
+    Смысл — один идентификатор на обе поверхности: тот же `session_...`, что
+    человек видит в приложении, годится как цель `tmux attach -t =<id>`. Раньше
+    цель приходилось выяснять отдельно, и при совпадении имён каталогов она ещё
+    и обрастала различающим хвостом.
+
+    Раньше ссылки имени взяться неоткуда: id выдаёт сервер, а не мы, и до
+    первой печати в панели его не существует. Отсюда переименование по факту,
+    а не имя сразу.
+
+    Неудача не фатальна: сессия жива и работает под прежним именем, `@rc_url`
+    уже выставлен, и `find(cwd)` найдёт её в любом случае.
+    """
+    session_id = url.rsplit("/", 1)[-1]
+    if session_id == name:
+        return name
+    code, out = await _run("rename-session", "-t", f"={name}", session_id, check=False)
+    if code != 0:
+        log.warning("rename %s -> %s failed: %s", name, session_id, out.strip())
+        return name
+    return session_id
 
 
 def _failure(reason: str, pane: str) -> str:

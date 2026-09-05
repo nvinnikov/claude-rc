@@ -1,19 +1,26 @@
 import re
+import time
 from pathlib import Path
 
 from clauderc import bot as bot_module
 from clauderc.bot import (
     ResumeChoice,
+    _attach_line,
     _chunk_report,
     _died_text,
+    _fresh_text,
     _has_repos,
+    _list_item,
     _pop_resume_group,
+    _pull_line,
     _resume_keyboard,
+    _same_session,
     _selected_targets,
     _sync_line,
     _sync_report_line,
     _sync_unavailable_line,
 )
+from clauderc.remote import RemoteSession
 from clauderc.sync import Outcome, RepoStatus, SyncResult
 from clauderc.watch import Died
 
@@ -239,3 +246,76 @@ def test_sync_unavailable_line_names_repo_and_reason() -> None:
 def test_sync_unavailable_line_escapes_html() -> None:
     line = _sync_unavailable_line("a&b")
     assert "&amp;" in line
+
+
+def _session(url: str = "https://claude.ai/code/session_01ABC") -> RemoteSession:
+    return RemoteSession(
+        name="oms",
+        tmux_name="rc-oms",
+        cwd="/Users/n/code/oms",
+        url=url,
+        created_at=int(time.time()) - 60,
+    )
+
+
+def test_attach_line_carries_the_session_id() -> None:
+    # Id — то, что подставляется в `tmux attach -t =<id>`: `ssh` и хост у каждой
+    # машины свои, меняется здесь только имя.
+    assert _attach_line(_session()) == "🖥 <code>rc-oms</code>"
+
+
+def test_attach_line_escapes_html() -> None:
+    session = RemoteSession(name="x", tmux_name="rc-<evil>", cwd="/x", url="", created_at=0)
+    assert "&lt;evil&gt;" in _attach_line(session)
+
+
+def test_cards_show_both_ways_in() -> None:
+    # Ссылка ведёт в приложение, id — в терминал; карточка обязана давать обе,
+    # иначе с телефона второй способ попросту неоткуда взять.
+    session = _session()
+    for text in (_fresh_text(session), _list_item(session)):
+        assert session.url in text
+        assert "rc-oms" in text
+
+
+def test_cards_keep_the_id_when_the_url_is_unknown() -> None:
+    text = _list_item(_session(url=""))
+    assert "ссылка неизвестна" in text
+    assert "rc-oms" in text
+
+
+def test_same_session_recognises_the_session_from_the_card() -> None:
+    session = _session()
+    assert _same_session(session, session.created_at) is session
+
+
+def test_same_session_rejects_a_relaunch_in_the_same_directory() -> None:
+    """Устаревшая кнопка Stop не имеет права погасить чужую работу.
+
+    Каталог — ключ сессии, но не удостоверение: прежняя могла умереть, а в том
+    же каталоге подняться новая. Переименование `session_created` сохраняет,
+    перезапуск — нет.
+    """
+    session = _session()
+    assert _same_session(session, session.created_at - 1) is None
+
+
+def test_same_session_handles_a_directory_with_no_session() -> None:
+    assert _same_session(None, 1000) is None
+
+
+def test_pull_line_reports_what_the_pull_did() -> None:
+    # Молча тянуть нельзя: человек должен видеть, на каком коде поднимается сессия.
+    result = SyncResult(Path("/repos/oms"), Outcome.updated, "подтянуто 3", "main")
+    assert _pull_line(result) == "⤵️ main: подтянуто 3"
+
+
+def test_pull_line_names_a_directory_that_is_not_a_repo() -> None:
+    result = SyncResult(Path("/services"), Outcome.skipped, "не рабочая копия git", "?")
+    assert _pull_line(result) == "⤵️ не git-репозиторий, тянуть нечего"
+
+
+def test_pull_line_escapes_html() -> None:
+    result = SyncResult(Path("/repos/oms"), Outcome.failed, "<evil>", "<b>")
+    line = _pull_line(result)
+    assert "&lt;evil&gt;" in line and "&lt;b&gt;" in line

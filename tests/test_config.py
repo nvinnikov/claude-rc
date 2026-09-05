@@ -21,7 +21,9 @@ def test_load_config_reads_all_fields(tmp_path: Path) -> None:
         f'worktree_root = "{tmp_path / "wt"}"\n'
         f'state_path = "{tmp_path / "state.json"}"\n'
         "scan_depth = 2\n"
-        "launch_timeout_s = 30\n",
+        "launch_timeout_s = 30\n"
+        'permission_mode = "acceptEdits"\n'
+        "pull_before_start = true\n",
     )
 
     assert load_config(cfg) == Config(
@@ -32,6 +34,8 @@ def test_load_config_reads_all_fields(tmp_path: Path) -> None:
         state_path=tmp_path / "state.json",
         scan_depth=2,
         launch_timeout_s=30.0,
+        permission_mode="acceptEdits",
+        pull_before_start=True,
     )
 
 
@@ -172,4 +176,50 @@ def test_wrong_typed_state_path_raises_value_error(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="state_path"):
+        load_config(cfg)
+
+
+def test_permission_mode_defaults_to_none(tmp_path: Path) -> None:
+    cfg = _write(tmp_path, f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n')
+    assert load_config(cfg).permission_mode is None
+    assert load_config(cfg).pull_before_start is False
+
+
+def test_permission_mode_rejects_an_unknown_mode(tmp_path: Path) -> None:
+    # claude на неизвестном режиме не стартует, и человек увидел бы мёртвую
+    # сессию вместо «в конфиге не тот режим».
+    cfg = _write(
+        tmp_path,
+        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n'
+        'permission_mode = "yolo"\n',
+    )
+    with pytest.raises(ValueError, match="permission_mode"):
+        load_config(cfg)
+
+
+def test_pull_before_start_rejects_a_non_boolean(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path,
+        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n'
+        'pull_before_start = "yes"\n',
+    )
+    with pytest.raises(ValueError, match="pull_before_start"):
+        load_config(cfg)
+
+
+def test_permission_mode_rejects_the_settings_name_the_flag_does_not_take(
+    tmp_path: Path,
+) -> None:
+    """`default` — имя ручного режима для settings.json, но не для флага.
+
+    `claude --permission-mode` его не принимает и с ним не стартует, а в
+    примерах документации он встречается — то есть это ровно та ошибка, ради
+    предотвращения которой белый список и заведён.
+    """
+    cfg = _write(
+        tmp_path,
+        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n'
+        'permission_mode = "default"\n',
+    )
+    with pytest.raises(ValueError, match="permission_mode"):
         load_config(cfg)

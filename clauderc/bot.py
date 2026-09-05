@@ -26,9 +26,6 @@ from clauderc import sync as sync_mod
 from clauderc.browse import BrowseError
 from clauderc.config import Config, load_config
 from clauderc.remote import (
-    PREFIX as REMOTE_PREFIX,
-)
-from clauderc.remote import (
     LaunchError,
     RemoteSession,
     TrustRequired,
@@ -38,6 +35,9 @@ from clauderc.remote import (
     launch,
     list_sessions,
     tmux_available,
+)
+from clauderc.remote import (
+    resolve as resolve_sessions,
 )
 from clauderc.repos import discover, resolve
 from clauderc.state import State
@@ -177,16 +177,50 @@ def _label(path: Path, roots: tuple[Path, ...]) -> str:
 
 
 def _link_line(session: RemoteSession) -> str:
-    if session.url:
-        return html.escape(session.url)
-    return f"ссылка неизвестна, подсядь: <code>{html.escape(session.attach_hint)}</code>"
+    return html.escape(session.url) if session.url else "ссылка неизвестна"
+
+
+def _same_session(session: RemoteSession | None, created_at: int) -> RemoteSession | None:
+    """Та ли это сессия, что была на карточке, когда её показывали.
+
+    Каталог — ключ сессии, но не её удостоверение: прежняя могла умереть, а в том
+    же каталоге подняться новая. Устаревшая кнопка Stop тогда погасила бы чужую
+    работу. `session_created` переименование сохраняет, а перезапуск — нет.
+    """
+    if session is None or session.created_at != created_at:
+        return None
+    return session
+
+
+def _pull_line(result: SyncResult) -> str:
+    """Что дало подтягивание перед запуском — одной строкой в карточке.
+
+    Молча тянуть нельзя: человек должен видеть, на каком коде поднимается
+    сессия, особенно когда подтянуть не вышло и код остался прежним.
+    """
+    if result.outcome is Outcome.skipped and result.branch == "?":
+        return "⤵️ не git-репозиторий, тянуть нечего"
+    return f"⤵️ {html.escape(result.branch)}: {html.escape(result.detail)}"
+
+
+def _attach_line(session: RemoteSession) -> str:
+    """Имя tmux-сессии — второй вход в неё, кроме ссылки.
+
+    Показывается всегда, а не только когда ссылку добыть не удалось: забрать имя
+    с телефона и надо, чтобы подсесть из терминала на другой машине. Дальше оно
+    подставляется в `tmux attach -d -t =<имя>` (см. README про алиас) — команду
+    целиком карточка не носит: `ssh` и хост у каждой машины свои, а меняется
+    здесь только имя. В Telegram <code> копируется одним тапом.
+    """
+    return f"🖥 <code>{html.escape(session.tmux_name)}</code>"
 
 
 def _fresh_text(session: RemoteSession) -> str:
     return (
         f"✅ Сессия <b>{html.escape(session.name)}</b> поднята\n"
         f"<code>{html.escape(session.cwd)}</code>\n"
-        f"{_link_line(session)}"
+        f"{_link_line(session)}\n"
+        f"{_attach_line(session)}"
     )
 
 
@@ -198,6 +232,7 @@ def _list_item(session: RemoteSession, tree: Worktree | None = None) -> str:
     if tree is not None:
         lines.append(f"🌿 <code>{html.escape(tree.branch)}</code> · {_tree_state(tree)}")
     lines.append(_link_line(session))
+    lines.append(_attach_line(session))
     return "\n".join(lines)
 
 
@@ -431,7 +466,11 @@ async def main() -> None:
     pending: dict[str, tuple[Path, str | None]] = {}
     # Сессии, которые ждут ответа на диалог доверия каталогу.
     trust_pending: dict[str, tuple[str, str]] = {}
-    stop_pending: dict[str, str] = {}
+    # (каталог, время создания): каталог — ключ сессии, а время отличает ту самую
+    # сессию от новой, поднятой в том же каталоге после смерти прежней. Имя не годится:
+    # `await_url` переименовывает сессию в её id, и запомненное имя перестаёт
+    # существовать. Переименование `session_created` сохраняет, перезапуск — нет.
+    stop_pending: dict[str, tuple[str, int]] = {}
     tree_pending: dict[str, Path] = {}
     # Значение — (id карточки, выбор): выбор любого варианта гасит остальные
     # токены той же карточки, чтобы два тапа не подняли две сессии в одном каталоге.
@@ -468,13 +507,44 @@ async def main() -> None:
             head += f"\nветка <code>{html.escape(branch)}</code>"
         notice = await message.answer(head + "…", parse_mode="HTML")
 
+        # Живую сессию ищем до подтягивания: тап по каталогу, где она уже
+        # работает, ничего не запускает — и перематывать под ней дерево тем
+        # более незачем. Для ветки живая сессия в самом репозитории запуск не
+        # отменяет (worktree будет свой), но тянуть репозиторий под ней нельзя.
+        alive_here = await find(str(target))
+        if alive_here is not None and branch is None:
+            await notice.edit_text(
+                f"Уже поднята.\n{_list_item(alive_here)}",
+                parse_mode="HTML",
+                reply_markup=_open_keyboard(alive_here.url),
+            )
+            return
+
+        pull_note = ""
+        if config.pull_before_start:
+            # До worktree, а не после: `git worktree add` ветвится от текущего
+            # HEAD, и на несвежем репозитории новый worktree тоже был бы несвежим.
+            pull_note = (
+                "⤵️ в каталоге работает сессия — не тяну"
+                if alive_here is not None
+                else _pull_line(await sync_mod.sync_one(target))
+            )
+            await notice.edit_text(f"{head}\n{pull_note}…", parse_mode="HTML")
+
+        def told(text: str) -> str:
+            """Финальная карточка поверх промежуточной не должна съедать отчёт
+            о подтягивании: неудавшийся pull иначе не оставляет в чате следа,
+            а именно он и объясняет, на каком коде поднялась сессия.
+            """
+            return f"{pull_note}\n{text}" if pull_note else text
+
         cwd = target
         if branch:
             try:
                 cwd = await worktrees.ensure(target, branch, config.worktree_root)
             except WorktreeError as exc:
                 await notice.edit_text(
-                    f"❌ Worktree не создан.\n<pre>{html.escape(str(exc))}</pre>"[:3800],
+                    told(f"❌ Worktree не создан.\n<pre>{html.escape(str(exc))}</pre>")[:3800],
                     parse_mode="HTML",
                 )
                 return
@@ -482,7 +552,7 @@ async def main() -> None:
         alive = await find(str(cwd))
         if alive is not None:
             await notice.edit_text(
-                f"Уже поднята.\n{_list_item(alive)}",
+                told(f"Уже поднята.\n{_list_item(alive)}"),
                 parse_mode="HTML",
                 reply_markup=_open_keyboard(alive.url),
             )
@@ -490,15 +560,21 @@ async def main() -> None:
 
         try:
             session = await launch(
-                cwd.name, str(cwd), timeout_s=config.launch_timeout_s, resume=resume
+                cwd.name,
+                str(cwd),
+                timeout_s=config.launch_timeout_s,
+                resume=resume,
+                permission_mode=config.permission_mode,
             )
         except TrustRequired as need:
             token = uuid.uuid4().hex[:8]
             trust_pending[token] = (need.tmux_name, need.cwd)
             await notice.edit_text(
-                "🔐 Claude впервые видит этот каталог и ждёт подтверждения.\n"
-                f"<code>{html.escape(need.cwd)}</code>\n\n"
-                "Он получит право читать, менять и запускать здесь файлы.",
+                told(
+                    "🔐 Claude впервые видит этот каталог и ждёт подтверждения.\n"
+                    f"<code>{html.escape(need.cwd)}</code>\n\n"
+                    "Он получит право читать, менять и запускать здесь файлы."
+                ),
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
@@ -516,15 +592,17 @@ async def main() -> None:
                 # await_url уже видел сессию мёртвой (таймаут, упала сама
                 # или исчезла между capture и list) — без метки watcher
                 # опросил бы её как упавшую следом за этим же сообщением.
-                watcher.expect_death(exc.tmux_name)
+                watcher.expect_death(exc.tmux_name, str(cwd))
             await notice.edit_text(
-                f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800],
+                told(f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>")[:3800],
                 parse_mode="HTML",
             )
             return
 
         await notice.edit_text(
-            _fresh_text(session), parse_mode="HTML", reply_markup=_open_keyboard(session.url)
+            told(_fresh_text(session)),
+            parse_mode="HTML",
+            reply_markup=_open_keyboard(session.url),
         )
 
     async def offer_start(message: Message, target: Path, branch: str | None) -> None:
@@ -590,9 +668,11 @@ async def main() -> None:
             real = os.path.realpath(session.cwd)
             occupied.add(real)
             token = uuid.uuid4().hex[:8]
-            # Имя в callback_data не кладём: там 64 байта, а путь worktree с кириллицей
-            # за лимит выходит легко.
-            stop_pending[token] = session.tmux_name
+            # Путь в callback_data не кладём: там 64 байта, а путь worktree с кириллицей
+            # за лимит выходит легко. Но держим именно путь, а не имя: имя сессии
+            # меняется у неё под ногами — `await_url` переименовывает её в id, как
+            # только появится ссылка, и запомненное имя перестало бы существовать.
+            stop_pending[token] = (real, session.created_at)
             rows = []
             if session.url:
                 rows.append([InlineKeyboardButton(text="Open in Claude", url=session.url)])
@@ -904,12 +984,32 @@ async def main() -> None:
             await message.reply(f"Погашено сессий: {killed}." if killed else "Гасить нечего.")
             return
         name = parts[1]
-        if await watcher.kill_named(name):
-            # Worktree намеренно остаётся: в нём может лежать несохранённая работа.
-            await message.reply(f"Сессия <b>{html.escape(name)}</b> погашена.", parse_mode="HTML")
-        else:
+        matches = await resolve_sessions(name)
+        if not matches:
             await message.reply(
                 f"Нет живой сессии <code>{html.escape(name)}</code>.", parse_mode="HTML"
+            )
+            return
+        if len(matches) > 1:
+            # Имя каталога в дереве не уникально; выбирать за человека, какую
+            # из трёх сессий погасить, нельзя — называем id, они различаются.
+            listing = "\n".join(
+                f"<code>{html.escape(s.tmux_name)}</code> · {html.escape(s.cwd)}" for s in matches
+            )
+            await message.reply(
+                f"Таких сессий несколько — назови id:\n{listing}", parse_mode="HTML"
+            )
+            return
+        if await watcher.kill(matches[0].tmux_name, matches[0].cwd):
+            # Называем найденное, а не набранное: на `/rckill ~/code/oms` ответ
+            # «Сессия ~/code/oms погашена» — про путь, а не про сессию.
+            # Worktree намеренно остаётся: в нём может лежать несохранённая работа.
+            await message.reply(
+                f"Сессия <b>{html.escape(matches[0].name)}</b> погашена.", parse_mode="HTML"
+            )
+        else:
+            await message.reply(
+                f"Не удалось погасить <code>{html.escape(name)}</code>.", parse_mode="HTML"
             )
 
     @dp.message(Command("wt"))
@@ -955,7 +1055,7 @@ async def main() -> None:
         # Сессия держит этот каталог: не погасив её, оставим Claude в исчезнувшем cwd.
         session = await find(str(path))
         if session is not None:
-            await watcher.kill(session.tmux_name)
+            await watcher.kill(session.tmux_name, session.cwd)
 
         try:
             await worktrees.remove(config.worktree_root, name, force=force)
@@ -1027,7 +1127,7 @@ async def main() -> None:
         # Сессия могла подняться уже после показа карточки.
         session = await find(str(path))
         if session is not None:
-            await watcher.kill(session.tmux_name)
+            await watcher.kill(session.tmux_name, session.cwd)
         try:
             await worktrees.remove(config.worktree_root, path.name, force=forced)
         except WorktreeError as exc:
@@ -1045,19 +1145,22 @@ async def main() -> None:
     async def on_stop(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        tmux_name = stop_pending.pop((query.data or "").removeprefix("stop:"), None)
+        pending = stop_pending.pop((query.data or "").removeprefix("stop:"), None)
         message = _live_message(query)
-        if tmux_name is None:
+        if pending is None:
             await query.answer("Список устарел")
             if message is not None:
                 await message.edit_reply_markup(reply_markup=None)
             return
 
-        killed = await watcher.kill(tmux_name)
+        cwd, created_at = pending
+        # Имя берём заново: с момента показа карточки сессию могли переименовать.
+        session = _same_session(await find(cwd), created_at)
+        killed = session is not None and await watcher.kill(session.tmux_name, session.cwd)
         await query.answer("Погашена" if killed else "Уже не жива")
         if message is None:
             return
-        name = tmux_name.removeprefix(REMOTE_PREFIX)
+        name = session.name if session is not None else os.path.basename(cwd)
         # Worktree намеренно остаётся: там может лежать несохранённая работа.
         await message.edit_text(
             f"⏹ Сессия <b>{html.escape(name)}</b> погашена."
@@ -1137,7 +1240,7 @@ async def main() -> None:
 
         tmux_name, cwd = waiting
         if verdict == "notrust":
-            await watcher.kill(tmux_name)
+            await watcher.kill(tmux_name, cwd)
             await message.answer("Отменил, сессия погашена.")
             return
 
@@ -1154,7 +1257,7 @@ async def main() -> None:
                 # await_url уже видел сессию мёртвой (таймаут, упала сама
                 # или исчезла между capture и list) — без метки watcher
                 # опросил бы её как упавшую следом за этим же сообщением.
-                watcher.expect_death(exc.tmux_name)
+                watcher.expect_death(exc.tmux_name, cwd)
             await message.answer(
                 f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
             )

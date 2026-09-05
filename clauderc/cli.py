@@ -25,19 +25,23 @@ from typing import Any, NamedTuple
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
 from clauderc import setup as setup  # тесты подменяют cli.setup.verify_token/catch_user_id
 from clauderc import sync as clauderc_sync  # _Commands.sync затенил бы модуль sync
+from clauderc import update as update_mod  # _Commands.update затенил бы модуль update
 from clauderc import worktrees as worktrees  # тесты подменяют cli.worktrees.ensure
 from clauderc.config import load_config as load_config  # тесты читают cli.load_config
 from clauderc.remote import (
+    PERMISSION_MODES,
     LaunchError,
     RemoteSession,
     TrustRequired,
     attach_command,
     await_url,
     confirm_trust,
+    find,
     kill_all,
     kill_tmux,
     launch,
     list_sessions,
+    resolve,
 )
 from clauderc.worktrees import WorktreeError
 
@@ -81,6 +85,13 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("path", nargs="?", default=".", help="каталог (по умолчанию текущий)")
     start.add_argument("--branch", help="создать worktree под ветку")
     start.add_argument("--resume", help="продолжить диалог: last или id")
+    start.add_argument("--pull", action="store_true", help="подтянуть origin перед запуском")
+    start.add_argument(
+        "--permission-mode",
+        dest="permission_mode",
+        choices=PERMISSION_MODES,
+        help="с какими правами начинать сессию",
+    )
 
     stop = sub.add_parser("stop", help="погасить сессию")
     stop.add_argument("target", nargs="?", help="имя сессии или каталог")
@@ -90,6 +101,14 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true", dest="as_json")
 
     sub.add_parser("setup", help="заполнить config.toml: токен, user_id, каталоги")
+
+    update_cmd = sub.add_parser("update", help="обновить claude-rc тем же способом, каким ставили")
+    update_cmd.add_argument(
+        "--check", action="store_true", help="только сказать, есть ли версия новее"
+    )
+    # --json подразумевает --check: машинный вывод нужен, чтобы решить, обновляться
+    # ли, а не чтобы обновиться молча. Этим его читает приложение в меню-баре.
+    update_cmd.add_argument("--json", action="store_true", dest="as_json")
 
     sync_cmd = sub.add_parser("sync", help="подтянуть репозитории из origin")
     sync_cmd.add_argument("paths", nargs="*", help="каталоги (по умолчанию текущий)")
@@ -111,10 +130,7 @@ class _Commands:
 
     @staticmethod
     def version(args: argparse.Namespace) -> int:
-        try:
-            print(package_version("claude-rc"))
-        except PackageNotFoundError:
-            print("unknown (пакет не установлен)")
+        print(_current_version())
         return 0
 
     @staticmethod
@@ -159,7 +175,15 @@ class _Commands:
                 print(f"--branch нужен рабочий config.toml: {config_path}: {exc}", file=sys.stderr)
                 return EXIT_ENVIRONMENT
         try:
-            session = asyncio.run(_start(target, args.branch, args.resume))
+            session = asyncio.run(
+                _start(
+                    target,
+                    args.branch,
+                    args.resume,
+                    pull=args.pull,
+                    permission_mode=args.permission_mode,
+                )
+            )
         except (LaunchError, WorktreeError) as exc:
             print(str(exc), file=sys.stderr)
             return EXIT_FAILED
@@ -179,6 +203,11 @@ class _Commands:
             return EXIT_ENVIRONMENT
         try:
             killed = asyncio.run(_stop(args.target))
+        except _StopAmbiguous as exc:
+            print("Таких сессий несколько — назови id:", file=sys.stderr)
+            for session in exc.sessions:
+                print(f"  {session.tmux_name}\t{session.cwd}", file=sys.stderr)
+            return EXIT_FAILED
         except _StopFailed as exc:
             print(f"Нашёл, но не погасил: {exc}", file=sys.stderr)
             return EXIT_FAILED
@@ -217,6 +246,90 @@ class _Commands:
             # бы трейсбек вместо «Прервано». Ловим оба тут одним сообщением.
             print("\nПрервано.", file=sys.stderr)
             return EXIT_ENVIRONMENT
+
+    @staticmethod
+    def update(args: argparse.Namespace) -> int:
+        install = update_mod.detect()
+        current = _current_version()
+
+        if args.as_json:
+            latest = update_mod.latest_release()
+            # `available` — не «есть версия новее», а «есть что поставить»:
+            # приложение по этому полю решает, гасить ли себя вместе с ботом,
+            # и на неопознанном канале погасило бы впустую.
+            newer = latest is not None and update_mod.is_newer(latest, current)
+            installable = bool(
+                update_mod.plan(install, app_installed=update_mod.APP_PATH.is_dir(), version=latest)
+            )
+            print(
+                json.dumps(
+                    {
+                        "channel": install.channel.value,
+                        "install": install.label,
+                        "current": current,
+                        "latest": latest,
+                        "available": newer and installable,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+
+        print(f"Установлено: {install.label}\nВерсия: {current}")
+
+        latest = update_mod.latest_release()
+        if latest is None:
+            print("Последний релиз узнать не вышло — сеть недоступна или GitHub не ответил.")
+        elif update_mod.is_newer(latest, current):
+            print(f"Доступна {latest}.")
+        else:
+            print(f"Новее нет (последний релиз {latest}).")
+
+        if args.check:
+            return 0
+
+        commands = update_mod.plan(
+            install, app_installed=update_mod.APP_PATH.is_dir(), version=latest
+        )
+        if not commands:
+            print(
+                "Обновлять нечем: способ установки не опознан.\n"
+                f"Поставь заново по README: {update_mod.REPO_URL}",
+                file=sys.stderr,
+            )
+            return EXIT_ENVIRONMENT
+
+        if install.channel is update_mod.Channel.clone and install.root is not None:
+            # Правила про грязное дерево, отсоединённый HEAD и перемотку только
+            # вперёд уже написаны и проверены в sync — своих здесь не выдумываем.
+            # Живая сессия в клоне — не трогаем: обновление может идти само,
+            # по тумблеру в приложении, и перематывать дерево под работающим
+            # claude тем более незачем.
+            if asyncio.run(find(str(install.root))) is not None:
+                print(
+                    "В клоне работает RC-сессия — не подтягиваю и не переустанавливаю.",
+                    file=sys.stderr,
+                )
+                return EXIT_FAILED
+            result = asyncio.run(clauderc_sync.sync_one(install.root))
+            print(f"{_MARK[result.outcome]} {install.root.name}\t{result.detail}")
+            if result.outcome is clauderc_sync.Outcome.failed:
+                return EXIT_FAILED
+            if result.outcome is clauderc_sync.Outcome.skipped:
+                print("Клон не подтянут — обновлять нечего.", file=sys.stderr)
+                return EXIT_FAILED
+
+        for command in commands:
+            print("$ " + " ".join(command))
+            if subprocess.run(command).returncode != 0:
+                print("Команда обновления не отработала.", file=sys.stderr)
+                return EXIT_FAILED
+
+        print(
+            "Готово. Бот работает старым кодом, пока его не перезапустить: "
+            "Stop bot / Start bot в приложении или заново `claude-rc bot`."
+        )
+        return 0
 
     @staticmethod
     def sync(args: argparse.Namespace) -> int:
@@ -258,6 +371,14 @@ class _StopFailed(RuntimeError):
     """Сессия нашлась, но tmux не смог её погасить — не путать с «не найдена»."""
 
 
+class _StopAmbiguous(RuntimeError):
+    """Под цель подошло несколько сессий: выбирать за человека нельзя."""
+
+    def __init__(self, sessions: list[RemoteSession]) -> None:
+        super().__init__("под цель подошло несколько сессий")
+        self.sessions = sessions
+
+
 _MARK = {
     clauderc_sync.Outcome.updated: "⤵",
     clauderc_sync.Outcome.already: "=",
@@ -273,6 +394,13 @@ _OUTCOME_LABEL = {
 }
 
 
+def _current_version() -> str:
+    try:
+        return package_version("claude-rc")
+    except PackageNotFoundError:
+        return "unknown (пакет не установлен)"
+
+
 def _as_dict(session: RemoteSession) -> dict[str, Any]:
     return {
         "name": session.name,
@@ -283,13 +411,31 @@ def _as_dict(session: RemoteSession) -> dict[str, Any]:
     }
 
 
-async def _start(target: Path, branch: str | None, resume: str | None) -> RemoteSession:
+async def _start(
+    target: Path,
+    branch: str | None,
+    resume: str | None,
+    *,
+    pull: bool = False,
+    permission_mode: str | None = None,
+) -> RemoteSession:
+    if pull:
+        # До worktree, а не после: `git worktree add` ветвится от текущего HEAD,
+        # и на несвежем репозитории свежесозданный worktree тоже был бы несвежим.
+        # Но не под живой сессией: перематывать дерево, в котором прямо сейчас
+        # работает claude, нельзя — в боте этот случай закрыт так же.
+        if await find(str(target)) is not None:
+            print(f"· {target.name}\tв каталоге работает сессия — не тяну")
+        else:
+            result = await clauderc_sync.sync_one(target)
+            print(f"{_MARK[result.outcome]} {target.name}\t{result.branch}\t{result.detail}")
+
     cwd = target
     if branch:
         config = load_config(paths.config_file())
         cwd = await worktrees.ensure(target, branch, config.worktree_root)
     try:
-        return await launch(cwd.name, str(cwd), resume=resume)
+        return await launch(cwd.name, str(cwd), resume=resume, permission_mode=permission_mode)
     except TrustRequired as need:
         return await _ask_trust(need)
 
@@ -502,7 +648,14 @@ def _read_raw_toml(target: Path) -> dict[str, object] | None:
         return None
 
 
-_EXTRA_KEYS = ("worktree_root", "state_path", "scan_depth", "launch_timeout_s")
+_EXTRA_KEYS = (
+    "worktree_root",
+    "state_path",
+    "scan_depth",
+    "launch_timeout_s",
+    "permission_mode",
+    "pull_before_start",
+)
 
 
 def _current_extras(target: Path) -> dict[str, object]:
@@ -700,18 +853,24 @@ def _ask_roots(current: tuple[Path, ...] | None) -> tuple[Path, ...]:
 
 
 async def _stop(target: str) -> str | None:
-    """Гасит сессию по имени или каталогу.
+    """Гасит сессию по id, имени или каталогу.
 
     Существования каталога не требуем: worktree мог быть удалён, а сессия в нём
     остаться — именно её и нужно погасить.
+
+    Имя — это имя каталога, и оно не уникально: у трёх клонов одного репозитория
+    оно одно на всех. Выбрать за человека, какую из трёх гасить, нельзя, поэтому
+    на неоднозначность отвечаем отказом со списком id, а не гасим первую попавшуюся.
     """
-    wanted = os.path.realpath(Path(target).expanduser())
-    for session in await list_sessions():
-        if session.name == target or os.path.realpath(session.cwd) == wanted:
-            if not await kill_tmux(session.tmux_name):
-                raise _StopFailed(session.name)
-            return session.name
-    return None
+    matches = await resolve(target)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise _StopAmbiguous(matches)
+    session = matches[0]
+    if not await kill_tmux(session.tmux_name):
+        raise _StopFailed(session.name)
+    return session.name
 
 
 def _allowed_user_id_detail(value: int) -> str:
