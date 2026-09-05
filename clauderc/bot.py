@@ -520,15 +520,23 @@ async def main() -> None:
             )
             return
 
+        pull_note = ""
         if config.pull_before_start:
             # До worktree, а не после: `git worktree add` ветвится от текущего
             # HEAD, и на несвежем репозитории новый worktree тоже был бы несвежим.
-            line = (
+            pull_note = (
                 "⤵️ в каталоге работает сессия — не тяну"
                 if alive_here is not None
                 else _pull_line(await sync_mod.sync(target))
             )
-            await notice.edit_text(f"{head}\n{line}…", parse_mode="HTML")
+            await notice.edit_text(f"{head}\n{pull_note}…", parse_mode="HTML")
+
+        def told(text: str) -> str:
+            """Финальная карточка поверх промежуточной не должна съедать отчёт
+            о подтягивании: неудавшийся pull иначе не оставляет в чате следа,
+            а именно он и объясняет, на каком коде поднялась сессия.
+            """
+            return f"{pull_note}\n{text}" if pull_note else text
 
         cwd = target
         if branch:
@@ -536,7 +544,7 @@ async def main() -> None:
                 cwd = await worktrees.ensure(target, branch, config.worktree_root)
             except WorktreeError as exc:
                 await notice.edit_text(
-                    f"❌ Worktree не создан.\n<pre>{html.escape(str(exc))}</pre>"[:3800],
+                    told(f"❌ Worktree не создан.\n<pre>{html.escape(str(exc))}</pre>")[:3800],
                     parse_mode="HTML",
                 )
                 return
@@ -544,7 +552,7 @@ async def main() -> None:
         alive = await find(str(cwd))
         if alive is not None:
             await notice.edit_text(
-                f"Уже поднята.\n{_list_item(alive)}",
+                told(f"Уже поднята.\n{_list_item(alive)}"),
                 parse_mode="HTML",
                 reply_markup=_open_keyboard(alive.url),
             )
@@ -562,9 +570,11 @@ async def main() -> None:
             token = uuid.uuid4().hex[:8]
             trust_pending[token] = (need.tmux_name, need.cwd)
             await notice.edit_text(
-                "🔐 Claude впервые видит этот каталог и ждёт подтверждения.\n"
-                f"<code>{html.escape(need.cwd)}</code>\n\n"
-                "Он получит право читать, менять и запускать здесь файлы.",
+                told(
+                    "🔐 Claude впервые видит этот каталог и ждёт подтверждения.\n"
+                    f"<code>{html.escape(need.cwd)}</code>\n\n"
+                    "Он получит право читать, менять и запускать здесь файлы."
+                ),
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
@@ -584,13 +594,15 @@ async def main() -> None:
                 # опросил бы её как упавшую следом за этим же сообщением.
                 watcher.expect_death(exc.tmux_name)
             await notice.edit_text(
-                f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800],
+                told(f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>")[:3800],
                 parse_mode="HTML",
             )
             return
 
         await notice.edit_text(
-            _fresh_text(session), parse_mode="HTML", reply_markup=_open_keyboard(session.url)
+            told(_fresh_text(session)),
+            parse_mode="HTML",
+            reply_markup=_open_keyboard(session.url),
         )
 
     async def offer_start(message: Message, target: Path, branch: str | None) -> None:
