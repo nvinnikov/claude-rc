@@ -23,7 +23,7 @@ launch_timeout_s = 90
 
 # С какими правами поднимать сессии. Без него — как у claude по умолчанию, то есть
 # он спрашивает на каждом шаге, а с телефона это неудобно. Значения: default (оно же
-# manual), acceptEdits, plan, auto, dontAsk, bypassPermissions. Гейта прав на стороне бота
+# manual (ручной), acceptEdits, plan, auto, dontAsk, bypassPermissions. Гейта прав на стороне бота
 # по-прежнему нет — флаг только говорит claude, с чего начать.
 # permission_mode = "acceptEdits"
 

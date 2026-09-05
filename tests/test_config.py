@@ -205,3 +205,21 @@ def test_pull_before_start_rejects_a_non_boolean(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="pull_before_start"):
         load_config(cfg)
+
+
+def test_permission_mode_rejects_the_settings_name_the_flag_does_not_take(
+    tmp_path: Path,
+) -> None:
+    """`default` — имя ручного режима для settings.json, но не для флага.
+
+    `claude --permission-mode` его не принимает и с ним не стартует, а в
+    примерах документации он встречается — то есть это ровно та ошибка, ради
+    предотвращения которой белый список и заведён.
+    """
+    cfg = _write(
+        tmp_path,
+        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n'
+        'permission_mode = "default"\n',
+    )
+    with pytest.raises(ValueError, match="permission_mode"):
+        load_config(cfg)

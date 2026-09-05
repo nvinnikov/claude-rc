@@ -72,8 +72,8 @@ detached HEAD is left alone and history only ever fast-forwards. With `--branch`
 current HEAD, so pulling afterwards would leave the new worktree on stale code. The card says
 what the pull did, because a session silently started on old code is worse than no pull.
 
-**Permissions.** `permission_mode` picks what the session starts with — `default` (alias
-`manual`), `acceptEdits`, `plan`, `auto`, `dontAsk` or `bypassPermissions` — and it's checked when the
+**Permissions.** `permission_mode` picks what the session starts with — `manual`,
+`acceptEdits`, `plan`, `auto`, `dontAsk` or `bypassPermissions` — and it's checked when the
 config is read, since Claude refuses to start on an unknown mode and you'd see a dead session
 rather than a typo. This adds no gate on the bot's side; see
 [Permissions and trade-offs](#permissions-and-trade-offs). The CLI takes the same two as
