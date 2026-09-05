@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import json
 import sys
+import tomllib
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from urllib import request as request  # реэкспорт для mypy --strict: тесты его подменяют
 
+PACKAGE = "claude-rc"
 REPO_URL = "https://github.com/nvinnikov/claude-rc"
 RELEASES_API = "https://api.github.com/repos/nvinnikov/claude-rc/releases/latest"
 TAP = "nvinnikov/tap"
@@ -72,7 +74,10 @@ def detect(prefix: Path | None = None) -> Install:
         formula = parts[index + 1] if index + 1 < len(parts) else None
         return Install(Channel.brew, formula=formula)
 
-    if (root.parent / "pyproject.toml").is_file():
+    # Именно наш клон, а не любой каталог с pyproject.toml: `uv run claude-rc`
+    # из чужого проекта дал бы окружение с его pyproject рядом, и обновление
+    # ушло бы тянуть и собирать чужой репозиторий.
+    if _project_name(root.parent / "pyproject.toml") == PACKAGE:
         return Install(Channel.clone, root=root.parent)
 
     # ~/.local/share/uv/tools/claude-rc
@@ -80,6 +85,18 @@ def detect(prefix: Path | None = None) -> Install:
         return Install(Channel.uv_tool)
 
     return Install(Channel.unknown)
+
+
+def _project_name(pyproject: Path) -> str | None:
+    """`project.name` из pyproject.toml или None, если файла нет и он не читается."""
+    try:
+        with pyproject.open("rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    project = data.get("project")
+    name = project.get("name") if isinstance(project, dict) else None
+    return name if isinstance(name, str) else None
 
 
 def plan(install: Install, *, app_installed: bool) -> list[list[str]]:

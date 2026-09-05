@@ -361,10 +361,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// реже, а каждая проверка — поход в сеть.
     private static let updateInterval: TimeInterval = 6 * 60 * 60
     private static let autoUpdateKey = "autoUpdate"
+    private static let autoUpdateAttemptKey = "autoUpdateAttempt"
 
     private var autoUpdateEnabled: Bool {
         get { UserDefaults.standard.bool(forKey: Self.autoUpdateKey) }
         set { UserDefaults.standard.set(newValue, forKey: Self.autoUpdateKey) }
+    }
+
+    /// Версия, которую тумблер уже пробовал поставить. Переживает перезапуск
+    /// приложения намеренно: обновление само его и перезапускает, так что
+    /// память в оперативке от неудачной попытки не осталась бы.
+    private var autoUpdateAttempt: String? {
+        get { UserDefaults.standard.string(forKey: Self.autoUpdateAttemptKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.autoUpdateAttemptKey) }
     }
 
     private func scheduleUpdateChecks() {
@@ -395,8 +404,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 self.renderUpdate()
                 if Updater.shouldRunAutomatically(
-                    status: self.updateStatus, enabled: self.autoUpdateEnabled
+                    status: self.updateStatus,
+                    enabled: self.autoUpdateEnabled,
+                    lastAttempt: self.autoUpdateAttempt
                 ) {
+                    // Метку ставим до запуска, а не после: обновление гасит нас,
+                    // и «после» может не наступить.
+                    self.autoUpdateAttempt = self.updateStatus?.latest
                     Log.app("update: обновляемся сами, тумблер включён")
                     self.runUpdate()
                 }
@@ -425,8 +439,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleAutoUpdate() {
         autoUpdateEnabled = !autoUpdateEnabled
         Log.app("auto-update: \(autoUpdateEnabled ? "включён" : "выключен")")
-        renderUpdate()
-        if autoUpdateEnabled { checkForUpdate() }
+        if autoUpdateEnabled {
+            // Включение — это и есть «попробуй ещё раз»: память о неудачной
+            // попытке иначе молча съела бы намерение человека.
+            autoUpdateAttempt = nil
+            renderUpdate()
+            checkForUpdate()
+        } else {
+            renderUpdate()
+        }
     }
 
     /// Обновление идёт в Терминале, а не дочерним процессом: см. `Updater.script`.

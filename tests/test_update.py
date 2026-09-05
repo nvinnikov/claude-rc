@@ -14,8 +14,20 @@ def test_detect_brew_reads_the_formula_from_the_cellar_path() -> None:
 
 def test_detect_clone_by_the_pyproject_next_to_the_environment(tmp_path: Path) -> None:
     # Клон и `uv tool` различает не разбор пути, а файл-признак рядом.
-    (tmp_path / "pyproject.toml").write_text("[project]\n")
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "claude-rc"\n')
     assert detect(tmp_path / ".venv") == Install(Channel.clone, root=tmp_path)
+
+
+def test_detect_does_not_take_a_foreign_project_for_our_clone(tmp_path: Path) -> None:
+    # `uv run claude-rc` из чужого проекта даёт окружение с его pyproject рядом.
+    # Приняв его за наш клон, обновление ушло бы тянуть и собирать чужой репозиторий.
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "someone-else"\n')
+    assert detect(tmp_path / ".venv") == Install(Channel.unknown)
+
+
+def test_detect_survives_a_broken_pyproject(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("это не toml [[[")
+    assert detect(tmp_path / ".venv") == Install(Channel.unknown)
 
 
 def test_detect_uv_tool(tmp_path: Path) -> None:

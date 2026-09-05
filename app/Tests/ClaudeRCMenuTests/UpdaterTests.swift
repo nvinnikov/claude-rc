@@ -46,11 +46,39 @@ import Testing
     }
 
     @Test func runsByItselfOnlyWithTheToggleOnAndSomethingToInstall() {
-        #expect(Updater.shouldRunAutomatically(status: made(available: true), enabled: true))
+        #expect(
+            Updater.shouldRunAutomatically(
+                status: made(available: true), enabled: true, lastAttempt: nil
+            )
+        )
         // Тумблер выключен — молчим: обновление гасит приложение.
-        #expect(!Updater.shouldRunAutomatically(status: made(available: true), enabled: false))
-        #expect(!Updater.shouldRunAutomatically(status: made(available: false), enabled: true))
-        #expect(!Updater.shouldRunAutomatically(status: nil, enabled: true))
+        #expect(
+            !Updater.shouldRunAutomatically(
+                status: made(available: true), enabled: false, lastAttempt: nil
+            )
+        )
+        #expect(
+            !Updater.shouldRunAutomatically(
+                status: made(available: false), enabled: true, lastAttempt: nil
+            )
+        )
+        #expect(Updater.shouldRunAutomatically(status: nil, enabled: true, lastAttempt: nil) == false)
+    }
+
+    @Test func doesNotRetryTheSameVersionByItself() {
+        // Неудачное обновление иначе зацикливается: приложение открывается
+        // заново, проверка снова видит ту же версию и снова открывает Терминал.
+        #expect(
+            !Updater.shouldRunAutomatically(
+                status: made(available: true), enabled: true, lastAttempt: "0.3.0"
+            )
+        )
+        // Следующая версия — снова повод.
+        #expect(
+            Updater.shouldRunAutomatically(
+                status: made(available: true, latest: "0.4.0"), enabled: true, lastAttempt: "0.3.0"
+            )
+        )
     }
 
     @Test func scriptQuotesPathsAndAlwaysReopensTheApp() {

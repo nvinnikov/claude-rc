@@ -951,8 +951,12 @@ async def main() -> None:
             )
             return
         if await watcher.kill(matches[0].tmux_name):
+            # Называем найденное, а не набранное: на `/rckill ~/code/oms` ответ
+            # «Сессия ~/code/oms погашена» — про путь, а не про сессию.
             # Worktree намеренно остаётся: в нём может лежать несохранённая работа.
-            await message.reply(f"Сессия <b>{html.escape(name)}</b> погашена.", parse_mode="HTML")
+            await message.reply(
+                f"Сессия <b>{html.escape(matches[0].name)}</b> погашена.", parse_mode="HTML"
+            )
         else:
             await message.reply(
                 f"Не удалось погасить <code>{html.escape(name)}</code>.", parse_mode="HTML"

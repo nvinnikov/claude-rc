@@ -87,9 +87,18 @@ enum Updater {
     /// Обновление гасит приложение (переустановка кладёт файлы под работающим
     /// процессом, поэтому и `make install`, и каска сначала его убивают), так что
     /// делать это без спроса можно только по явно включённому тумблеру.
-    static func shouldRunAutomatically(status: Status?, enabled: Bool) -> Bool {
-        guard enabled, let status else { return false }
-        return status.available
+    ///
+    /// `lastAttempt` — версия, которую тумблер уже пробовал поставить. Без неё
+    /// неудачное обновление зациклилось бы: приложение открывается заново,
+    /// проверка снова видит ту же версию доступной и снова запускает Терминал.
+    /// Повторить ту же версию можно руками — пункт меню это позволяет всегда.
+    static func shouldRunAutomatically(
+        status: Status?, enabled: Bool, lastAttempt: String?
+    ) -> Bool {
+        guard enabled, let status, status.available, let latest = status.latest else {
+            return false
+        }
+        return latest != lastAttempt
     }
 
     /// Скрипт обновления для Терминала.
