@@ -2061,3 +2061,37 @@ def test_update_does_not_reinstall_a_clone_it_could_not_pull(
 
     assert cli.main(["update"]) == 1
     assert ran == []
+
+
+def test_update_json_is_machine_readable_and_never_installs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Этот вывод читает приложение в меню-баре."""
+    ran: list[list[str]] = []
+    _no_network(monkeypatch, "0.3.0")
+    monkeypatch.setattr(
+        update_mod, "detect", lambda: update_mod.Install(update_mod.Channel.uv_tool)
+    )
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: ran.append(cmd))
+
+    assert cli.main(["update", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["channel"] == "uv-tool"
+    assert payload["latest"] == "0.3.0"
+    assert payload["available"] is True
+    # --json подразумевает --check: машинный вывод нужен, чтобы решить, а не чтобы
+    # обновиться молча.
+    assert ran == []
+
+
+def test_update_json_says_nothing_is_available_without_network(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _no_network(monkeypatch, None)
+    monkeypatch.setattr(
+        update_mod, "detect", lambda: update_mod.Install(update_mod.Channel.uv_tool)
+    )
+    assert cli.main(["update", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["latest"] is None
+    assert payload["available"] is False

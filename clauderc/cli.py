@@ -97,6 +97,9 @@ def _parser() -> argparse.ArgumentParser:
     update_cmd.add_argument(
         "--check", action="store_true", help="только сказать, есть ли версия новее"
     )
+    # --json подразумевает --check: машинный вывод нужен, чтобы решить, обновляться
+    # ли, а не чтобы обновиться молча. Этим его читает приложение в меню-баре.
+    update_cmd.add_argument("--json", action="store_true", dest="as_json")
 
     sync_cmd = sub.add_parser("sync", help="подтянуть репозитории из origin")
     sync_cmd.add_argument("paths", nargs="*", help="каталоги (по умолчанию текущий)")
@@ -231,6 +234,23 @@ class _Commands:
     def update(args: argparse.Namespace) -> int:
         install = update_mod.detect()
         current = _current_version()
+
+        if args.as_json:
+            latest = update_mod.latest_release()
+            print(
+                json.dumps(
+                    {
+                        "channel": install.channel.value,
+                        "install": install.label,
+                        "current": current,
+                        "latest": latest,
+                        "available": latest is not None and update_mod.is_newer(latest, current),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+
         print(f"Установлено: {install.label}\nВерсия: {current}")
 
         latest = update_mod.latest_release()

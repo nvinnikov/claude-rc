@@ -460,7 +460,7 @@ uv tool install .
 | `claude-rc stop <name\|path>` / `claude-rc stop --all` | kill a session |
 | `claude-rc doctor [--json]` | check tmux, claude and the config |
 | `claude-rc setup` | first-run wizard — token, user_id, directories |
-| `claude-rc update [--check]` | update the tool the same way it was installed |
+| `claude-rc update [--check] [--json]` | update the tool the same way it was installed |
 | `claude-rc sync [paths…] [--branch b] [--no-fetch]` | fast-forward repositories from origin |
 | `claude-rc bot` | run the Telegram bot in the foreground — same as `make run` |
 
@@ -609,6 +609,25 @@ reported and the update goes ahead anyway.
 
 **The bot keeps running the old code until it is restarted** — `Stop bot` / `Start bot` in the
 menu bar app, or `claude-rc bot` again.
+
+#### From the menu bar
+
+The app checks for a new release at launch and every six hours, and the menu row says what it
+found: `Check for updates…` with the current version under it, or `Update to 0.3.0…` when
+there is something to install. `Update automatically` runs it without asking; the check
+itself happens either way.
+
+The check runs off the main thread (it goes to the network) and reads
+`claude-rc update --check --json` — the app never works out versions or install channels for
+itself, so the two can't disagree about them. `--json` implies `--check` and installs nothing.
+
+Updating opens Terminal rather than running silently, for two reasons at once. The update
+kills the app — reinstalling puts files under a running process, so both `make install` and
+the cask stop it first — and a child process would die with it half-way through. And the
+output of `git`, `make` or `brew` is worth seeing: a silent update that didn't work is worse
+than no update. The script stops the app itself before reinstalling (SIGTERM, so it shuts the
+bot down cleanly), and reopens it afterwards whether or not the update succeeded. Live
+sessions don't care: they belong to tmux, not to the bot.
 
 ## Releases
 
