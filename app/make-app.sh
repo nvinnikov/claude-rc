@@ -14,6 +14,13 @@ VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$HERE/../pyproject.toml" | head 
 swift build -c release --package-path "$HERE"
 BIN="$(swift build -c release --package-path "$HERE" --show-bin-path)/$NAME"
 
+# Каталог сборки закрыт от Spotlight: bundle id у сборочной копии тот же, что у
+# установленной в /Applications, и без этого файла поиск и Launchpad показывают
+# два ClaudeRC — человек запускает сборочный и не понимает, почему обновление
+# «не приехало». Файл переживает пересборку: ниже сносится только сам бандл.
+mkdir -p "$HERE/build"
+touch "$HERE/build/.metadata_never_index"
+
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp "$BIN" "$APP/Contents/MacOS/$NAME"
