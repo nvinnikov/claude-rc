@@ -12,6 +12,7 @@ from clauderc.bot import (
     _has_repos,
     _list_item,
     _pop_resume_group,
+    _pull_line,
     _resume_keyboard,
     _same_session,
     _selected_targets,
@@ -301,3 +302,20 @@ def test_same_session_rejects_a_relaunch_in_the_same_directory() -> None:
 
 def test_same_session_handles_a_directory_with_no_session() -> None:
     assert _same_session(None, 1000) is None
+
+
+def test_pull_line_reports_what_the_pull_did() -> None:
+    # Молча тянуть нельзя: человек должен видеть, на каком коде поднимается сессия.
+    result = SyncResult(Path("/repos/oms"), Outcome.updated, "подтянуто 3", "main")
+    assert _pull_line(result) == "⤵️ main: подтянуто 3"
+
+
+def test_pull_line_names_a_directory_that_is_not_a_repo() -> None:
+    result = SyncResult(Path("/services"), Outcome.skipped, "не рабочая копия git", "?")
+    assert _pull_line(result) == "⤵️ не git-репозиторий, тянуть нечего"
+
+
+def test_pull_line_escapes_html() -> None:
+    result = SyncResult(Path("/repos/oms"), Outcome.failed, "<evil>", "<b>")
+    line = _pull_line(result)
+    assert "&lt;evil&gt;" in line and "&lt;b&gt;" in line

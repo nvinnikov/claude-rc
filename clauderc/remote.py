@@ -29,6 +29,9 @@ log = logging.getLogger("clauderc.remote")
 
 PREFIX = "rc-"
 CLAUDE_BIN = "claude"
+# Режимы прав, которые понимает claude. Проверяем на своей стороне, чтобы
+# опечатка называлась при чтении конфига, а не гасила сессию при старте.
+PERMISSION_MODES = ("default", "manual", "acceptEdits", "plan", "auto", "bypassPermissions")
 # Имя отдельного tmux-сервера (`tmux -L <имя>`). Пустая/отсутствующая — сервер
 # по умолчанию, тот же, где живут рабочие сессии.
 TMUX_SOCKET_ENV = "CLAUDE_RC_TMUX_SOCKET"
@@ -286,6 +289,16 @@ async def kill_all() -> int:
     return killed
 
 
+def _permission_flag(mode: str | None) -> str:
+    """Хвост командной строки для режима прав.
+
+    Права выдаются в приложении Claude, и гейта на нашей стороне не появляется:
+    флаг только говорит claude, с чем начинать, чтобы сессия не останавливалась
+    на каждом шаге у человека, который сейчас с телефоном в руках.
+    """
+    return f" --permission-mode {shlex.quote(mode)}" if mode else ""
+
+
 def _resume_flag(resume: str | None) -> str:
     """Хвост командной строки для резюма диалога."""
     if resume is None:
@@ -296,12 +309,19 @@ def _resume_flag(resume: str | None) -> str:
 
 
 async def launch(
-    repo: str, cwd: str, *, timeout_s: float = 90.0, resume: str | None = None
+    repo: str,
+    cwd: str,
+    *,
+    timeout_s: float = 90.0,
+    resume: str | None = None,
+    permission_mode: str | None = None,
 ) -> RemoteSession:
     """Поднимает RC-сессию в `cwd` и ждёт, пока claude напечатает ссылку.
 
     `resume` продолжает прежний диалог (`"last"` — последний, id — конкретный);
     проверка на уже живую сессию в `cwd` его не отменяет — сессия одна на каталог.
+
+    `permission_mode` — с какими правами начинать (см. `PERMISSION_MODES`).
     """
     if not tmux_available():
         raise LaunchError("tmux не найден в PATH — поставь через `brew install tmux`")
@@ -314,6 +334,7 @@ async def launch(
     command = (
         _SCRUB_ENV
         + f"exec {shlex.quote(CLAUDE_BIN)} --remote-control {shlex.quote(repo)}"
+        + _permission_flag(permission_mode)
         + _resume_flag(resume)
     )
     await _run("new-session", "-d", "-s", name, "-x", _COLS, "-y", _ROWS, "-c", cwd, command)

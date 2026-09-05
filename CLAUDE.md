@@ -53,6 +53,10 @@ uv run claude-rc update --check  # как поставлено, какая ве�
 | `clauderc/watch.py` | опрос tmux: замечает исчезнувшие сессии, метит намеренные гашения |
 | `clauderc/cli.py` | команда `claude-rc`: те же действия из терминала |
 | `clauderc/update.py` | канал установки и команда обновления для него |
+
+Права и подтягивание решаются до запуска, а не во время: `permission_mode` уходит в
+`--permission-mode`, `pull_before_start` — в `sync` **до** создания worktree, потому что
+`git worktree add` ветвится от текущего HEAD.
 | `clauderc/sync.py` | состояние репозитория относительно origin и подтягивание — общее для бота и CLI |
 | `app/` | Swift-пакет `ClaudeRCMenu`: приложение в меню-баре, владеющее процессом бота |
 

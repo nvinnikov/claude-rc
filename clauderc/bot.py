@@ -192,6 +192,17 @@ def _same_session(session: RemoteSession | None, created_at: int) -> RemoteSessi
     return session
 
 
+def _pull_line(result: SyncResult) -> str:
+    """Что дало подтягивание перед запуском — одной строкой в карточке.
+
+    Молча тянуть нельзя: человек должен видеть, на каком коде поднимается
+    сессия, особенно когда подтянуть не вышло и код остался прежним.
+    """
+    if result.outcome is Outcome.skipped and result.branch == "?":
+        return "⤵️ не git-репозиторий, тянуть нечего"
+    return f"⤵️ {html.escape(result.branch)}: {html.escape(result.detail)}"
+
+
 def _attach_line(session: RemoteSession) -> str:
     """Имя tmux-сессии — второй вход в неё, кроме ссылки.
 
@@ -496,6 +507,12 @@ async def main() -> None:
             head += f"\nветка <code>{html.escape(branch)}</code>"
         notice = await message.answer(head + "…", parse_mode="HTML")
 
+        if config.pull_before_start:
+            # До worktree, а не после: `git worktree add` ветвится от текущего
+            # HEAD, и на несвежем репозитории новый worktree тоже был бы несвежим.
+            pulled = await sync_mod.sync(target)
+            await notice.edit_text(f"{head}\n{_pull_line(pulled)}…", parse_mode="HTML")
+
         cwd = target
         if branch:
             try:
@@ -518,7 +535,11 @@ async def main() -> None:
 
         try:
             session = await launch(
-                cwd.name, str(cwd), timeout_s=config.launch_timeout_s, resume=resume
+                cwd.name,
+                str(cwd),
+                timeout_s=config.launch_timeout_s,
+                resume=resume,
+                permission_mode=config.permission_mode,
             )
         except TrustRequired as need:
             token = uuid.uuid4().hex[:8]

@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from clauderc.remote import PERMISSION_MODES
+
 
 @dataclass(frozen=True)
 class Config:
@@ -13,6 +15,8 @@ class Config:
     state_path: Path
     scan_depth: int
     launch_timeout_s: float
+    permission_mode: str | None
+    pull_before_start: bool
 
 
 def load_config(path: Path) -> Config:
@@ -38,6 +42,8 @@ def load_config(path: Path) -> Config:
     state_path = _require_path(raw, "state_path", "~/.claude-rc/state.json")
     scan_depth = _require_int(raw, "scan_depth", default=3)
     launch_timeout_s = _require_number(raw, "launch_timeout_s", default=90)
+    permission_mode = _require_permission_mode(raw)
+    pull_before_start = _require_bool(raw, "pull_before_start", default=False)
 
     missing = [str(p) for p in roots if not p.is_dir()]
     if missing:
@@ -52,6 +58,8 @@ def load_config(path: Path) -> Config:
         state_path=state_path,
         scan_depth=scan_depth,
         launch_timeout_s=launch_timeout_s,
+        permission_mode=permission_mode,
+        pull_before_start=pull_before_start,
     )
 
 
@@ -59,6 +67,35 @@ def _require_str(raw: dict[str, Any], key: str) -> str:
     value = raw[key]  # KeyError на отсутствии — тот же контракт, что и раньше
     if not isinstance(value, str):
         raise ValueError(f"{key}: ожидалась строка")
+    return value
+
+
+def _require_permission_mode(raw: dict[str, Any]) -> str | None:
+    """Режим прав для новых сессий или None — «как у claude по умолчанию».
+
+    Опечатку называем здесь: claude на неизвестном режиме отказывается
+    стартовать, и человек увидел бы не «в конфиге не тот режим», а мёртвую
+    сессию без объяснений.
+    """
+    value = raw.get("permission_mode")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("permission_mode: ожидалась строка")
+    mode = value.strip()
+    if not mode:
+        return None
+    if mode not in PERMISSION_MODES:
+        raise ValueError(
+            f"permission_mode: {mode!r} — ожидалось одно из {', '.join(PERMISSION_MODES)}"
+        )
+    return mode
+
+
+def _require_bool(raw: dict[str, Any], key: str, *, default: bool) -> bool:
+    value = raw.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{key}: ожидалось true или false")
     return value
 
 

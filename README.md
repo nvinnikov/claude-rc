@@ -60,6 +60,25 @@ From the phone it looks like this:
 3. `▶️ Start Claude RC` — or `🌿 New worktree`, if something is already running there;
 4. the link arrives → `Open in Claude` → you're working.
 
+## What a session starts with
+
+A session that stops to ask something is a session you have to be at a keyboard for, so two
+things are decided before it starts rather than during it.
+
+**Fresh code.** With `pull_before_start = true` the working directory is fast-forwarded from
+origin first, by `claude-rc sync` — the same rules as everywhere else, so a dirty tree or a
+detached HEAD is left alone and history only ever fast-forwards. With `--branch`, the
+*repository* is pulled before the worktree is created: `git worktree add` branches from the
+current HEAD, so pulling afterwards would leave the new worktree on stale code. The card says
+what the pull did, because a session silently started on old code is worse than no pull.
+
+**Permissions.** `permission_mode` picks what the session starts with — `default` (alias
+`manual`), `acceptEdits`, `plan`, `auto` or `bypassPermissions` — and it's checked when the
+config is read, since Claude refuses to start on an unknown mode and you'd see a dead session
+rather than a typo. This adds no gate on the bot's side; see
+[Permissions and trade-offs](#permissions-and-trade-offs). The CLI takes the same two as
+flags: `claude-rc start --pull --permission-mode acceptEdits`.
+
 ## The four surfaces of a session
 
 A running Claude Code session can be reached in four different ways, and they are easy to
@@ -398,8 +417,8 @@ It writes `~/.config/claude-rc/config.toml` with mode `600` (and the directory `
 that file holds a live token; a repeat run narrows the permissions even if the file used to
 be wider. A repeat `claude-rc setup` pre-fills the previous values as hints and changes only
 what you answer — an empty answer keeps the old value. Four technical fields the wizard
-never asks about (`worktree_root`, `state_path`, `scan_depth`, `launch_timeout_s`) are
-carried over verbatim on rewrite; anything else outside that list (including human
+never asks about (`worktree_root`, `state_path`, `scan_depth`, `launch_timeout_s`,
+`permission_mode`, `pull_before_start`) are carried over verbatim on rewrite; anything else outside that list (including human
 comments) is not preserved.
 
 Then open the ClaudeRC app or run `claude-rc bot`.
@@ -417,6 +436,9 @@ Then open the ClaudeRC app or run `claude-rc bot`.
    - `bot_token` — from @BotFather
    - `allowed_user_id` — your Telegram user_id (ask @userinfobot)
    - `rc_roots` — where to look for repositories
+   - `permission_mode` — optional: what a session starts with, so it doesn't stop and
+     ask at every step while you're holding a phone
+   - `pull_before_start` — optional: fetch origin before a session starts
 3. `chmod 600 config.toml`
 
 The config is looked up in order: the path in `$CLAUDE_RC_CONFIG` if set; otherwise
@@ -456,7 +478,7 @@ uv tool install .
 |---|---|
 | `claude-rc version` | version |
 | `claude-rc sessions [--json]` | live RC sessions |
-| `claude-rc start [path] [--branch b] [--resume last\|id]` | start a session (default: current directory) |
+| `claude-rc start [path] [--branch b] [--resume last\|id] [--pull] [--permission-mode m]` | start a session (default: current directory) |
 | `claude-rc stop <name\|path>` / `claude-rc stop --all` | kill a session |
 | `claude-rc doctor [--json]` | check tmux, claude and the config |
 | `claude-rc setup` | first-run wizard — token, user_id, directories |

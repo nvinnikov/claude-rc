@@ -29,6 +29,7 @@ from clauderc import update as update_mod  # _Commands.update затенил б�
 from clauderc import worktrees as worktrees  # тесты подменяют cli.worktrees.ensure
 from clauderc.config import load_config as load_config  # тесты читают cli.load_config
 from clauderc.remote import (
+    PERMISSION_MODES,
     LaunchError,
     RemoteSession,
     TrustRequired,
@@ -83,6 +84,13 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("path", nargs="?", default=".", help="каталог (по умолчанию текущий)")
     start.add_argument("--branch", help="создать worktree под ветку")
     start.add_argument("--resume", help="продолжить диалог: last или id")
+    start.add_argument("--pull", action="store_true", help="подтянуть origin перед запуском")
+    start.add_argument(
+        "--permission-mode",
+        dest="permission_mode",
+        choices=PERMISSION_MODES,
+        help="с какими правами начинать сессию",
+    )
 
     stop = sub.add_parser("stop", help="погасить сессию")
     stop.add_argument("target", nargs="?", help="имя сессии или каталог")
@@ -166,7 +174,15 @@ class _Commands:
                 print(f"--branch нужен рабочий config.toml: {config_path}: {exc}", file=sys.stderr)
                 return EXIT_ENVIRONMENT
         try:
-            session = asyncio.run(_start(target, args.branch, args.resume))
+            session = asyncio.run(
+                _start(
+                    target,
+                    args.branch,
+                    args.resume,
+                    pull=args.pull,
+                    permission_mode=args.permission_mode,
+                )
+            )
         except (LaunchError, WorktreeError) as exc:
             print(str(exc), file=sys.stderr)
             return EXIT_FAILED
@@ -376,13 +392,26 @@ def _as_dict(session: RemoteSession) -> dict[str, Any]:
     }
 
 
-async def _start(target: Path, branch: str | None, resume: str | None) -> RemoteSession:
+async def _start(
+    target: Path,
+    branch: str | None,
+    resume: str | None,
+    *,
+    pull: bool = False,
+    permission_mode: str | None = None,
+) -> RemoteSession:
+    if pull:
+        # До worktree, а не после: `git worktree add` ветвится от текущего HEAD,
+        # и на несвежем репозитории свежесозданный worktree тоже был бы несвежим.
+        result = await clauderc_sync.sync(target)
+        print(f"{_MARK[result.outcome]} {target.name}\t{result.branch}\t{result.detail}")
+
     cwd = target
     if branch:
         config = load_config(paths.config_file())
         cwd = await worktrees.ensure(target, branch, config.worktree_root)
     try:
-        return await launch(cwd.name, str(cwd), resume=resume)
+        return await launch(cwd.name, str(cwd), resume=resume, permission_mode=permission_mode)
     except TrustRequired as need:
         return await _ask_trust(need)
 
@@ -595,7 +624,14 @@ def _read_raw_toml(target: Path) -> dict[str, object] | None:
         return None
 
 
-_EXTRA_KEYS = ("worktree_root", "state_path", "scan_depth", "launch_timeout_s")
+_EXTRA_KEYS = (
+    "worktree_root",
+    "state_path",
+    "scan_depth",
+    "launch_timeout_s",
+    "permission_mode",
+    "pull_before_start",
+)
 
 
 def _current_extras(target: Path) -> dict[str, object]:

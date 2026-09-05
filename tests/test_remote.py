@@ -593,3 +593,59 @@ async def test_trust_is_confirmed_by_choice_number_not_by_enter(
         assert session.url == url
     finally:
         await remote._run("kill-server", check=False)
+
+
+async def test_launch_passes_the_permission_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Права выдаются в приложении Claude; флаг лишь говорит, с чем начинать."""
+    created: list[tuple[str, ...]] = []
+
+    def handler(*args: str) -> tuple[int, str]:
+        if args[0] == "new-session":
+            created.append(args)
+        return 0, ""
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    monkeypatch.setattr(remote, "_POLL_S", 0.0)
+
+    with pytest.raises(LaunchError):
+        await remote.launch("oms", "/repos/oms", timeout_s=0.05, permission_mode="acceptEdits")
+
+    assert "--permission-mode acceptEdits" in created[0][-1]
+
+
+async def test_launch_without_a_permission_mode_adds_no_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[tuple[str, ...]] = []
+
+    def handler(*args: str) -> tuple[int, str]:
+        if args[0] == "new-session":
+            created.append(args)
+        return 0, ""
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    monkeypatch.setattr(remote, "_POLL_S", 0.0)
+
+    with pytest.raises(LaunchError):
+        await remote.launch("oms", "/repos/oms", timeout_s=0.05)
+
+    assert "--permission-mode" not in created[0][-1]
+
+
+async def test_permission_mode_is_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Режим приходит из конфига, то есть снаружи: в командную строку tmux он
+    # попадает проквотированным, а не как есть.
+    created: list[tuple[str, ...]] = []
+
+    def handler(*args: str) -> tuple[int, str]:
+        if args[0] == "new-session":
+            created.append(args)
+        return 0, ""
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    monkeypatch.setattr(remote, "_POLL_S", 0.0)
+
+    with pytest.raises(LaunchError):
+        await remote.launch("oms", "/repos/oms", timeout_s=0.05, permission_mode="a b")
+
+    assert "--permission-mode 'a b'" in created[0][-1]
