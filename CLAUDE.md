@@ -31,6 +31,7 @@ make install-app   # то же, что install: install-tool + сборка и �
 uv run pytest tests/test_remote.py::test_launch_stores_url_in_tmux_option  # один тест
 
 uv run claude-rc                 # те же действия бота из терминала (`claude-rc bot` = `make run`)
+uv run claude-rc update --check  # как поставлено, какая версия, есть ли новее
 ```
 
 Гейт должен быть зелёным перед коммитом. `mypy --strict` включён на весь код и тесты —
@@ -51,6 +52,7 @@ uv run claude-rc                 # те же действия бота из те
 | `clauderc/history.py` | диалоги Claude Code для каталога (для резюма) |
 | `clauderc/watch.py` | опрос tmux: замечает исчезнувшие сессии, метит намеренные гашения |
 | `clauderc/cli.py` | команда `claude-rc`: те же действия из терминала |
+| `clauderc/update.py` | канал установки и команда обновления для него |
 | `clauderc/sync.py` | состояние репозитория относительно origin и подтягивание — общее для бота и CLI |
 | `app/` | Swift-пакет `ClaudeRCMenu`: приложение в меню-баре, владеющее процессом бота |
 

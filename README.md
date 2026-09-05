@@ -460,6 +460,7 @@ uv tool install .
 | `claude-rc stop <name\|path>` / `claude-rc stop --all` | kill a session |
 | `claude-rc doctor [--json]` | check tmux, claude and the config |
 | `claude-rc setup` | first-run wizard — token, user_id, directories |
+| `claude-rc update [--check]` | update the tool the same way it was installed |
 | `claude-rc sync [paths…] [--branch b] [--no-fetch]` | fast-forward repositories from origin |
 | `claude-rc bot` | run the Telegram bot in the foreground — same as `make run` |
 
@@ -583,6 +584,31 @@ ends up on Telegram's servers. A deliberate trade-off for the convenience of res
 be turned off without touching code: don't use the resume fork — start sessions via
 `🌿 New worktree` or `/rc <repo> <branch>`; a fresh worktree has no history and nothing to
 preview.
+
+### Updating
+
+```bash
+claude-rc update --check    # what's installed, what version, is there a newer one
+claude-rc update            # update it
+```
+
+There is nothing to configure and nothing to remember: the command works out how this copy
+was installed from the environment it is running in, and runs that channel's own command.
+A clone is fast-forwarded and reinstalled (`make install`, or `make install-tool` when the
+app isn't there); a `uv tool` install is reinstalled from git; a Homebrew install is
+`brew upgrade`d, with the cask too when the app is present. The install channel is read from
+the running environment's path rather than from `claude-rc` on `PATH` — the name is the same
+in all three cases, the path is not.
+
+The clone is pulled by `claude-rc sync`, so its rules apply as they do everywhere else: a
+dirty tree or a detached HEAD is left alone, and history only ever fast-forwards. Nothing is
+reinstalled when nothing was pulled.
+
+Checking the latest release needs the network, but updating doesn't: an unreachable GitHub is
+reported and the update goes ahead anyway.
+
+**The bot keeps running the old code until it is restarted** — `Stop bot` / `Start bot` in the
+menu bar app, or `claude-rc bot` again.
 
 ## Releases
 

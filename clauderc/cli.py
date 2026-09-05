@@ -25,6 +25,7 @@ from typing import Any, NamedTuple
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
 from clauderc import setup as setup  # тесты подменяют cli.setup.verify_token/catch_user_id
 from clauderc import sync as clauderc_sync  # _Commands.sync затенил бы модуль sync
+from clauderc import update as update_mod  # _Commands.update затенил бы модуль update
 from clauderc import worktrees as worktrees  # тесты подменяют cli.worktrees.ensure
 from clauderc.config import load_config as load_config  # тесты читают cli.load_config
 from clauderc.remote import (
@@ -92,6 +93,11 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("setup", help="заполнить config.toml: токен, user_id, каталоги")
 
+    update_cmd = sub.add_parser("update", help="обновить claude-rc тем же способом, каким ставили")
+    update_cmd.add_argument(
+        "--check", action="store_true", help="только сказать, есть ли версия новее"
+    )
+
     sync_cmd = sub.add_parser("sync", help="подтянуть репозитории из origin")
     sync_cmd.add_argument("paths", nargs="*", help="каталоги (по умолчанию текущий)")
     sync_cmd.add_argument("--branch", help="переключить на ветку перед подтягиванием")
@@ -112,10 +118,7 @@ class _Commands:
 
     @staticmethod
     def version(args: argparse.Namespace) -> int:
-        try:
-            print(package_version("claude-rc"))
-        except PackageNotFoundError:
-            print("unknown (пакет не установлен)")
+        print(_current_version())
         return 0
 
     @staticmethod
@@ -225,6 +228,55 @@ class _Commands:
             return EXIT_ENVIRONMENT
 
     @staticmethod
+    def update(args: argparse.Namespace) -> int:
+        install = update_mod.detect()
+        current = _current_version()
+        print(f"Установлено: {install.label}\nВерсия: {current}")
+
+        latest = update_mod.latest_release()
+        if latest is None:
+            print("Последний релиз узнать не вышло — сеть недоступна или GitHub не ответил.")
+        elif update_mod.is_newer(latest, current):
+            print(f"Доступна {latest}.")
+        else:
+            print(f"Новее нет (последний релиз {latest}).")
+
+        if args.check:
+            return 0
+
+        commands = update_mod.plan(install, app_installed=update_mod.APP_PATH.is_dir())
+        if not commands:
+            print(
+                "Обновлять нечем: способ установки не опознан.\n"
+                f"Поставь заново по README: {update_mod.REPO_URL}",
+                file=sys.stderr,
+            )
+            return EXIT_ENVIRONMENT
+
+        if install.channel is update_mod.Channel.clone and install.root is not None:
+            # Правила про грязное дерево, отсоединённый HEAD и перемотку только
+            # вперёд уже написаны и проверены в sync — своих здесь не выдумываем.
+            result = asyncio.run(clauderc_sync.sync(install.root))
+            print(f"{_MARK[result.outcome]} {install.root.name}\t{result.detail}")
+            if result.outcome is clauderc_sync.Outcome.failed:
+                return EXIT_FAILED
+            if result.outcome is clauderc_sync.Outcome.skipped:
+                print("Клон не подтянут — обновлять нечего.", file=sys.stderr)
+                return EXIT_FAILED
+
+        for command in commands:
+            print("$ " + " ".join(command))
+            if subprocess.run(command).returncode != 0:
+                print("Команда обновления не отработала.", file=sys.stderr)
+                return EXIT_FAILED
+
+        print(
+            "Готово. Бот работает старым кодом, пока его не перезапустить: "
+            "Stop bot / Start bot в приложении или заново `claude-rc bot`."
+        )
+        return 0
+
+    @staticmethod
     def sync(args: argparse.Namespace) -> int:
         explicit = [Path(p) for p in args.paths]
         targets = clauderc_sync.resolve_targets(explicit)
@@ -285,6 +337,13 @@ _OUTCOME_LABEL = {
     clauderc_sync.Outcome.skipped: "пропущено",
     clauderc_sync.Outcome.failed: "не получилось",
 }
+
+
+def _current_version() -> str:
+    try:
+        return package_version("claude-rc")
+    except PackageNotFoundError:
+        return "unknown (пакет не установлен)"
 
 
 def _as_dict(session: RemoteSession) -> dict[str, Any]:
