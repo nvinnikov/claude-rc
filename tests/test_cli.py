@@ -2095,3 +2095,45 @@ def test_update_json_says_nothing_is_available_without_network(
     payload = json.loads(capsys.readouterr().out)
     assert payload["latest"] is None
     assert payload["available"] is False
+
+
+def test_update_json_is_not_available_when_there_is_nothing_to_install(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Приложение по `available` решает, гасить ли себя вместе с ботом.
+
+    На неопознанном канале обновлять нечем, и «есть версия новее» здесь
+    означало бы, что оно погасится впустую и упрётся в отказ.
+    """
+    _no_network(monkeypatch, "9.9.9")
+    monkeypatch.setattr(
+        update_mod, "detect", lambda: update_mod.Install(update_mod.Channel.unknown)
+    )
+    assert cli.main(["update", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["latest"] == "9.9.9"
+    assert payload["available"] is False
+
+
+def test_start_pull_leaves_a_directory_with_a_live_session_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Перематывать дерево, в котором прямо сейчас работает claude, нельзя."""
+    pulled: list[Path] = []
+
+    async def fake_find(cwd: str) -> RemoteSession:
+        return _session()
+
+    async def fake_sync(repo: Path, **kwargs: object) -> None:
+        pulled.append(repo)
+
+    async def fake_launch(*args: object, **kwargs: object) -> RemoteSession:
+        return _session()
+
+    monkeypatch.setattr(cli, "find", fake_find)
+    monkeypatch.setattr(cli.sync, "sync", fake_sync)
+    monkeypatch.setattr(cli, "launch", fake_launch)
+
+    assert cli.main(["start", str(tmp_path), "--pull"]) == 0
+    assert pulled == []
+    assert "не тяну" in capsys.readouterr().out

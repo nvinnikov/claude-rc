@@ -36,6 +36,7 @@ from clauderc.remote import (
     attach_command,
     await_url,
     confirm_trust,
+    find,
     kill_all,
     kill_tmux,
     launch,
@@ -253,6 +254,13 @@ class _Commands:
 
         if args.as_json:
             latest = update_mod.latest_release()
+            # `available` — не «есть версия новее», а «есть что поставить»:
+            # приложение по этому полю решает, гасить ли себя вместе с ботом,
+            # и на неопознанном канале погасило бы впустую.
+            newer = latest is not None and update_mod.is_newer(latest, current)
+            installable = bool(
+                update_mod.plan(install, app_installed=update_mod.APP_PATH.is_dir(), version=latest)
+            )
             print(
                 json.dumps(
                     {
@@ -260,7 +268,7 @@ class _Commands:
                         "install": install.label,
                         "current": current,
                         "latest": latest,
-                        "available": latest is not None and update_mod.is_newer(latest, current),
+                        "available": newer and installable,
                     },
                     ensure_ascii=False,
                 )
@@ -405,8 +413,13 @@ async def _start(
     if pull:
         # До worktree, а не после: `git worktree add` ветвится от текущего HEAD,
         # и на несвежем репозитории свежесозданный worktree тоже был бы несвежим.
-        result = await clauderc_sync.sync(target)
-        print(f"{_MARK[result.outcome]} {target.name}\t{result.branch}\t{result.detail}")
+        # Но не под живой сессией: перематывать дерево, в котором прямо сейчас
+        # работает claude, нельзя — в боте этот случай закрыт так же.
+        if await find(str(target)) is not None:
+            print(f"· {target.name}\tв каталоге работает сессия — не тяну")
+        else:
+            result = await clauderc_sync.sync(target)
+            print(f"{_MARK[result.outcome]} {target.name}\t{result.branch}\t{result.detail}")
 
     cwd = target
     if branch:
