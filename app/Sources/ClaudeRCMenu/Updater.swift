@@ -62,13 +62,24 @@ enum Updater {
         return parse(pipe.fileHandleForReading.readDataToEndOfFile())
     }
 
+    /// Ставит ли нажатие обновление — или только спрашивает про версию.
+    ///
+    /// Один признак и на заголовок, и на действие: «Check for updates…»,
+    /// которое гасит приложение вместе с ботом и переустанавливает тулзу, —
+    /// худший вид сюрприза, а разойтись эти двое могут только если решаются
+    /// порознь.
+    static func installsOnClick(status: Status?) -> Bool {
+        guard let status else { return false }
+        return status.available && status.latest != nil
+    }
+
     /// Заголовок пункта меню.
     ///
     /// Версию в заголовке показываем только когда она есть и новее: «Update to
     /// 0.3.0…» — это уже причина нажать, а «Check for updates…» — предложение
     /// сходить в сеть.
     static func menuTitle(for status: Status?) -> String {
-        guard let status, status.available, let latest = status.latest else {
+        guard installsOnClick(status: status), let latest = status?.latest else {
             return "Check for updates…"
         }
         return "Update to \(latest)…"

@@ -28,6 +28,23 @@ import Testing
         #expect(Updater.parse("claude-rc: command not found".data(using: .utf8)!) == nil)
     }
 
+    @Test func clickInstallsOnlyWhenThereIsSomethingToInstall() {
+        // Пункт с надписью «Check for updates…» не должен гасить бота и
+        // переустанавливать тулзу: заголовок и действие решаются одним признаком.
+        #expect(!Updater.installsOnClick(status: nil))
+        #expect(!Updater.installsOnClick(status: made(available: false)))
+        #expect(!Updater.installsOnClick(status: made(available: true, latest: nil)))
+        #expect(Updater.installsOnClick(status: made(available: true)))
+    }
+
+    @Test func titleAndActionAgree() {
+        for status in [nil, made(available: false), made(available: true)] {
+            let installs = Updater.installsOnClick(status: status)
+            let promises = Updater.menuTitle(for: status).hasPrefix("Update to ")
+            #expect(installs == promises)
+        }
+    }
+
     @Test func menuTitleNamesTheVersionOnlyWhenThereIsOne() {
         #expect(Updater.menuTitle(for: nil) == "Check for updates…")
         #expect(Updater.menuTitle(for: made(available: false)) == "Check for updates…")

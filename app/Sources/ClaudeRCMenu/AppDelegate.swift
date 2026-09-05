@@ -150,7 +150,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        updateRow.action = #selector(runUpdate)
+        // Действие ставится в renderUpdate вместе с заголовком: пункт с
+        // надписью «Check for updates…» не должен гасить бота и переустанавливать
+        // тулзу.
         updateRow.target = self
         menu.addItem(updateRow)
 
@@ -420,6 +422,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func renderUpdate() {
         updateRow.title = Updater.menuTitle(for: updateStatus)
+        updateRow.action =
+            Updater.installsOnClick(status: updateStatus)
+            ? #selector(runUpdate) : #selector(checkForUpdateNow)
         updateRow.isEnabled = cli != nil && !updateCheckInFlight
         autoUpdateRow.state = autoUpdateEnabled ? .on : .off
         autoUpdateRow.isEnabled = cli != nil
@@ -432,6 +437,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let note = Updater.menuNote(for: updateStatus)
         updateNoteRow.title = note
         updateNoteRow.isHidden = note.isEmpty
+    }
+
+    /// Обёртка для пункта меню: `checkForUpdate` зовётся и из таймера, и из
+    /// колбэка, а `@objc` нужен только меню.
+    @objc private func checkForUpdateNow() {
+        checkForUpdate()
     }
 
     /// Тумблер включили — проверяем сразу: ждать шесть часов с уже вышедшим

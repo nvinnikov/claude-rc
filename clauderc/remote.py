@@ -31,7 +31,17 @@ PREFIX = "rc-"
 CLAUDE_BIN = "claude"
 # Режимы прав, которые понимает claude. Проверяем на своей стороне, чтобы
 # опечатка называлась при чтении конфига, а не гасила сессию при старте.
-PERMISSION_MODES = ("default", "manual", "acceptEdits", "plan", "auto", "bypassPermissions")
+# `default` — конфигурационное имя ручного режима (доки приводят
+# `claude --permission-mode default` в примерах), `manual` — его псевдоним.
+PERMISSION_MODES = (
+    "default",
+    "manual",
+    "acceptEdits",
+    "plan",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+)
 # Имя отдельного tmux-сервера (`tmux -L <имя>`). Пустая/отсутствующая — сервер
 # по умолчанию, тот же, где живут рабочие сессии.
 TMUX_SOCKET_ENV = "CLAUDE_RC_TMUX_SOCKET"

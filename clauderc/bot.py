@@ -507,11 +507,28 @@ async def main() -> None:
             head += f"\nветка <code>{html.escape(branch)}</code>"
         notice = await message.answer(head + "…", parse_mode="HTML")
 
+        # Живую сессию ищем до подтягивания: тап по каталогу, где она уже
+        # работает, ничего не запускает — и перематывать под ней дерево тем
+        # более незачем. Для ветки живая сессия в самом репозитории запуск не
+        # отменяет (worktree будет свой), но тянуть репозиторий под ней нельзя.
+        alive_here = await find(str(target))
+        if alive_here is not None and branch is None:
+            await notice.edit_text(
+                f"Уже поднята.\n{_list_item(alive_here)}",
+                parse_mode="HTML",
+                reply_markup=_open_keyboard(alive_here.url),
+            )
+            return
+
         if config.pull_before_start:
             # До worktree, а не после: `git worktree add` ветвится от текущего
             # HEAD, и на несвежем репозитории новый worktree тоже был бы несвежим.
-            pulled = await sync_mod.sync(target)
-            await notice.edit_text(f"{head}\n{_pull_line(pulled)}…", parse_mode="HTML")
+            line = (
+                "⤵️ в каталоге работает сессия — не тяну"
+                if alive_here is not None
+                else _pull_line(await sync_mod.sync(target))
+            )
+            await notice.edit_text(f"{head}\n{line}…", parse_mode="HTML")
 
         cwd = target
         if branch:
