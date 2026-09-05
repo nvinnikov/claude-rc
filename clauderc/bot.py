@@ -527,7 +527,7 @@ async def main() -> None:
             pull_note = (
                 "⤵️ в каталоге работает сессия — не тяну"
                 if alive_here is not None
-                else _pull_line(await sync_mod.sync(target))
+                else _pull_line(await sync_mod.sync_one(target))
             )
             await notice.edit_text(f"{head}\n{pull_note}…", parse_mode="HTML")
 

@@ -416,7 +416,7 @@ It asks three things:
 It writes `~/.config/claude-rc/config.toml` with mode `600` (and the directory `700`) —
 that file holds a live token; a repeat run narrows the permissions even if the file used to
 be wider. A repeat `claude-rc setup` pre-fills the previous values as hints and changes only
-what you answer — an empty answer keeps the old value. Four technical fields the wizard
+what you answer — an empty answer keeps the old value. Six technical fields the wizard
 never asks about (`worktree_root`, `state_path`, `scan_depth`, `launch_timeout_s`,
 `permission_mode`, `pull_before_start`) are carried over verbatim on rewrite; anything else outside that list (including human
 comments) is not preserved.

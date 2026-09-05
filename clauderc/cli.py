@@ -302,7 +302,7 @@ class _Commands:
         if install.channel is update_mod.Channel.clone and install.root is not None:
             # Правила про грязное дерево, отсоединённый HEAD и перемотку только
             # вперёд уже написаны и проверены в sync — своих здесь не выдумываем.
-            result = asyncio.run(clauderc_sync.sync(install.root))
+            result = asyncio.run(clauderc_sync.sync_one(install.root))
             print(f"{_MARK[result.outcome]} {install.root.name}\t{result.detail}")
             if result.outcome is clauderc_sync.Outcome.failed:
                 return EXIT_FAILED
@@ -418,7 +418,7 @@ async def _start(
         if await find(str(target)) is not None:
             print(f"· {target.name}\tв каталоге работает сессия — не тяну")
         else:
-            result = await clauderc_sync.sync(target)
+            result = await clauderc_sync.sync_one(target)
             print(f"{_MARK[result.outcome]} {target.name}\t{result.branch}\t{result.detail}")
 
     cwd = target

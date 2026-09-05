@@ -22,9 +22,10 @@ state_path = "~/.claude-rc/state.json"
 launch_timeout_s = 90
 
 # С какими правами поднимать сессии. Без него — как у claude по умолчанию, то есть
-# он спрашивает на каждом шаге, а с телефона это неудобно. Значения: default (оно же
-# manual (ручной), acceptEdits, plan, auto, dontAsk, bypassPermissions. Гейта прав на стороне бота
-# по-прежнему нет — флаг только говорит claude, с чего начать.
+# он спрашивает на каждом шаге, а с телефона это неудобно. Значения: manual (ручной),
+# acceptEdits, plan, auto, dontAsk, bypassPermissions — ровно то, что принимает
+# `claude --permission-mode`. Гейта прав на стороне бота по-прежнему нет: флаг
+# только говорит claude, с чего начать.
 # permission_mode = "acceptEdits"
 
 # Подтягивать ли origin перед запуском сессии. Идёт по правилам `claude-rc sync`:
