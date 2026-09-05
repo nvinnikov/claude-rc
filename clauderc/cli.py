@@ -280,7 +280,9 @@ class _Commands:
         if args.check:
             return 0
 
-        commands = update_mod.plan(install, app_installed=update_mod.APP_PATH.is_dir())
+        commands = update_mod.plan(
+            install, app_installed=update_mod.APP_PATH.is_dir(), version=latest
+        )
         if not commands:
             print(
                 "Обновлять нечем: способ установки не опознан.\n"

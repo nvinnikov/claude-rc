@@ -30,8 +30,51 @@ def test_detect_survives_a_broken_pyproject(tmp_path: Path) -> None:
     assert detect(tmp_path / ".venv") == Install(Channel.unknown)
 
 
+def _uv_tool_env(tmp_path: Path, receipt: str | None = None) -> Path:
+    env = tmp_path / "share/uv/tools/claude-rc"
+    env.mkdir(parents=True)
+    if receipt is not None:
+        (env / "uv-receipt.toml").write_text(receipt)
+    return env
+
+
 def test_detect_uv_tool(tmp_path: Path) -> None:
-    assert detect(tmp_path / "share/uv/tools/claude-rc") == Install(Channel.uv_tool)
+    assert detect(_uv_tool_env(tmp_path)) == Install(Channel.uv_tool)
+
+
+def test_detect_uv_tool_installed_from_a_clone_is_a_clone(tmp_path: Path) -> None:
+    # `make install` — заявленный основной способ — ставит из клона, и окружение
+    # у него ровно такое же, как у установки из git. Обновлять надо клон, иначе
+    # правки человека молча заменяются веткой из интернета.
+    clone = tmp_path / "src/claude-rc"
+    clone.mkdir(parents=True)
+    (clone / "pyproject.toml").write_text('[project]\nname = "claude-rc"\n')
+    env = _uv_tool_env(
+        tmp_path,
+        f'[tool]\nrequirements = [{{ name = "claude-rc", directory = "{clone}" }}]\n',
+    )
+    assert detect(env) == Install(Channel.clone, root=clone)
+
+
+def test_detect_uv_tool_installed_from_git_stays_uv_tool(tmp_path: Path) -> None:
+    env = _uv_tool_env(
+        tmp_path,
+        '[tool]\nrequirements = [{ name = "claude-rc", git = "https://github.com/x/y" }]\n',
+    )
+    assert detect(env) == Install(Channel.uv_tool)
+
+
+def test_detect_ignores_a_receipt_pointing_at_a_vanished_clone(tmp_path: Path) -> None:
+    # Клон могли снести после установки: тянуть и собирать там нечего.
+    env = _uv_tool_env(
+        tmp_path,
+        f'[tool]\nrequirements = [{{ name = "claude-rc", directory = "{tmp_path / "gone"}" }}]\n',
+    )
+    assert detect(env) == Install(Channel.uv_tool)
+
+
+def test_detect_survives_a_broken_receipt(tmp_path: Path) -> None:
+    assert detect(_uv_tool_env(tmp_path, "не toml [[[")) == Install(Channel.uv_tool)
 
 
 def test_detect_unknown_environment(tmp_path: Path) -> None:
@@ -45,7 +88,15 @@ def test_plan_clone_targets_the_app_only_when_it_is_installed() -> None:
     assert plan(install, app_installed=False) == [["make", "-C", "/src/claude-rc", "install-tool"]]
 
 
-def test_plan_uv_tool_reinstalls_from_git() -> None:
+def test_plan_uv_tool_installs_the_release_it_named() -> None:
+    # Команда только что назвала номер релиза; поставить при этом ветку —
+    # значит соврать про то, что встанет.
+    (command,) = plan(Install(Channel.uv_tool), app_installed=False, version="0.3.0")
+    assert command == ["uv", "tool", "install", "--force", f"git+{update.REPO_URL}@v0.3.0"]
+
+
+def test_plan_uv_tool_falls_back_to_the_branch_without_a_version() -> None:
+    # Сеть недоступна — обновиться веткой лучше, чем не обновиться вовсе.
     (command,) = plan(Install(Channel.uv_tool), app_installed=False)
     assert command == ["uv", "tool", "install", "--force", f"git+{update.REPO_URL}"]
 

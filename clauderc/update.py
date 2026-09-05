@@ -82,6 +82,15 @@ def detect(prefix: Path | None = None) -> Install:
 
     # ~/.local/share/uv/tools/claude-rc
     if "uv" in parts and "tools" in parts:
+        # `make install` — заявленный основной способ — ставит тулзу из клона
+        # (`uv tool install --force .`), и окружение при этом ровно такое же,
+        # как у установки из git. Обновлять надо клон, а не master в интернете,
+        # иначе правки человека молча заменяются чужой веткой, а приложение в
+        # /Applications не переустанавливается вовсе. Путь клона uv записывает
+        # в квитанцию рядом с окружением — она и различает эти два случая.
+        source = _uv_source(root / "uv-receipt.toml")
+        if source is not None and _project_name(source / "pyproject.toml") == PACKAGE:
+            return Install(Channel.clone, root=source)
         return Install(Channel.uv_tool)
 
     return Install(Channel.unknown)
@@ -99,7 +108,31 @@ def _project_name(pyproject: Path) -> str | None:
     return name if isinstance(name, str) else None
 
 
-def plan(install: Install, *, app_installed: bool) -> list[list[str]]:
+def _uv_source(receipt: Path) -> Path | None:
+    """Каталог, из которого `uv tool install` поставил нашу тулзу.
+
+    `uv-receipt.toml` пишет источник рядом с окружением: у установки из каталога
+    это `directory`, у установки из git — `git`, и второе нам не источник для
+    обновления, а ровно то, что `plan` и так сделает.
+    """
+    try:
+        with receipt.open("rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    tool = data.get("tool")
+    requirements = tool.get("requirements") if isinstance(tool, dict) else None
+    if not isinstance(requirements, list):
+        return None
+    for requirement in requirements:
+        if not isinstance(requirement, dict) or requirement.get("name") != PACKAGE:
+            continue
+        directory = requirement.get("directory")
+        return Path(directory) if isinstance(directory, str) else None
+    return None
+
+
+def plan(install: Install, *, app_installed: bool, version: str | None = None) -> list[list[str]]:
     """Команды обновления для канала. Пустой список — обновить нечем.
 
     Клон обновляется двумя шагами: сначала `sync` подтягивает историю (его
@@ -113,7 +146,11 @@ def plan(install: Install, *, app_installed: bool) -> list[list[str]]:
         return [["make", "-C", str(install.root), target]]
 
     if install.channel is Channel.uv_tool:
-        return [["uv", "tool", "install", "--force", f"git+{REPO_URL}"]]
+        # На тег, а не на ветку по умолчанию: команда только что назвала номер
+        # релиза, и ставить при этом что-то другое значит соврать. Версии нет
+        # (сеть недоступна) — ставим ветку, это лучше, чем не обновиться вовсе.
+        target = f"git+{REPO_URL}@v{version}" if version else f"git+{REPO_URL}"
+        return [["uv", "tool", "install", "--force", target]]
 
     if install.channel is Channel.brew and install.formula is not None:
         commands = [["brew", "upgrade", f"{TAP}/{install.formula}"]]

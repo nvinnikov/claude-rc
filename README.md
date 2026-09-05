@@ -625,10 +625,15 @@ claude-rc update            # update it
 There is nothing to configure and nothing to remember: the command works out how this copy
 was installed from the environment it is running in, and runs that channel's own command.
 A clone is fast-forwarded and reinstalled (`make install`, or `make install-tool` when the
-app isn't there); a `uv tool` install is reinstalled from git; a Homebrew install is
-`brew upgrade`d, with the cask too when the app is present. The install channel is read from
-the running environment's path rather than from `claude-rc` on `PATH` — the name is the same
-in all three cases, the path is not.
+app isn't there); a `uv tool` install is reinstalled from git at the release tag it just
+named; a Homebrew install is `brew upgrade`d, with the cask too when the app is present.
+
+The channel is read from the running environment rather than from `claude-rc` on `PATH` —
+the name is the same in all three cases, the path is not. `make install` and an install from
+a git URL land in the same place, so what tells them apart is uv's own `uv-receipt.toml`
+next to the environment: an install from a directory records `directory` there, one from git
+records `git`. Without that, updating the documented main way of installing would pull master
+over the clone, and never reinstall the app.
 
 The clone is pulled by `claude-rc sync`, so its rules apply as they do everywhere else: a
 dirty tree or a detached HEAD is left alone, and history only ever fast-forwards. Nothing is
