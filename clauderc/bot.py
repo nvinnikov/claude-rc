@@ -592,7 +592,7 @@ async def main() -> None:
                 # await_url уже видел сессию мёртвой (таймаут, упала сама
                 # или исчезла между capture и list) — без метки watcher
                 # опросил бы её как упавшую следом за этим же сообщением.
-                watcher.expect_death(exc.tmux_name)
+                watcher.expect_death(exc.tmux_name, str(cwd))
             await notice.edit_text(
                 told(f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>")[:3800],
                 parse_mode="HTML",
@@ -1000,7 +1000,7 @@ async def main() -> None:
                 f"Таких сессий несколько — назови id:\n{listing}", parse_mode="HTML"
             )
             return
-        if await watcher.kill(matches[0].tmux_name):
+        if await watcher.kill(matches[0].tmux_name, matches[0].cwd):
             # Называем найденное, а не набранное: на `/rckill ~/code/oms` ответ
             # «Сессия ~/code/oms погашена» — про путь, а не про сессию.
             # Worktree намеренно остаётся: в нём может лежать несохранённая работа.
@@ -1055,7 +1055,7 @@ async def main() -> None:
         # Сессия держит этот каталог: не погасив её, оставим Claude в исчезнувшем cwd.
         session = await find(str(path))
         if session is not None:
-            await watcher.kill(session.tmux_name)
+            await watcher.kill(session.tmux_name, session.cwd)
 
         try:
             await worktrees.remove(config.worktree_root, name, force=force)
@@ -1127,7 +1127,7 @@ async def main() -> None:
         # Сессия могла подняться уже после показа карточки.
         session = await find(str(path))
         if session is not None:
-            await watcher.kill(session.tmux_name)
+            await watcher.kill(session.tmux_name, session.cwd)
         try:
             await worktrees.remove(config.worktree_root, path.name, force=forced)
         except WorktreeError as exc:
@@ -1156,7 +1156,7 @@ async def main() -> None:
         cwd, created_at = pending
         # Имя берём заново: с момента показа карточки сессию могли переименовать.
         session = _same_session(await find(cwd), created_at)
-        killed = session is not None and await watcher.kill(session.tmux_name)
+        killed = session is not None and await watcher.kill(session.tmux_name, session.cwd)
         await query.answer("Погашена" if killed else "Уже не жива")
         if message is None:
             return
@@ -1240,7 +1240,7 @@ async def main() -> None:
 
         tmux_name, cwd = waiting
         if verdict == "notrust":
-            await watcher.kill(tmux_name)
+            await watcher.kill(tmux_name, cwd)
             await message.answer("Отменил, сессия погашена.")
             return
 
@@ -1257,7 +1257,7 @@ async def main() -> None:
                 # await_url уже видел сессию мёртвой (таймаут, упала сама
                 # или исчезла между capture и list) — без метки watcher
                 # опросил бы её как упавшую следом за этим же сообщением.
-                watcher.expect_death(exc.tmux_name)
+                watcher.expect_death(exc.tmux_name, cwd)
             await message.answer(
                 f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
             )

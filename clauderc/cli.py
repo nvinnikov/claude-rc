@@ -302,6 +302,15 @@ class _Commands:
         if install.channel is update_mod.Channel.clone and install.root is not None:
             # Правила про грязное дерево, отсоединённый HEAD и перемотку только
             # вперёд уже написаны и проверены в sync — своих здесь не выдумываем.
+            # Живая сессия в клоне — не трогаем: обновление может идти само,
+            # по тумблеру в приложении, и перематывать дерево под работающим
+            # claude тем более незачем.
+            if asyncio.run(find(str(install.root))) is not None:
+                print(
+                    "В клоне работает RC-сессия — не подтягиваю и не переустанавливаю.",
+                    file=sys.stderr,
+                )
+                return EXIT_FAILED
             result = asyncio.run(clauderc_sync.sync_one(install.root))
             print(f"{_MARK[result.outcome]} {install.root.name}\t{result.detail}")
             if result.outcome is clauderc_sync.Outcome.failed:

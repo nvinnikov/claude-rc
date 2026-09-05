@@ -254,3 +254,36 @@ async def test_relaunch_in_the_same_directory_still_reports_the_death(
     _sessions(monkeypatch, [old], [fresh])
     (died,) = await _collect(Watcher(), 2)
     assert died.tmux_name == "session_01A"
+
+
+async def test_kill_after_a_rename_is_still_silent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Погасили сессию, которую поллер запомнил под прежним именем.
+
+    Имя меняется у сессии под ногами — `await_url` даёт ей id Claude. Метка
+    только по имени не совпала бы с тем, что лежит в снимке, и намеренное
+    гашение доехало бы карточкой «сессия завершилась».
+    """
+    old = _session("oms", "/repos/oms")
+    renamed = RemoteSession(
+        name="oms", tmux_name="session_01ABC", cwd="/repos/oms", url="https://x", created_at=0
+    )
+
+    async def fake_kill(tmux_name: str) -> bool:
+        return True
+
+    monkeypatch.setattr(watch, "kill_tmux", fake_kill)
+    # Снимок со старым именем, потом сессия видна уже переименованной (её и
+    # гасим), потом её нет.
+    _sessions(monkeypatch, [old], [renamed], [])
+
+    watcher = Watcher()
+    seen: list[Died] = []
+
+    async def on_died(died: Died) -> None:
+        seen.append(died)
+
+    await watcher.poll(on_died)  # запомнили rc-oms
+    await watcher.kill("session_01ABC")  # метка ставится и по каталогу
+    await watcher.poll(on_died)
+
+    assert seen == []
