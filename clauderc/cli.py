@@ -22,6 +22,7 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from clauderc import actions as actions  # тесты подменяют cli.actions.rename
 from clauderc import passport as passport  # тесты подменяют cli.passport.worktrees.inspect
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
 from clauderc import setup as setup  # тесты подменяют cli.setup.verify_token/catch_user_id
@@ -111,6 +112,12 @@ def _parser() -> argparse.ArgumentParser:
     stop = sub.add_parser("stop", help="погасить сессию")
     stop.add_argument("target", nargs="?", help="имя сессии или каталог")
     stop.add_argument("--all", action="store_true", dest="every")
+
+    rename_cmd = sub.add_parser(
+        "rename", help="переименовать сессию: ярлык в tmux и /rename в приложении"
+    )
+    rename_cmd.add_argument("target", help="ярлык, каталог или session_…")
+    rename_cmd.add_argument("name")
 
     doctor = sub.add_parser("doctor", help="проверить окружение")
     doctor.add_argument("--json", action="store_true", dest="as_json")
@@ -247,11 +254,8 @@ class _Commands:
             return EXIT_ENVIRONMENT
         try:
             killed = asyncio.run(_stop(args.target))
-        except _StopAmbiguous as exc:
-            print("Таких сессий несколько — назови id:", file=sys.stderr)
-            for session in exc.sessions:
-                print(f"  {session.tmux_name}\t{session.cwd}", file=sys.stderr)
-            return EXIT_FAILED
+        except _Ambiguous as exc:
+            return _print_ambiguous(exc)
         except _StopFailed as exc:
             print(f"Нашёл, но не погасил: {exc}", file=sys.stderr)
             return EXIT_FAILED
@@ -259,6 +263,28 @@ class _Commands:
             print(f"Сессия не найдена: {args.target}", file=sys.stderr)
             return EXIT_FAILED
         print(f"Погашена: {killed}")
+        return 0
+
+    @staticmethod
+    def rename(args: argparse.Namespace) -> int:
+        try:
+            session = asyncio.run(_one(args.target))
+        except _Ambiguous as exc:
+            return _print_ambiguous(exc)
+        if session is None:
+            print(f"Сессия не найдена: {args.target}", file=sys.stderr)
+            return EXIT_FAILED
+        try:
+            result = asyncio.run(actions.rename(session, args.name))
+        except actions.ActionError as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_FAILED
+        print(result.label)
+        if not result.app_renamed:
+            print(
+                "Приложение Claude имя не подхватило: у этой версии claude нет /rename.",
+                file=sys.stderr,
+            )
         return 0
 
     @staticmethod
@@ -415,12 +441,27 @@ class _StopFailed(RuntimeError):
     """Сессия нашлась, но tmux не смог её погасить — не путать с «не найдена»."""
 
 
-class _StopAmbiguous(RuntimeError):
+class _Ambiguous(Exception):
     """Под цель подошло несколько сессий: выбирать за человека нельзя."""
 
     def __init__(self, sessions: list[RemoteSession]) -> None:
-        super().__init__("под цель подошло несколько сессий")
+        super().__init__("ambiguous target")
         self.sessions = sessions
+
+
+async def _one(target: str) -> RemoteSession | None:
+    """Одна сессия под цель — резолвер, общий для `rename`, `send`, `restart`, `connect`."""
+    matches = await resolve(target)
+    if len(matches) > 1:
+        raise _Ambiguous(matches)
+    return matches[0] if matches else None
+
+
+def _print_ambiguous(exc: _Ambiguous) -> int:
+    print("Таких сессий несколько — назови id:", file=sys.stderr)
+    for session in exc.sessions:
+        print(f"  {session.tmux_name}\t{session.cwd}", file=sys.stderr)
+    return EXIT_FAILED
 
 
 _MARK = {
@@ -918,7 +959,7 @@ async def _stop(target: str) -> str | None:
     if not matches:
         return None
     if len(matches) > 1:
-        raise _StopAmbiguous(matches)
+        raise _Ambiguous(matches)
     session = matches[0]
     if not await kill_tmux(session.tmux_name):
         raise _StopFailed(session.name)

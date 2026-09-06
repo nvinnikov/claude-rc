@@ -151,6 +151,9 @@ def tmux_available() -> bool:
     return shutil.which("tmux") is not None
 
 
+# Единственный шов до tmux: `actions` (и позже `state_probe`) тоже ходят
+# через эту функцию, а не запускают tmux сами — так подмена в тестах
+# (`monkeypatch.setattr(remote, "_run", ...)`) одна на весь код.
 async def _run(*args: str, check: bool = True) -> tuple[int, str]:
     socket = os.environ.get(TMUX_SOCKET_ENV)
     socket_flag = ("-L", socket) if socket else ()

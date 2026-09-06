@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from clauderc import cli, remote
+from clauderc import actions, cli, remote
 from clauderc import update as update_mod
 from clauderc.remote import LaunchError, RemoteSession, TrustRequired
 from clauderc.worktrees import Worktree
@@ -1902,6 +1902,23 @@ def test_stop_refuses_to_guess_between_same_named_sessions(
     err = capsys.readouterr().err
     assert "session_01A" in err and "session_01B" in err
     assert killed == []
+
+
+def test_rename_prints_new_label(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    async def fake_rename(session: RemoteSession, name: str) -> actions.RenameResult:
+        return actions.RenameResult(label=f"oms@{name}", app_renamed=False)
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "rename", fake_rename)
+    assert cli.main(["rename", "oms", "fix"]) == 0
+    out, err = capsys.readouterr()
+    assert out.strip() == "oms@fix"
+    assert "/rename" in err
 
 
 def test_stop_by_session_id_is_unambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
