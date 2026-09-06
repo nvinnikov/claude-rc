@@ -233,6 +233,18 @@ def _died_text(died: Died) -> str:
     )
 
 
+def _bypass_failed_text(exc: str) -> str:
+    """Текст, когда Bypass успел погасить прежнюю сессию, но новая не поднялась.
+
+    Отдельно от «Сессия не погасла» (см. `on_bypass`): здесь прежней сессии уже
+    нет, и молчание об этом оставило бы человека с мёртвой карточкой без единой
+    подсказки, что делать дальше — отсюда и предложение Resume рядом с текстом.
+    """
+    return f"⏹ Прежняя сессия погашена, но заново не поднялась.\n<pre>{html.escape(exc)}</pre>"[
+        :3800
+    ]
+
+
 def _label(path: Path, roots: tuple[Path, ...]) -> str:
     """Короткое имя для списка: относительный путь от ближайшего корня."""
     for root in roots:
@@ -1270,10 +1282,26 @@ async def main() -> None:
                 mode="bypassPermissions",
                 timeout_s=config.launch_timeout_s,
             )
-        except (actions.ActionError, LaunchError) as exc:
+        except actions.ActionError as exc:
+            # actions.restart поднимает ActionError только из проверки kill —
+            # сессия ещё жива, к перезапуску даже не приступали.
+            await message.answer(f"❌ {html.escape(str(exc))}"[:3800], parse_mode="HTML")
+            return
+        except LaunchError as exc:
+            # LaunchError идёт только из remote.launch — до этой точки прежняя
+            # сессия уже погашена, и молчать об этом нельзя.
+            log.warning("bypass relaunch failed for %s: %s", session.cwd, exc)
+            if exc.tmux_name:
+                watcher.expect_death(exc.tmux_name, session.cwd)
+            token = uuid.uuid4().hex[:8]
+            resume_pending[token] = (
+                token,
+                LaunchRequest(target=Path(session.cwd), resume="last"),
+            )
             await message.answer(
-                f"❌ Не перезапустилась.\n<pre>{html.escape(str(exc))}</pre>"[:3800],
+                _bypass_failed_text(str(exc)),
                 parse_mode="HTML",
+                reply_markup=_resume_keyboard([(token, "↻ Resume")]),
             )
             return
         except TrustRequired as need:

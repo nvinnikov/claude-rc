@@ -8,6 +8,7 @@ from clauderc.bot import (
     LaunchRequest,
     _apply_name,
     _browse_card,
+    _bypass_failed_text,
     _chunk_report,
     _died_text,
     _has_repos,
@@ -64,6 +65,20 @@ def test_died_text_escapes_html() -> None:
     text = _died_text(Died(name="a&b", tmux_name="rc-a-b", cwd="/repos/<x>"))
     assert "&amp;" in text
     assert "<x>" not in text
+
+
+def test_bypass_failed_text_mentions_previous_session() -> None:
+    # Прежняя сессия к этому моменту уже погашена (kill в actions.restart
+    # прошёл) — молчание об этом оставило бы карточку без единой подсказки.
+    text = _bypass_failed_text("timeout")
+    assert "погашена" in text
+    assert "timeout" in text
+
+
+def test_bypass_failed_text_escapes_html() -> None:
+    text = _bypass_failed_text("<boom>")
+    assert "&lt;boom&gt;" in text
+    assert "<boom>" not in text
 
 
 def test_pop_resume_group_clears_sibling_tokens() -> None:
