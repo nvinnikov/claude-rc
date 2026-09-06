@@ -73,7 +73,16 @@ _URL_OPTION = "@rc_url"
 # В опции, а не выведенный из имени tmux: имя после переименования — id сессии
 # Claude, и ветку по нему не восстановить.
 _LABEL_OPTION = "@rc_label"
-_FORMAT = "#{session_name}\t#{session_path}\t#{session_created}\t#{@rc_url}\t#{@rc_label}"
+# Режим, с которого начинает сессия, если ни флаг, ни конфиг не сказали иначе.
+# `auto` — потому что с телефона на каждый шаг не наотвечаешься, а претензии
+# на права всё равно решает приложение Claude, не мы.
+DEFAULT_PERMISSION_MODE = "auto"
+# Режим хранится рядом с ярлыком: `restart` должен поднимать сессию с прежним
+# режимом, а раньше он нигде не сохранялся — узнать его после запуска было неоткуда.
+_MODE_OPTION = "@rc_mode"
+_FORMAT = (
+    "#{session_name}\t#{session_path}\t#{session_created}\t#{@rc_url}\t#{@rc_label}\t#{@rc_mode}"
+)
 
 # CLAUDE_CODE_* чистим уже внутри панели: tmux-сервер мог быть поднят из-под
 # Claude Code, и унаследованный CLAUDE_CODE_CHILD_SESSION выключит сохранение
@@ -137,6 +146,7 @@ class RemoteSession:
     url: str
     created_at: int  # unix-время создания tmux-сессии
     label: str = ""  # ярлык repo@branch; пуст у сессий прежней версии
+    mode: str = ""  # режим прав, с которым поднята сессия; пуст у сессий прежней версии
 
     def uptime_s(self) -> float:
         return max(0.0, time.time() - self.created_at)
@@ -181,9 +191,9 @@ async def list_sessions() -> list[RemoteSession]:
     sessions: list[RemoteSession] = []
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) != 5:
+        if len(parts) != 6:
             continue
-        tmux_name, path, created, url, label = parts
+        tmux_name, path, created, url, label, mode = parts
         # Наши сессии — либо ещё не переименованные (префикс), либо уже
         # названные id сессии Claude (тогда имя ни о чём не говорит, но
         # `@rc_url` выставлен). Одного признака мало: по префиксу не видно
@@ -198,6 +208,7 @@ async def list_sessions() -> list[RemoteSession]:
                 url=url,
                 created_at=int(created) if created.isdigit() else 0,
                 label=label,
+                mode=mode,
             )
         )
     return sorted(sessions, key=lambda s: s.name)
@@ -390,19 +401,21 @@ async def launch(
         return existing
 
     name = await _unique_name(label, cwd)
+    mode = permission_mode or DEFAULT_PERMISSION_MODE
     command = (
         _SCRUB_ENV
         + f"exec {shlex.quote(CLAUDE_BIN)} --remote-control {shlex.quote(label)}"
         + f" -n {shlex.quote(label)}"
-        + _permission_flag(permission_mode)
+        + _permission_flag(mode)
         + _resume_flag(resume)
     )
     await _run("new-session", "-d", "-s", name, "-x", _COLS, "-y", _ROWS, "-c", cwd, command)
-    # Ярлык — сразу, не дожидаясь ссылки: сессия, умершая до неё, тоже должна
-    # называться в отчёте о смерти так же, как её звали при запуске.
-    stored, why = await _run("set-option", "-t", f"={name}:", _LABEL_OPTION, label, check=False)
-    if stored != 0:
-        log.warning("set %s on %s failed: %s", _LABEL_OPTION, name, why.strip())
+    # Ярлык и режим — сразу, не дожидаясь ссылки: сессия, умершая до неё, тоже
+    # должна называться и помнить режим так же, как при запуске.
+    for option, value in ((_LABEL_OPTION, label), (_MODE_OPTION, mode)):
+        stored, why = await _run("set-option", "-t", f"={name}:", option, value, check=False)
+        if stored != 0:
+            log.warning("set %s on %s failed: %s", option, name, why.strip())
     return await await_url(name, cwd, timeout_s=timeout_s)
 
 

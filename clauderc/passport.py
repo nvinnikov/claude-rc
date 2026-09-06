@@ -89,7 +89,7 @@ def build(session: RemoteSession, *, host: str, tree: Worktree | None) -> Passpo
         tmux_name=tmux_name,
         created_at=session.created_at,
         uptime_s=int(session.uptime_s()),
-        mode=getattr(session, "mode", ""),  # поле появляется в remote в задаче 11
+        mode=session.mode,
         attach=attach_line(tmux_name, host),
         cli=cli_prefix(host),
     )
