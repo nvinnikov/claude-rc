@@ -17,6 +17,9 @@ class Config:
     launch_timeout_s: float
     permission_mode: str | None
     pull_before_start: bool
+    # Как эта машина зовётся по ssh с других машин (алиас из ~/.ssh/config).
+    # Пусто — паспорт сессии печатает только локальные формы подсадки.
+    host: str
 
 
 def load_config(path: Path) -> Config:
@@ -44,6 +47,7 @@ def load_config(path: Path) -> Config:
     launch_timeout_s = _require_number(raw, "launch_timeout_s", default=90)
     permission_mode = _require_permission_mode(raw)
     pull_before_start = _require_bool(raw, "pull_before_start", default=False)
+    host = _optional_str(raw, "host")
 
     missing = [str(p) for p in roots if not p.is_dir()]
     if missing:
@@ -60,6 +64,7 @@ def load_config(path: Path) -> Config:
         launch_timeout_s=launch_timeout_s,
         permission_mode=permission_mode,
         pull_before_start=pull_before_start,
+        host=host,
     )
 
 
@@ -68,6 +73,13 @@ def _require_str(raw: dict[str, Any], key: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{key}: ожидалась строка")
     return value
+
+
+def _optional_str(raw: dict[str, Any], key: str) -> str:
+    value = raw.get(key, "")
+    if not isinstance(value, str):
+        raise ValueError(f"{key}: ожидалась строка")
+    return value.strip()
 
 
 def _require_permission_mode(raw: dict[str, Any]) -> str | None:

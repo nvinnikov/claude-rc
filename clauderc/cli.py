@@ -686,6 +686,7 @@ _EXTRA_KEYS = (
     "launch_timeout_s",
     "permission_mode",
     "pull_before_start",
+    "host",
 )
 
 

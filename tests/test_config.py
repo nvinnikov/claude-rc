@@ -36,6 +36,7 @@ def test_load_config_reads_all_fields(tmp_path: Path) -> None:
         launch_timeout_s=30.0,
         permission_mode="acceptEdits",
         pull_before_start=True,
+        host="",
     )
 
 
@@ -223,3 +224,30 @@ def test_permission_mode_rejects_the_settings_name_the_flag_does_not_take(
     )
     with pytest.raises(ValueError, match="permission_mode"):
         load_config(cfg)
+
+
+def test_host_defaults_to_empty(tmp_path: Path) -> None:
+    config = load_config(
+        _write(tmp_path, f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n')
+    )
+    assert config.host == ""
+
+
+def test_host_is_read_and_stripped(tmp_path: Path) -> None:
+    config = load_config(
+        _write(
+            tmp_path,
+            f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\nhost = " m1 "\n',
+        )
+    )
+    assert config.host == "m1"
+
+
+def test_host_must_be_a_string(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="host"):
+        load_config(
+            _write(
+                tmp_path,
+                f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\nhost = 1\n',
+            )
+        )
