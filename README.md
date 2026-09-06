@@ -179,6 +179,11 @@ else to read it from.
 | Module | Responsibility |
 |---|---|
 | `clauderc/remote.py` | everything tmux: start a session, harvest the link, kill it |
+| `clauderc/passport.py` | one session structure, rendered to HTML, text and JSON |
+| `clauderc/state_probe.py` | state from the pane (idle/working/needs_input/dead/unknown), listening ports |
+| `clauderc/actions.py` | acting on a session: `send`, `tail`, `rename`, `restart` |
+| `clauderc/proxy.py` | `--host`: run a command on another machine over ssh |
+| `clauderc/forward.py` | ssh tunnels to a session's listening ports |
 | `clauderc/worktrees.py` | git worktree per branch: create, inspect, remove |
 | `clauderc/browse.py` | directory tree navigation (`cd`/`ls`) |
 | `clauderc/repos.py` | walking `rc_roots` looking for git repositories |
@@ -210,15 +215,21 @@ Two ways to pick where a session goes up: walk there, or call it by name.
 ```
 
 `/pwd` sends a card: the current path and buttons for the subdirectories (git repositories
-marked with `●`), plus `⬆️ ..` and `▶️ Start Claude RC`. On a phone that beats typing paths:
-you tap through the tree and launch without entering anything. The current directory survives
-a bot restart.
+marked with `●`), plus `⬆️ ..`, `▶️ Start Claude RC` and `🔓 Start (bypass)` — the same
+launch, straight into `bypassPermissions`. On a phone that beats typing paths: you tap
+through the tree and launch without entering anything. The current directory survives a bot
+restart.
 
 `/cd` understands relative paths, absolute paths, `..` and `~`.
 
+Either start button asks one more thing first: a name for the session, as a reply to the
+bot's message, or `-` to skip it and fall back to the branch. The name becomes the label
+`repo@name`.
+
 Inside a git repository a `🌿 New worktree` button appears — it starts a session in a fresh
-worktree on a branch named like `wt/20260730-131502`. That's how you work in parallel with an
-already-running session when the branch name doesn't matter.
+worktree on a branch named like `wt/20260730-131502`, or `wt/<name>` if you named the session.
+That's how you work in parallel with an already-running session when the branch name doesn't
+matter.
 
 `📚 Projects` (`/repos`) — a flat list of every git repository as buttons: a tap takes you
 straight into the directory, no tree-walking. Identical names (two clones of one repository)
@@ -305,8 +316,10 @@ different sessions.
 
 `💬 Chats` shows both halves of the picture.
 
-First the live sessions — one message each, with `Open in Claude` and `⏹ Stop` buttons. If
-a session runs in a worktree, the card shows the branch and its state.
+First the live sessions — one message each, with `Open in Claude`, `⏹ Stop`, `🔓 Bypass`
+(kill and relaunch with `bypassPermissions`), `🔌 /mcp` (send `/mcp` and show the pane's
+answer), `📋 Tail` (the pane's last lines) and `✏️ Rename` buttons. If a session runs in a
+worktree, the card shows the branch and its state.
 
 Then the worktrees left **without** a session. That's the unfinished work: each gets
 `▶️ Start` (bring a session back up in the same directory) and `🗑 Remove`. There is
@@ -484,15 +497,41 @@ uv tool install .
 | Command | Action |
 |---|---|
 | `claude-rc version` | version |
-| `claude-rc sessions [--json]` | live RC sessions |
+| `claude-rc sessions [--json] [--no-probe]` | live RC sessions, with state and listening ports |
 | `claude-rc whoami [path] [--json]` | which session owns this directory: label, id, link, attach command |
-| `claude-rc start [path] [--branch b] [--resume last\|id] [--pull] [--permission-mode m]` | start a session (default: current directory) |
+| `claude-rc start [path] [--branch b] [--name n] [--new-worktree] [--resume last\|id] [--pull] [--permission-mode m]` | start a session (default: current directory); `--name` sets the label `repo@n` and, with `--new-worktree` and no explicit `--branch`, the branch `wt/<n>` |
+| `claude-rc rename <target> <name>` | relabel in tmux and `/rename` in the app |
+| `claude-rc send <target> <text> [--no-enter] [--tail N]` | type into the session pane |
+| `claude-rc restart <target> [--mode m]` | kill and relaunch with `--resume`, optionally with another permission mode |
+| `claude-rc connect [target] [--read-only] [--cc] [--url] [--start] [--branch b]` | attach a terminal to the session's tmux pane |
 | `claude-rc stop <name\|path>` / `claude-rc stop --all` | kill a session |
 | `claude-rc doctor [--json]` | check tmux, claude and the config |
 | `claude-rc setup` | first-run wizard — token, user_id, directories |
 | `claude-rc update [--check] [--json]` | update the tool the same way it was installed |
 | `claude-rc sync [paths…] [--branch b] [--no-fetch]` | fast-forward repositories from origin |
 | `claude-rc bot` | run the Telegram bot in the foreground — same as `make run` |
+| `claude-rc --host m1 forward <target> [ports…] [--stop]` | ssh tunnels to the ports the session listens on |
+| `claude-rc --host m1 <command>` | run the same command on another machine over ssh (`bot`, `update`, `forward` excluded; paths must be absolute) |
+
+### For a steering agent
+
+One machine is the whole product; add `host = "m1"` to its config when you have a second
+one — the session passport then prints `ssh m1 -t 'tmux attach …'` and
+`claude-rc --host m1 …` forms. A Claude session that manages other sessions (on the same
+machine or another) needs exactly one call to see everything:
+
+```bash
+claude-rc --host m1 sessions --json      # label, url, branch, state, last pane lines, listening ports
+claude-rc --host m1 send oms@fix '/mcp' --tail 20
+claude-rc --host m1 restart oms@fix --mode bypassPermissions
+claude-rc --host m1 forward oms@fix       # then open http://localhost:<port>
+```
+
+`whoami` is for the agent *inside* a session; a steering agent is not inside one and should
+use `sessions --json`. `state` is what the pane shows (`idle`, `working`, `needs_input`,
+`unknown`), never what claude knows — read `last_lines` when in doubt. `--no-probe` skips
+the pane capture and port lookup for a faster listing when state isn't needed. Text for
+`send` that starts with `-` goes after `--`: `claude-rc send oms -- -x`.
 
 The trust dialog for an unfamiliar directory is asked straight on stdin: there's a human at
 the terminal, and their answer *is* the decision about access to that directory — no
@@ -614,6 +653,47 @@ and shaped the code:
   success pending a human's confirmation in System Settings. Mistaking it for a failure and
   adding a hand-rolled LaunchAgent on top gives you two autostart mechanisms and a doubled
   bot.
+- **The passport is the single render.** `clauderc/passport.py` builds one `Passport`
+  structure from a `RemoteSession`, git and the config, and one function renders it to HTML
+  for the bot, text for `whoami`/`sessions`, and JSON for a steering agent — three surfaces
+  reading one source instead of three copies of the same wording drifting apart.
+- **State is an observation, and `unknown` is the honest fallback.** There's no event stream
+  from tmux and no status API from claude; `state_probe.probe` gets everything from
+  pattern-matching one `capture-pane`. `idle` and `needs_input` come from known pane shapes —
+  an empty input frame, a numbered dialog, a trust prompt — and whatever matches none of them
+  is `unknown`, never a guess: a claude update that changes the TUI has to surface as
+  "we don't know," not as a wrong `idle`.
+- **`@rc_mode` and the `auto` default.** `launch` records the permission mode a session
+  started with in the tmux user option `@rc_mode`, next to `@rc_label`, so `restart` without
+  `--mode` reopens with the same one. The default changed from `manual` to `auto` for the
+  same reason as [What a session starts with](#what-a-session-starts-with): a session that
+  stops to ask on every step is one you have to be at a keyboard for.
+- **`send-keys -l`.** `actions.send` passes the user's text to `tmux send-keys` with `-l`
+  (literal) before a separate `Enter` keystroke — without it, names like `Up` or `C-c` typed
+  by a human would be read as key names instead of text. The text goes to `send-keys` as an
+  argument, not through a shell, so no quoting is needed.
+- **`restart` goes through the bot's `Watcher`.** Killing the old session any other way hands
+  the human a "session crashed" card right after they pressed the button that restarted it —
+  the `Watcher` has to be told the death is expected, the same rule `stop` already follows.
+- **`forward` is the one client-side command.** Everything else `--host` touches runs on the
+  far machine; `forward`'s ssh tunnel has to listen where the browser opening
+  `http://localhost:<port>` will run, i.e. here — the one deliberate exception to
+  "`--host` = run it there," and it's called out above rather than left to be discovered.
+- **A relative path is refused under `--host`.** The command runs as a plain local
+  `claude-rc` on the far machine with no idea what directory this one meant; `.` or `../foo`
+  would resolve against a shell it never lived in, so it's rejected instead of guessed at.
+- **Non-interactive ssh doesn't read `.zshrc`, so the `PATH` fix is explicit.** `ssh host cmd`
+  (unlike `ssh -t host`) skips the login-shell rc files that put `~/.local/bin` on `PATH` —
+  exactly where `uv tool install` puts `claude-rc`. `proxy.remote_argv` prepends that
+  directory itself rather than trusting the remote shell's own setup.
+- **`--host` with no value is an error, not a silent local run.** A forgotten argument —
+  `claude-rc stop --all --host` — must not fall through to killing sessions here on the
+  assumption that "no host given" means "this machine"; the flag requires a value, so the
+  mistake surfaces immediately instead of taking out the wrong machine's sessions.
+- **One machine is the whole product; `host` only matters once there's a second one.**
+  Nothing above needs a new config key to work solo — the bot, the CLI, a steering session,
+  an agent inside a session. Setting `host` only changes what the passport prints (`ssh
+  <host> -t ...`, `claude-rc --host <host> ...`); leaving it unset costs nothing.
 
 ## Permissions and trade-offs
 
