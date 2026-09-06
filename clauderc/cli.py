@@ -90,6 +90,15 @@ def _parser() -> argparse.ArgumentParser:
     start = sub.add_parser("start", help="поднять сессию")
     start.add_argument("path", nargs="?", default=".", help="каталог (по умолчанию текущий)")
     start.add_argument("--branch", help="создать worktree под ветку")
+    start.add_argument(
+        "--name", help="имя сессии: ярлык repo@name и ветка wt/<name> для --new-worktree"
+    )
+    start.add_argument(
+        "--new-worktree",
+        action="store_true",
+        dest="new_worktree",
+        help="отдельный worktree; ветка — из --name, иначе по времени",
+    )
     start.add_argument("--resume", help="продолжить диалог: last или id")
     start.add_argument("--pull", action="store_true", help="подтянуть origin перед запуском")
     start.add_argument(
@@ -190,7 +199,7 @@ class _Commands:
         if args.resume == "":
             print("--resume не может быть пустой строкой.", file=sys.stderr)
             return EXIT_ENVIRONMENT
-        if args.branch:
+        if args.branch or args.new_worktree:
             # _start дальше зовёт load_config напрямую — без этой проверки
             # отсутствие или порча конфига долетает наружу трейсбеком вместо
             # внятного сообщения (тот же контракт, что и в _diagnose).
@@ -215,6 +224,8 @@ class _Commands:
                     args.resume,
                     pull=args.pull,
                     permission_mode=args.permission_mode,
+                    name=args.name,
+                    new_worktree=args.new_worktree,
                 )
             )
         except (LaunchError, WorktreeError) as exc:
@@ -452,6 +463,8 @@ async def _start(
     *,
     pull: bool = False,
     permission_mode: str | None = None,
+    name: str | None = None,
+    new_worktree: bool = False,
 ) -> RemoteSession:
     if pull:
         # До worktree, а не после: `git worktree add` ветвится от текущего HEAD,
@@ -464,12 +477,15 @@ async def _start(
             result = await clauderc_sync.sync_one(target)
             print(f"{_MARK[result.outcome]} {target.name}\t{result.branch}\t{result.detail}")
 
+    if new_worktree and not branch:
+        branch = worktrees.branch_for(name) if name else worktrees.generate_branch()
+
     cwd = target
     if branch:
         config = load_config(paths.config_file())
         cwd = await worktrees.ensure(target, branch, config.worktree_root)
     try:
-        label = await worktrees.label(cwd)
+        label = await worktrees.label(cwd, name=name)
         return await launch(label, str(cwd), resume=resume, permission_mode=permission_mode)
     except TrustRequired as need:
         return await _ask_trust(need)

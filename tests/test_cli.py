@@ -2154,7 +2154,7 @@ def test_start_names_the_session_by_repo_and_branch(
     # и в приложении сессия называлась слагом вместо репозитория и ветки.
     seen: dict[str, Any] = {}
 
-    async def fake_label(path: Path) -> str:
+    async def fake_label(path: Path, *, name: str | None = None) -> str:
         seen["labelled"] = path
         return "demo@wt/feature-x"
 
@@ -2168,6 +2168,38 @@ def test_start_names_the_session_by_repo_and_branch(
     assert cli.main(["start", str(tmp_path)]) == 0
     assert seen["label"] == "demo@wt/feature-x"
     assert seen["labelled"] == tmp_path
+
+
+def test_start_name_becomes_label_and_new_worktree_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def fake_ensure(repo: Path, branch: str, root: Path) -> Path:
+        seen["branch"] = branch
+        return tmp_path
+
+    async def fake_label(path: Path, *, name: str | None = None) -> str:
+        return f"oms@{name}"
+
+    async def fake_launch(label: str, cwd: str, **kw: Any) -> RemoteSession:
+        seen["label"] = label
+        return _session()
+
+    monkeypatch.setattr(cli.worktrees, "ensure", fake_ensure)
+    monkeypatch.setattr(cli.worktrees, "label", fake_label)
+    monkeypatch.setattr(cli, "launch", fake_launch)
+
+    config = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    config.write_text(f'bot_token = "x"\nallowed_user_id = 1\nrc_roots = ["{root}"]\n')
+    monkeypatch.setattr(cli.paths, "config_file", lambda: config)
+
+    # --new-worktree без --branch — ветка выводится из имени
+    assert cli.main(["start", str(tmp_path), "--new-worktree", "--name", "MCP fix"]) == 0
+    assert seen["branch"] == "wt/mcp-fix"
+    assert seen["label"] == "oms@MCP fix"
 
 
 def test_whoami_json_describes_the_enclosing_session(

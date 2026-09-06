@@ -305,3 +305,18 @@ async def test_label_falls_back_to_directory_name_outside_git(tmp_path: Path) ->
     plain.mkdir()
 
     assert await worktrees.label(plain) == "notes"
+
+
+def test_branch_for_slugs_the_name() -> None:
+    assert worktrees.branch_for("MCP fix!") == "wt/mcp-fix"
+    assert worktrees.branch_for("...") == "wt/wt"
+
+
+async def test_label_prefers_the_given_name(repo: Path) -> None:
+    assert (await worktrees.label(repo, name="mcp-fix")).endswith("@mcp-fix")
+    assert "@" in await worktrees.label(repo)
+
+
+async def test_label_uses_name_for_non_git_dir(tmp_path: Path) -> None:
+    assert await worktrees.label(tmp_path, name="x") == f"{tmp_path.name}@x"
+    assert await worktrees.label(tmp_path) == tmp_path.name

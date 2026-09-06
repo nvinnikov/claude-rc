@@ -70,6 +70,11 @@ def generate_branch(now: float | None = None) -> str:
     return "wt/" + time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
 
 
+def branch_for(name: str) -> str:
+    """Ветка для параллельной сессии, названной человеком: `wt/<slug>`."""
+    return "wt/" + slug(name)
+
+
 async def _git(cwd: Path, *args: str, timeout_s: float | None = None) -> tuple[int, str]:
     # timeout_s=None — не значение по умолчанию в сигнатуре: значение читается
     # из _GIT_TIMEOUT_S на каждом вызове, а не один раз при загрузке модуля —
@@ -178,14 +183,18 @@ async def remove(root: Path, name: str, *, force: bool = False) -> Worktree:
     return info
 
 
-async def label(path: Path) -> str:
-    """Ярлык сессии: репозиторий и ветка одной строкой.
+async def label(path: Path, *, name: str | None = None) -> str:
+    """Ярлык сессии: репозиторий и имя (если дали) или ветка одной строкой.
 
     Один ярлык на все поверхности — имя в приложении Claude, карточка бота,
     имя tmux-сессии до переименования. Имя каталога worktree для этого не
     годится: `demo-wt-feature-x` — слаг, а человек ищет сессию по репозиторию
     и ветке. Не git-каталог ярлыку не мешает: там имя каталога и есть всё,
-    что о нём известно.
+    что о нём известно. `name` — то, что человек дал сессии сам (`start --name`);
+    оно понятнее ветки, особенно сгенерированной по времени (`generate_branch`).
     """
     info = await inspect(path)
+    repo = info.repo if info is not None else path.name
+    if name:
+        return f"{repo}@{name}"
     return f"{info.repo}@{info.branch}" if info is not None else path.name
