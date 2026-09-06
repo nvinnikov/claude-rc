@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.263
+▝▜██████▀  Opus 5 (1M context) with high effort · Claude Max
+  ▝▝ ▝▝    /private/tmp/state_probe_test2
+
+⚠ 1 MCP server needs authentication · run /mcp
+
+❯ выполни через Bash команду: ls -la /tmp
+
+  Listing /tmp contents
+  ⎿  $ ls -la /tmp
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+
+   rtk ls -la /tmp
+   List /tmp contents
+
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don’t ask again for: rtk ls *
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.263
+▝▜██████▀  Opus 5 (1M context) with high effort · Claude Max
+  ▝▝ ▝▝    /private/tmp/state_probe_test2
+
+⚠ 1 MCP server needs authentication · run /mcp
+
+❯ напиши стихотворение из 40 строк про tmux
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✢ Cogitating… (1s · thinking with high effort)
+                  tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents                                           /rc
