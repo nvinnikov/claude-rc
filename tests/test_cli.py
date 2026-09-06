@@ -2131,6 +2131,64 @@ def test_connect_lists_when_several_and_no_target(
     assert "rc-a" in capsys.readouterr().err
 
 
+def test_connect_start_launches_and_attaches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return []
+
+    async def fake_start(
+        target: Path, branch: str | None, resume: str | None, **kwargs: Any
+    ) -> RemoteSession:
+        return _session()
+
+    seen: list[list[str]] = []
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli, "_start", fake_start)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.os, "execvp", lambda file, args: seen.append(args))
+    assert cli.main(["connect", str(tmp_path), "--start"]) == 0
+    assert seen == [["tmux", "attach", "-d", "-t", "=rc-oms"]]
+
+
+def test_connect_start_rejects_missing_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return []
+
+    async def fake_start(
+        target: Path, branch: str | None, resume: str | None, **kwargs: Any
+    ) -> RemoteSession:
+        pytest.fail("_start")
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli, "_start", fake_start)
+    assert cli.main(["connect", str(tmp_path / "nope"), "--start"]) == 2
+    assert capsys.readouterr().err.strip()
+
+
+def test_connect_start_branch_without_config_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return []
+
+    async def fake_start(
+        target: Path, branch: str | None, resume: str | None, **kwargs: Any
+    ) -> RemoteSession:
+        pytest.fail("_start")
+
+    missing_config = tmp_path / "config.toml"
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli, "_start", fake_start)
+    monkeypatch.setattr(cli.paths, "config_file", lambda: missing_config)
+
+    assert cli.main(["connect", str(tmp_path), "--start", "--branch", "feature/x"]) == 2
+    err = capsys.readouterr().err
+    assert str(missing_config) in err
+
+
 def test_stop_by_session_id_is_unambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
     killed: list[str] = []
 

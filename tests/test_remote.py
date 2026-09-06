@@ -66,6 +66,23 @@ def test_attach_argv_read_only_and_control(monkeypatch: pytest.MonkeyPatch) -> N
     assert remote.attach_argv("s", control=True) == ["tmux", "-CC", "attach", "-d", "-t", "=s"]
 
 
+def test_attach_argv_control_with_socket_keeps_flag_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # -CC идёт после -L socket и перед attach — не перед tmux и не после attach.
+    monkeypatch.setenv(remote.TMUX_SOCKET_ENV, "sock")
+    assert remote.attach_argv("s", control=True) == [
+        "tmux",
+        "-L",
+        "sock",
+        "-CC",
+        "attach",
+        "-d",
+        "-t",
+        "=s",
+    ]
+
+
 async def test_list_sessions_parses_rows_and_ignores_foreign(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

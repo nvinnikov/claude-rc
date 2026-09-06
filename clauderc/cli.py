@@ -220,6 +220,30 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _worktree_config_error() -> int | None:
+    """Config.toml для --branch/--new-worktree — до `_start`, а не во время него.
+
+    `_start` дальше зовёт `load_config` напрямую — без этой проверки отсутствие
+    или порча конфига долетает наружу трейсбеком вместо внятного сообщения (тот
+    же контракт, что и в `_diagnose`). Общая для `start` и `connect --start`: обе
+    команды поднимают worktree через `_start` и ловят одну и ту же ловушку.
+    """
+    config_path = paths.config_file()
+    if not config_path.is_file():
+        print(
+            f"--branch нужен config.toml, а его нет: {config_path}\n"
+            "Скопируй config.example.toml и заполни (см. README).",
+            file=sys.stderr,
+        )
+        return EXIT_ENVIRONMENT
+    try:
+        load_config(config_path)
+    except (ValueError, KeyError, OSError) as exc:
+        print(f"--branch нужен рабочий config.toml: {config_path}: {exc}", file=sys.stderr)
+        return EXIT_ENVIRONMENT
+    return None
+
+
 class _Commands:
     """Обработчики подкоманд. Имя метода совпадает с именем команды."""
 
@@ -287,22 +311,9 @@ class _Commands:
             print("--resume не может быть пустой строкой.", file=sys.stderr)
             return EXIT_ENVIRONMENT
         if args.branch or args.new_worktree:
-            # _start дальше зовёт load_config напрямую — без этой проверки
-            # отсутствие или порча конфига долетает наружу трейсбеком вместо
-            # внятного сообщения (тот же контракт, что и в _diagnose).
-            config_path = paths.config_file()
-            if not config_path.is_file():
-                print(
-                    f"--branch нужен config.toml, а его нет: {config_path}\n"
-                    "Скопируй config.example.toml и заполни (см. README).",
-                    file=sys.stderr,
-                )
-                return EXIT_ENVIRONMENT
-            try:
-                load_config(config_path)
-            except (ValueError, KeyError, OSError) as exc:
-                print(f"--branch нужен рабочий config.toml: {config_path}: {exc}", file=sys.stderr)
-                return EXIT_ENVIRONMENT
+            error = _worktree_config_error()
+            if error is not None:
+                return error
         try:
             session = asyncio.run(
                 _start(
@@ -437,6 +448,10 @@ class _Commands:
             if not target.is_dir():
                 print(f"Каталог не найден: {target}", file=sys.stderr)
                 return EXIT_ENVIRONMENT
+            if args.branch:
+                error = _worktree_config_error()
+                if error is not None:
+                    return error
             try:
                 session = asyncio.run(_start(target.resolve(), args.branch, None))
             except (LaunchError, WorktreeError) as exc:
