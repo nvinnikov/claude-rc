@@ -60,6 +60,12 @@ def test_attach_argv_detaches_others_and_matches_exactly(monkeypatch: pytest.Mon
     assert remote.attach_argv("rc-oms") == ["tmux", "attach", "-d", "-t", "=rc-oms"]
 
 
+def test_attach_argv_read_only_and_control(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
+    assert remote.attach_argv("s", read_only=True) == ["tmux", "attach", "-d", "-r", "-t", "=s"]
+    assert remote.attach_argv("s", control=True) == ["tmux", "-CC", "attach", "-d", "-t", "=s"]
+
+
 async def test_list_sessions_parses_rows_and_ignores_foreign(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

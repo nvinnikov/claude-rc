@@ -113,7 +113,7 @@ class TrustRequired(RuntimeError):
         self.cwd = cwd
 
 
-def attach_argv(tmux_name: str) -> list[str]:
+def attach_argv(tmux_name: str, *, read_only: bool = False, control: bool = False) -> list[str]:
     """Аргументы подсадки к сессии.
 
     CLAUDE_RC_TMUX_SOCKET переключает весь модуль на отдельный сервер (см.
@@ -124,12 +124,17 @@ def attach_argv(tmux_name: str) -> list[str]:
     argv = ["tmux"]
     if socket:
         argv += ["-L", socket]
+    if control:
+        argv.append("-CC")  # iTerm2: окна tmux становятся нативными вкладками
     # `-d` отцепляет прочих tmux-клиентов. Панель создаётся _COLS x _ROWS без
     # клиента, и второй клиент с узким окном ужал бы её всем сразу — TUI
     # переверстался бы под руками у того, кто работает прямо сейчас. Приложения
     # Claude это не касается: оно говорит с сессией через API, а не через tmux.
+    argv += ["attach", "-d"]
+    if read_only:
+        argv.append("-r")
     # `=` — точное совпадение: без него `rc-oms` рискует поймать `rc-oms-2`.
-    argv += ["attach", "-d", "-t", f"={tmux_name}"]
+    argv += ["-t", f"={tmux_name}"]
     return argv
 
 

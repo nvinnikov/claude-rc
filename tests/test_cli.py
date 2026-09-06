@@ -2070,6 +2070,67 @@ def test_send_all_flags_combined(
     assert "output" in capsys.readouterr().out
 
 
+def test_connect_execs_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: list[list[str]] = []
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.os, "execvp", lambda file, args: seen.append(args))
+    assert cli.main(["connect", "oms"]) == 0
+    assert seen == [["tmux", "attach", "-d", "-t", "=rc-oms"]]
+
+
+def test_connect_without_tty_hints_ssh_t(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=False))
+    monkeypatch.setattr(cli.os, "execvp", lambda file, args: pytest.fail("exec"))
+    assert cli.main(["connect", "oms"]) == 2
+    assert "ssh -t" in capsys.readouterr().err
+
+
+def test_connect_picks_the_only_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_list() -> list[RemoteSession]:
+        return [_session()]
+
+    seen: list[list[str]] = []
+    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.os, "execvp", lambda file, args: seen.append(args))
+    assert cli.main(["connect"]) == 0
+    assert seen[0][-1] == "=rc-oms"
+
+
+def test_connect_url_only_prints(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.os, "execvp", lambda file, args: pytest.fail("exec"))
+    assert cli.main(["connect", "oms", "--url"]) == 0
+    assert capsys.readouterr().out.strip() == "https://claude.ai/code/session_A"
+
+
+def test_connect_lists_when_several_and_no_target(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_list() -> list[RemoteSession]:
+        return [_session("a"), _session("b")]
+
+    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=False))
+    assert cli.main(["connect"]) == 2
+    assert "rc-a" in capsys.readouterr().err
+
+
 def test_stop_by_session_id_is_unambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
     killed: list[str] = []
 

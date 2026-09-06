@@ -36,6 +36,7 @@ from clauderc.remote import (
     LaunchError,
     RemoteSession,
     TrustRequired,
+    attach_argv,
     attach_command,
     await_url,
     confirm_trust,
@@ -183,6 +184,20 @@ def _parser() -> argparse.ArgumentParser:
         help="через 3 с напечатать N последних строк панели",
     )
     send_cmd.epilog = "Пример: claude-rc send oms -- -x"
+
+    connect = sub.add_parser("connect", help="подсесть к сессии терминалом (tmux attach)")
+    connect.add_argument(
+        "target", nargs="?", help="ярлык, каталог или session_…; пусто — единственная живая"
+    )
+    connect.add_argument(
+        "--read-only", action="store_true", dest="read_only", help="смотреть, не вводя"
+    )
+    connect.add_argument("--cc", action="store_true", help="tmux -CC для iTerm2")
+    connect.add_argument(
+        "--url", action="store_true", dest="url_only", help="напечатать ссылку и выйти"
+    )
+    connect.add_argument("--start", action="store_true", help="нет сессии — поднять и подсесть")
+    connect.add_argument("--branch", help="вместе с --start: worktree под ветку")
 
     doctor = sub.add_parser("doctor", help="проверить окружение")
     doctor.add_argument("--json", action="store_true", dest="as_json")
@@ -400,6 +415,51 @@ class _Commands:
         return 0
 
     @staticmethod
+    def connect(args: argparse.Namespace) -> int:
+        try:
+            session = asyncio.run(_pick(args.target))
+        except _Ambiguous as exc:
+            if not args.target:
+                # Пустая цель — «нечем работать без уточнения», а не «ошиблись
+                # с уточнением»: код возврата отличается от явно неоднозначного.
+                print(
+                    "Живых сессий несколько — назови ярлык, каталог или session_…:", file=sys.stderr
+                )
+                for candidate in exc.sessions:
+                    print(f"  {candidate.tmux_name}\t{candidate.cwd}", file=sys.stderr)
+                return EXIT_ENVIRONMENT
+            return _print_ambiguous(exc)
+        if session is None:
+            if not args.start:
+                print("Живой сессии нет. Добавь --start, чтобы поднять.", file=sys.stderr)
+                return EXIT_FAILED
+            target = Path(args.target or ".").expanduser()
+            if not target.is_dir():
+                print(f"Каталог не найден: {target}", file=sys.stderr)
+                return EXIT_ENVIRONMENT
+            try:
+                session = asyncio.run(_start(target.resolve(), args.branch, None))
+            except (LaunchError, WorktreeError) as exc:
+                print(str(exc), file=sys.stderr)
+                return EXIT_FAILED
+            except _TrustDeclined as exc:
+                print(str(exc), file=sys.stderr)
+                return exc.exit_code
+        if args.url_only:
+            print(session.url or "ссылка неизвестна")
+            return 0
+        if not sys.stdin.isatty():
+            print(
+                "connect нужен терминал: без tty tmux ответит «open terminal failed».\n"
+                "Через ssh — `ssh -t`, или напрямую: " + attach_command(session.tmux_name),
+                file=sys.stderr,
+            )
+            return EXIT_ENVIRONMENT
+        argv = attach_argv(session.tmux_name, read_only=args.read_only, control=args.cc)
+        os.execvp(argv[0], argv)
+        return 0  # только под подменённым execvp
+
+    @staticmethod
     def doctor(args: argparse.Namespace) -> int:
         checks = _diagnose()
         if args.as_json:
@@ -567,6 +627,16 @@ async def _one(target: str) -> RemoteSession | None:
     if len(matches) > 1:
         raise _Ambiguous(matches)
     return matches[0] if matches else None
+
+
+async def _pick(target: str | None) -> RemoteSession | None:
+    """Цель для connect: явная — через resolve; пустая — единственная живая."""
+    if target:
+        return await _one(target)
+    sessions = await list_sessions()
+    if len(sessions) > 1:
+        raise _Ambiguous(sessions)
+    return sessions[0] if sessions else None
 
 
 async def _one_passport(session: RemoteSession) -> passport.Passport:
