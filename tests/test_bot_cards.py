@@ -5,17 +5,15 @@ from pathlib import Path
 from clauderc import bot as bot_module
 from clauderc.bot import (
     ResumeChoice,
-    _attach_line,
     _chunk_report,
     _died_text,
-    _fresh_text,
     _has_repos,
-    _list_item,
     _pop_resume_group,
     _pull_line,
     _resume_keyboard,
     _same_session,
     _selected_targets,
+    _session_card,
     _sync_line,
     _sync_report_line,
     _sync_unavailable_line,
@@ -258,30 +256,19 @@ def _session(url: str = "https://claude.ai/code/session_01ABC") -> RemoteSession
     )
 
 
-def test_attach_line_carries_the_session_id() -> None:
-    # Id — то, что подставляется в `tmux attach -t =<id>`: `ssh` и хост у каждой
-    # машины свои, меняется здесь только имя.
-    assert _attach_line(_session()) == "🖥 <code>rc-oms</code>"
-
-
-def test_attach_line_escapes_html() -> None:
-    session = RemoteSession(name="x", tmux_name="rc-<evil>", cwd="/x", url="", created_at=0)
-    assert "&lt;evil&gt;" in _attach_line(session)
-
-
-def test_cards_show_both_ways_in() -> None:
-    # Ссылка ведёт в приложение, id — в терминал; карточка обязана давать обе,
-    # иначе с телефона второй способ попросту неоткуда взять.
-    session = _session()
-    for text in (_fresh_text(session), _list_item(session)):
-        assert session.url in text
-        assert "rc-oms" in text
-
-
-def test_cards_keep_the_id_when_the_url_is_unknown() -> None:
-    text = _list_item(_session(url=""))
-    assert "ссылка неизвестна" in text
-    assert "rc-oms" in text
+def test_session_card_is_the_passport_html() -> None:
+    session = RemoteSession(
+        name="oms@x",
+        tmux_name="session_01ABC",
+        cwd="/repos/oms",
+        url="https://claude.ai/code/session_01ABC",
+        created_at=int(time.time()),
+        label="oms@x",
+    )
+    text = _session_card(session, host="m1", tree=None)
+    assert "<b>oms@x</b>" in text
+    assert "ssh m1 -t" in text
+    assert "claude-rc --host m1" in text
 
 
 def test_same_session_recognises_the_session_from_the_card() -> None:

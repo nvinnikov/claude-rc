@@ -21,7 +21,7 @@ from aiogram.types import (
     User,
 )
 
-from clauderc import browse, history, paths, worktrees
+from clauderc import browse, history, passport, paths, worktrees
 from clauderc import sync as sync_mod
 from clauderc.browse import BrowseError
 from clauderc.config import Config, load_config
@@ -157,15 +157,6 @@ def _died_text(died: Died) -> str:
     )
 
 
-def _uptime(seconds: float) -> str:
-    minutes = int(seconds // 60)
-    if minutes < 1:
-        return "только что"
-    if minutes < 60:
-        return f"{minutes} мин"
-    return f"{minutes // 60} ч {minutes % 60} мин"
-
-
 def _label(path: Path, roots: tuple[Path, ...]) -> str:
     """Короткое имя для списка: относительный путь от ближайшего корня."""
     for root in roots:
@@ -176,8 +167,9 @@ def _label(path: Path, roots: tuple[Path, ...]) -> str:
     return str(path)
 
 
-def _link_line(session: RemoteSession) -> str:
-    return html.escape(session.url) if session.url else "ссылка неизвестна"
+def _session_card(session: RemoteSession, *, host: str, tree: Worktree | None) -> str:
+    """Единственный рендер карточки сессии в боте — тот же паспорт, что и у CLI."""
+    return passport.as_html(passport.build(session, host=host, tree=tree))
 
 
 def _same_session(session: RemoteSession | None, created_at: int) -> RemoteSession | None:
@@ -201,39 +193,6 @@ def _pull_line(result: SyncResult) -> str:
     if result.outcome is Outcome.skipped and result.branch == "?":
         return "⤵️ не git-репозиторий, тянуть нечего"
     return f"⤵️ {html.escape(result.branch)}: {html.escape(result.detail)}"
-
-
-def _attach_line(session: RemoteSession) -> str:
-    """Имя tmux-сессии — второй вход в неё, кроме ссылки.
-
-    Показывается всегда, а не только когда ссылку добыть не удалось: забрать имя
-    с телефона и надо, чтобы подсесть из терминала на другой машине. Дальше оно
-    подставляется в `tmux attach -d -t =<имя>` (см. README про алиас) — команду
-    целиком карточка не носит: `ssh` и хост у каждой машины свои, а меняется
-    здесь только имя. В Telegram <code> копируется одним тапом.
-    """
-    return f"🖥 <code>{html.escape(session.tmux_name)}</code>"
-
-
-def _fresh_text(session: RemoteSession) -> str:
-    return (
-        f"✅ Сессия <b>{html.escape(session.name)}</b> поднята\n"
-        f"<code>{html.escape(session.cwd)}</code>\n"
-        f"{_link_line(session)}\n"
-        f"{_attach_line(session)}"
-    )
-
-
-def _list_item(session: RemoteSession, tree: Worktree | None = None) -> str:
-    lines = [
-        f"▸ <b>{html.escape(session.name)}</b> · {_uptime(session.uptime_s())}",
-        f"<code>{html.escape(session.cwd)}</code>",
-    ]
-    if tree is not None:
-        lines.append(f"🌿 <code>{html.escape(tree.branch)}</code> · {_tree_state(tree)}")
-    lines.append(_link_line(session))
-    lines.append(_attach_line(session))
-    return "\n".join(lines)
 
 
 def _tree_state(tree: Worktree) -> str:
@@ -514,7 +473,7 @@ async def main() -> None:
         alive_here = await find(str(target))
         if alive_here is not None and branch is None:
             await notice.edit_text(
-                f"Уже поднята.\n{_list_item(alive_here)}",
+                f"Уже поднята.\n{_session_card(alive_here, host=config.host, tree=None)}",
                 parse_mode="HTML",
                 reply_markup=_open_keyboard(alive_here.url),
             )
@@ -552,7 +511,7 @@ async def main() -> None:
         alive = await find(str(cwd))
         if alive is not None:
             await notice.edit_text(
-                told(f"Уже поднята.\n{_list_item(alive)}"),
+                told(f"Уже поднята.\n{_session_card(alive, host=config.host, tree=None)}"),
                 parse_mode="HTML",
                 reply_markup=_open_keyboard(alive.url),
             )
@@ -600,7 +559,7 @@ async def main() -> None:
             return
 
         await notice.edit_text(
-            told(_fresh_text(session)),
+            told(f"✅ Сессия поднята\n{_session_card(session, host=config.host, tree=None)}"),
             parse_mode="HTML",
             reply_markup=_open_keyboard(session.url),
         )
@@ -678,7 +637,7 @@ async def main() -> None:
                 rows.append([InlineKeyboardButton(text="Open in Claude", url=session.url)])
             rows.append([InlineKeyboardButton(text="⏹ Stop", callback_data=f"stop:{token}")])
             await message.answer(
-                _list_item(session, trees.get(real)),
+                _session_card(session, host=config.host, tree=trees.get(real)),
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
@@ -1264,7 +1223,9 @@ async def main() -> None:
             return
 
         await message.answer(
-            _fresh_text(session), parse_mode="HTML", reply_markup=_open_keyboard(session.url)
+            f"✅ Сессия поднята\n{_session_card(session, host=config.host, tree=None)}",
+            parse_mode="HTML",
+            reply_markup=_open_keyboard(session.url),
         )
 
     @dp.callback_query(F.data.startswith("rc:"))
@@ -1415,7 +1376,7 @@ async def main() -> None:
         for session in await list_sessions():
             await bot.send_message(
                 config.allowed_user_id,
-                _list_item(session),
+                _session_card(session, host=config.host, tree=None),
                 parse_mode="HTML",
                 reply_markup=_open_keyboard(session.url),
             )
