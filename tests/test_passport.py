@@ -103,6 +103,22 @@ def test_as_html_escapes(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "ссылка неизвестна" in html_text
 
 
+def test_as_html_caps_the_pane_tail() -> None:
+    # capture-pane -J склеивает перенесённые строки в длинные — без отреза
+    # одна болтливая сессия сама по себе перевалит карточку за лимит Telegram.
+    base = passport.build(_session(), host="", tree=None)
+    html_text = passport.as_html(dataclasses.replace(base, last_lines=("x" * 5000,)))
+    assert len(html_text) < 3000
+    assert html_text.rstrip().endswith("…</pre>")
+
+
+def test_as_html_keeps_a_short_tail_intact() -> None:
+    base = passport.build(_session(), host="", tree=None)
+    html_text = passport.as_html(dataclasses.replace(base, last_lines=("short tail",)))
+    assert "<pre>short tail</pre>" in html_text
+    assert "…" not in html_text
+
+
 async def test_collect_inspects_each_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_inspect(path: Path) -> Worktree | None:
         return _tree() if str(path) == "/repos/oms" else None

@@ -30,6 +30,11 @@ _STATE_WORDS = {
     "unknown": "❔ состояние неясно",
 }
 
+# `capture-pane -J` склеивает перенесённые строки панели в длинные логические —
+# без отреза хвост одной болтливой сессии сам по себе перевалит за лимит
+# Telegram в 4096 символов, и карточка не отправится вовсе.
+_PRE_MAX_CHARS = 1500
+
 
 @dataclass(frozen=True)
 class Passport:
@@ -193,5 +198,10 @@ def as_html(p: Passport) -> str:
     ]
     text = "\n".join(line for line in lines if line)
     if p.last_lines:
-        text += "\n<pre>" + e("\n".join(p.last_lines)) + "</pre>"
+        # Режем уже экранированную строку: отрез до escape мог бы попасть в
+        # середину «&lt;» и отдать в Telegram битую HTML-сущность.
+        tail = e("\n".join(p.last_lines))
+        if len(tail) > _PRE_MAX_CHARS:
+            tail = tail[:_PRE_MAX_CHARS] + "…"
+        text += "\n<pre>" + tail + "</pre>"
     return text

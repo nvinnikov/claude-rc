@@ -696,7 +696,7 @@ async def main() -> None:
                 rows.append([InlineKeyboardButton(text="Open in Claude", url=session.url)])
             rows.append([InlineKeyboardButton(text="⏹ Stop", callback_data=f"stop:{token}")])
             await message.answer(
-                _session_card(p),
+                _session_card(p)[:3800],
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
