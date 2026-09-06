@@ -8,13 +8,20 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from clauderc import remote
+from clauderc import remote as remote  # тесты подменяют actions.remote.launch
 from clauderc.remote import RemoteSession
 
 LABEL_OPTION = "@rc_label"
 _UNKNOWN_COMMAND = re.compile(r"Unknown (?:slash )?command", re.IGNORECASE)
+
+# (tmux_name, cwd) -> погашена ли; в боте — Watcher.kill, в CLI — обёртка над
+# remote.kill_tmux. Гашение чужое: сам restart сессию не трогает, чтобы
+# намеренная смерть не доехала до человека карточкой «сессия упала».
+Killer = Callable[[str, str], Awaitable[bool]]
+_SESSION_PREFIX = "session_"
 
 
 class ActionError(RuntimeError):
@@ -90,3 +97,24 @@ async def rename(session: RemoteSession, name: str, *, settle_s: float = 1.5) ->
     await asyncio.sleep(settle_s)
     recent = await tail(session, lines=8)
     return RenameResult(label=label, app_renamed=_UNKNOWN_COMMAND.search(recent) is None)
+
+
+async def restart(
+    session: RemoteSession, *, kill: Killer, mode: str | None = None, timeout_s: float = 90.0
+) -> RemoteSession:
+    """Гасит и поднимает заново в том же каталоге с тем же ярлыком и --resume.
+
+    `kill` — чужой: в боте это Watcher.kill, иначе намеренное гашение доехало
+    бы карточкой «сессия упала». Режим — из аргумента, иначе прежний из
+    @rc_mode. Ссылка после перезапуска новая.
+    """
+    session_id = session.tmux_name if session.tmux_name.startswith(_SESSION_PREFIX) else None
+    if not await kill(session.tmux_name, session.cwd):
+        raise ActionError(f"сессия {session.name} не погасла — перезапуск отменён")
+    return await remote.launch(
+        session.label or session.name,
+        session.cwd,
+        timeout_s=timeout_s,
+        resume=session_id,
+        permission_mode=mode or session.mode or None,
+    )

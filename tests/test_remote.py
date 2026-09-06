@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
@@ -228,6 +229,39 @@ async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch: pytest.Monk
         await remote._run("kill-server", check=False)
 
     assert _default_server_sessions() == before
+
+
+@pytest.mark.skipif(not remote.tmux_available(), reason="нет tmux")
+async def test_send_and_restart_against_real_tmux(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from clauderc import actions
+
+    socket_name = f"claude-rc-pytest-{uuid.uuid4().hex[:8]}"
+    monkeypatch.setenv(remote.TMUX_SOCKET_ENV, socket_name)
+    url = "https://claude.ai/code/session_" + uuid.uuid4().hex[:16]
+    stub = tmp_path / "fake-claude"
+    # `cat` — чтобы набранный текст остался на экране: echo его печатает как ввод.
+    stub.write_text(f'#!/bin/sh\necho "remote control active at"\necho "{url}"\ncat\n')
+    stub.chmod(0o755)
+    monkeypatch.setattr(remote, "CLAUDE_BIN", str(stub))
+    label = f"pytest-{uuid.uuid4().hex[:8]}@mcp-fix"
+
+    async def kill(tmux_name: str, cwd: str) -> bool:
+        return await remote.kill_tmux(tmux_name)
+
+    try:
+        session = await remote.launch(label, str(tmp_path), timeout_s=20)
+        await actions.send(session, "hello pane")
+        await asyncio.sleep(0.5)
+        assert "hello pane" in await actions.tail(session, lines=10)
+
+        fresh = await actions.restart(session, kill=kill, timeout_s=20)
+        assert fresh.label == label
+        assert fresh.mode == remote.DEFAULT_PERMISSION_MODE
+        assert fresh.cwd == session.cwd
+    finally:
+        await remote._run("kill-server", check=False)
 
 
 async def test_find_matches_by_directory_not_name(monkeypatch: pytest.MonkeyPatch) -> None:

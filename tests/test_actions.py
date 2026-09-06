@@ -1,4 +1,6 @@
+import dataclasses
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import pytest
 from clauderc import actions, remote
@@ -136,3 +138,66 @@ async def test_send_and_tail_waits_then_reads(monkeypatch: pytest.MonkeyPatch) -
     out = await actions.send_and_tail(_session(), "/mcp", wait_s=0, lines=2)
     assert out == "b\nc"
     assert calls == ["send-keys", "send-keys", "capture-pane"]
+
+
+async def test_restart_kills_then_relaunches_with_resume_and_old_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    killed: list[tuple[str, str]] = []
+
+    async def kill(tmux_name: str, cwd: str) -> bool:
+        order.append("kill")
+        killed.append((tmux_name, cwd))
+        return True
+
+    async def fake_launch(label: str, cwd: str, **kw: Any) -> RemoteSession:
+        order.append("launch")
+        assert label == "oms@old"
+        assert kw["resume"] == "session_01ABC"
+        assert kw["permission_mode"] == "plan"
+        return _session()
+
+    monkeypatch.setattr(actions.remote, "launch", fake_launch)
+    session = dataclasses.replace(_session(), mode="plan")
+    await actions.restart(session, kill=kill)
+    assert order == ["kill", "launch"]
+    assert killed == [("session_01ABC", "/repos/oms")]
+
+
+async def test_restart_overrides_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def kill(tmux_name: str, cwd: str) -> bool:
+        return True
+
+    seen: dict[str, Any] = {}
+
+    async def fake_launch(label: str, cwd: str, **kw: Any) -> RemoteSession:
+        seen.update(kw)
+        return _session()
+
+    monkeypatch.setattr(actions.remote, "launch", fake_launch)
+    await actions.restart(_session(), kill=kill, mode="bypassPermissions")
+    assert seen["permission_mode"] == "bypassPermissions"
+
+
+async def test_restart_without_session_id_launches_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def kill(tmux_name: str, cwd: str) -> bool:
+        return True
+
+    seen: dict[str, Any] = {}
+
+    async def fake_launch(label: str, cwd: str, **kw: Any) -> RemoteSession:
+        seen.update(kw)
+        return _session()
+
+    monkeypatch.setattr(actions.remote, "launch", fake_launch)
+    await actions.restart(_session(tmux_name="rc-oms"), kill=kill)
+    assert seen["resume"] is None
+
+
+async def test_restart_refuses_when_kill_fails() -> None:
+    async def kill(tmux_name: str, cwd: str) -> bool:
+        return False
+
+    with pytest.raises(actions.ActionError, match="не погас"):
+        await actions.restart(_session(), kill=kill)

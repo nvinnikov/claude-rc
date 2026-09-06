@@ -159,6 +159,10 @@ def _parser() -> argparse.ArgumentParser:
     rename_cmd.add_argument("target", help="ярлык, каталог или session_…")
     rename_cmd.add_argument("name")
 
+    restart_cmd = sub.add_parser("restart", help="погасить и поднять заново с --resume")
+    restart_cmd.add_argument("target")
+    restart_cmd.add_argument("--mode", choices=PERMISSION_MODES, help="сменить режим прав")
+
     send_cmd = sub.add_parser("send", help="набрать текст в панель сессии")
     send_cmd.add_argument("target")
     send_cmd.add_argument(
@@ -346,6 +350,30 @@ class _Commands:
                 "Приложение Claude имя не подхватило: у этой версии claude нет /rename.",
                 file=sys.stderr,
             )
+        return 0
+
+    @staticmethod
+    def restart(args: argparse.Namespace) -> int:
+        try:
+            session = asyncio.run(_one(args.target))
+        except _Ambiguous as exc:
+            return _print_ambiguous(exc)
+        if session is None:
+            print(f"Сессия не найдена: {args.target}", file=sys.stderr)
+            return EXIT_FAILED
+
+        async def kill(tmux_name: str, cwd: str) -> bool:
+            return await kill_tmux(tmux_name)
+
+        try:
+            fresh = asyncio.run(actions.restart(session, kill=kill, mode=args.mode))
+        except (actions.ActionError, LaunchError) as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_FAILED
+        except TrustRequired as need:
+            print(f"Каталог снова ждёт доверия: {attach_command(need.tmux_name)}", file=sys.stderr)
+            return EXIT_ENVIRONMENT
+        print(passport.as_text(asyncio.run(_one_passport(fresh))))
         return 0
 
     @staticmethod
@@ -539,6 +567,11 @@ async def _one(target: str) -> RemoteSession | None:
     if len(matches) > 1:
         raise _Ambiguous(matches)
     return matches[0] if matches else None
+
+
+async def _one_passport(session: RemoteSession) -> passport.Passport:
+    (p,) = await passport.collect([session], host=_host_name(), probe=False)
+    return p
 
 
 def _print_ambiguous(exc: _Ambiguous) -> int:

@@ -1937,6 +1937,33 @@ def test_rename_prints_new_label(
     assert "/rename" in err
 
 
+def test_restart_uses_kill_tmux_and_prints_passport(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_restart(
+        session: RemoteSession, *, kill: Any, mode: str | None = None, timeout_s: float = 90.0
+    ) -> RemoteSession:
+        seen["mode"] = mode
+        assert await kill("rc-oms", "/repos/oms") is True
+        return _session()
+
+    async def fake_kill(tmux_name: str) -> bool:
+        return True
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli, "kill_tmux", fake_kill)
+    monkeypatch.setattr(cli.actions, "restart", fake_restart)
+    monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
+    assert cli.main(["restart", "oms", "--mode", "bypassPermissions"]) == 0
+    assert seen["mode"] == "bypassPermissions"
+    assert "session_A" in capsys.readouterr().out
+
+
 def test_send_prints_tail_when_asked(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
