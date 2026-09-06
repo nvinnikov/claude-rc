@@ -1,0 +1,86 @@
+"""`claude-rc --host m1 …` — та же команда, выполненная на другой машине.
+
+Транспорт — ssh и только он: аутентификация, шифрование и ключи у него уже
+есть. Процесс замещается через execvp: коды возврата, stdout и Ctrl+C
+достаются ssh без нашего посредничества. Никакой роли «управляющий» у машины
+нет — любая с claude-rc может звать любую другую.
+"""
+
+from __future__ import annotations
+
+import os as os  # тесты подменяют proxy.os.execvp
+import shlex
+import subprocess as subprocess  # тесты подменяют proxy.subprocess.run
+
+HOST_ENV = "CLAUDE_RC_HOST"
+# bot — умер бы вместе с ssh-сессией; update — гасит приложение на той машине
+# и должен идти из её Терминала; forward — исполняется здесь по определению.
+LOCAL_ONLY = frozenset({"bot", "forward", "update"})
+# Команды, где человек отвечает на вопрос в терминале.
+TTY_COMMANDS = frozenset({"connect", "start", "setup"})
+# Команды с путём в позиционном аргументе: относительный путь означал бы
+# каталог этой машины, а исполняется команда на той.
+PATH_COMMANDS = frozenset({"start", "whoami", "sync"})
+# Опции этих команд, у которых есть значение — чтобы не принять его за путь.
+_VALUED_OPTIONS = frozenset({"--branch", "--resume", "--permission-mode", "--name", "--mode"})
+# Неинтерактивный ssh не читает .zshrc; uv tool кладёт бинарь в ~/.local/bin.
+_PATH_PREFIX = 'export PATH="$HOME/.local/bin:$PATH"; '
+
+
+def strip_host(argv: list[str]) -> tuple[str | None, list[str]]:
+    host: str | None = None
+    rest: list[str] = []
+    it = iter(argv)
+    for arg in it:
+        if arg == "--host":
+            host = next(it, None)
+        elif arg.startswith("--host="):
+            host = arg.removeprefix("--host=")
+        else:
+            rest.append(arg)
+    return host, rest
+
+
+def command_of(argv: list[str]) -> str | None:
+    return next((a for a in argv if not a.startswith("-")), None)
+
+
+def relative_paths(argv: list[str]) -> list[str]:
+    command = command_of(argv)
+    if command not in PATH_COMMANDS:
+        return []
+    positionals: list[str] = []
+    skip = False
+    for arg in argv[argv.index(command) + 1 :]:
+        if skip:
+            skip = False
+            continue
+        if arg in _VALUED_OPTIONS:
+            skip = True
+            continue
+        if arg.startswith("-"):
+            continue
+        positionals.append(arg)
+    if not positionals and command != "sync":
+        positionals = ["."]
+    return [p for p in positionals if not (os.path.isabs(p) or p.startswith("~"))]
+
+
+def remote_argv(host: str, args: list[str], *, tty: bool) -> list[str]:
+    command = _PATH_PREFIX + shlex.join(["claude-rc", *args])
+    return ["ssh", "-t" if tty else "-T", host, command]
+
+
+def exec_remote(host: str, args: list[str]) -> None:
+    argv = remote_argv(host, args, tty=command_of(args) in TTY_COMMANDS)
+    os.execvp(argv[0], argv)
+
+
+def run_remote(host: str, args: list[str], *, timeout_s: float = 30.0) -> tuple[int, str]:
+    """Выполнить и вернуть вывод — для forward, которому нужен sessions --json той стороны."""
+    argv = remote_argv(host, args, tty=False)
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s, check=False)
+    except subprocess.TimeoutExpired:
+        return 1, f"ssh {host} не ответил за {timeout_s:.0f}с"
+    return done.returncode, done.stdout if done.returncode == 0 else done.stderr

@@ -25,6 +25,7 @@ from typing import Any, NamedTuple
 from clauderc import actions as actions  # тесты подменяют cli.actions.rename
 from clauderc import passport as passport  # тесты подменяют cli.passport.worktrees.inspect
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
+from clauderc import proxy as proxy  # тесты подменяют cli.proxy.exec_remote
 from clauderc import setup as setup  # тесты подменяют cli.setup.verify_token/catch_user_id
 from clauderc import sync as clauderc_sync  # _Commands.sync затенил бы модуль sync
 from clauderc import update as update_mod  # _Commands.update затенил бы модуль update
@@ -64,8 +65,29 @@ def run() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    host, rest = proxy.strip_host(raw)
+    host = host or os.environ.get(proxy.HOST_ENV) or None
+    command = proxy.command_of(rest)
+    if host and command != "forward":
+        if command in proxy.LOCAL_ONLY:
+            print(
+                f"{command} при --host не выполняется: {_LOCAL_ONLY_WHY[command]}", file=sys.stderr
+            )
+            return EXIT_ENVIRONMENT
+        relative = proxy.relative_paths(rest)
+        if relative:
+            print(
+                f"При --host путь должен быть абсолютным или от ~: {', '.join(relative)}",
+                file=sys.stderr,
+            )
+            return EXIT_ENVIRONMENT
+        proxy.exec_remote(host, rest)
+        return 0  # execvp не возвращается; сюда попадает только тест с подменой
+
     parser = _parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(rest)
+    args.host = host  # forward читает отсюда (задача 16)
     if args.command is None:
         parser.print_usage(sys.stderr)
         return EXIT_ENVIRONMENT
@@ -74,8 +96,16 @@ def main(argv: list[str] | None = None) -> int:
     return int(handler(args))
 
 
+_LOCAL_ONLY_WHY = {
+    "bot": "бот умер бы вместе с ssh-сессией — запусти его на той машине",
+    "update": "обновление гасит приложение той машины и должно идти из её Терминала",
+    "forward": "туннель строится с этой стороны",
+}
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="claude-rc", description="RC-сессии Claude Code")
+    parser.add_argument("--host", help="выполнить команду на этой машине по ssh")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("bot", help="запустить Telegram-бота на переднем плане")

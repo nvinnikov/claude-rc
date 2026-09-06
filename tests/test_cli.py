@@ -3,10 +3,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from clauderc import actions, cli, remote
+from clauderc import actions, cli, proxy, remote
 from clauderc import update as update_mod
 from clauderc.remote import LaunchError, RemoteSession, TrustRequired
 from clauderc.worktrees import Worktree
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Без этого случайный CLAUDE_RC_HOST в окружении проксировал бы чужие тесты."""
+    monkeypatch.delenv(proxy.HOST_ENV, raising=False)
 
 
 async def _fake_no_worktree(path: Path) -> Worktree | None:
@@ -2260,3 +2266,35 @@ def test_whoami_outside_a_session_says_so(
     monkeypatch.setattr(cli, "find_enclosing", fake)
     assert cli.main(["whoami", str(tmp_path)]) == 1
     assert capsys.readouterr().err.strip()
+
+
+def test_host_flag_proxies_through_ssh(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[str]] = []
+    monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: seen.append([host, *args]))
+    cli.main(["--host", "m1", "sessions", "--json"])
+    assert seen == [["m1", "sessions", "--json"]]
+
+
+def test_host_env_is_used_when_no_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+    monkeypatch.setenv(proxy.HOST_ENV, "m3")
+    monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: seen.append(host))
+    cli.main(["sessions"])
+    assert seen == ["m3"]
+
+
+@pytest.mark.parametrize("command", ["bot", "update"])
+def test_host_refuses_local_only_commands(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: pytest.fail("proxied"))
+    assert cli.main(["--host", "m1", command]) == 2
+    assert command in capsys.readouterr().err
+
+
+def test_host_refuses_relative_paths(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: pytest.fail("proxied"))
+    assert cli.main(["--host", "m1", "start", "."]) == 2
+    assert "абсолютн" in capsys.readouterr().err
