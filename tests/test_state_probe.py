@@ -55,3 +55,41 @@ async def test_probe_keeps_last_lines(monkeypatch: pytest.MonkeyPatch) -> None:
 
 async def _no_ports(tmux_name: str) -> tuple[int, ...]:
     return ()
+
+
+def test_parse_lsof_extracts_ports() -> None:
+    out = "p123\nn*:3000\np456\nn127.0.0.1:5173\nn[::1]:5173\n"
+    assert state_probe._parse_lsof(out) == (3000, 5173)
+
+
+async def test_listening_ports_walks_children(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run(*a: str, check: bool = True) -> tuple[int, str]:
+        assert a == ("list-panes", "-t", "=session_X:", "-F", "#{pane_pid}")
+        return 0, "100\n"
+
+    calls: list[list[str]] = []
+
+    async def exec_(argv: list[str], timeout_s: float = 5.0) -> tuple[int, str]:
+        calls.append(argv)
+        if argv[0] == "pgrep":
+            parent = argv[-1]
+            return (0, "101\n102\n") if parent == "100" else (1, "")
+        assert argv[0] == "lsof"
+        assert "100,101,102" in argv
+        return 0, "n*:3000\n"
+
+    monkeypatch.setattr(remote, "_run", run)
+    monkeypatch.setattr(state_probe, "_exec", exec_)
+    assert await state_probe.listening_ports("session_X") == (3000,)
+
+
+async def test_listening_ports_empty_when_lsof_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run(*a: str, check: bool = True) -> tuple[int, str]:
+        return 0, "100\n"
+
+    async def exec_(argv: list[str], timeout_s: float = 5.0) -> tuple[int, str]:
+        return 127, "not found"
+
+    monkeypatch.setattr(remote, "_run", run)
+    monkeypatch.setattr(state_probe, "_exec", exec_)
+    assert await state_probe.listening_ports("session_X") == ()

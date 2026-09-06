@@ -9,11 +9,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from enum import StrEnum
 
 from clauderc import remote
+
+_EXEC_TIMEOUT_S = 5.0
 
 _TAIL_FOR_CLASSIFY = 12
 
@@ -65,8 +68,57 @@ def classify(pane: str) -> State:
     return State.UNKNOWN
 
 
+async def _exec(argv: list[str], timeout_s: float = _EXEC_TIMEOUT_S) -> tuple[int, str]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+    except OSError as exc:  # бинаря нет
+        return 127, str(exc)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return 1, f"{argv[0]} не ответил за {timeout_s:.0f}с"
+    return proc.returncode or 0, out.decode("utf-8", "replace")
+
+
+async def _descendants(root: str) -> list[str]:
+    pids, queue = [root], [root]
+    while queue:
+        code, out = await _exec(["pgrep", "-P", queue.pop()])
+        if code != 0:
+            continue
+        children = out.split()
+        pids.extend(children)
+        queue.extend(children)
+    return pids
+
+
+def _parse_lsof(out: str) -> tuple[int, ...]:
+    ports: set[int] = set()
+    for line in out.splitlines():
+        if line.startswith("n") and ":" in line:
+            tail = line.rsplit(":", 1)[1]
+            if tail.isdigit():
+                ports.add(int(tail))
+    return tuple(sorted(ports))
+
+
 async def listening_ports(tmux_name: str) -> tuple[int, ...]:
-    return ()  # задача 9
+    """TCP-порты, которые слушают процессы панели. Детерминировано: pid → потомки → lsof."""
+    code, out = await remote._run(
+        "list-panes", "-t", f"={tmux_name}:", "-F", "#{pane_pid}", check=False
+    )
+    root = out.strip().split("\n")[0] if code == 0 else ""
+    if not root.isdigit():
+        return ()
+    pids = await _descendants(root)
+    code, out = await _exec(
+        ["lsof", "-a", "-p", ",".join(pids), "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-Fn"]
+    )
+    return _parse_lsof(out) if code == 0 else ()
 
 
 async def probe(tmux_name: str, *, lines: int = 5) -> SessionState:
