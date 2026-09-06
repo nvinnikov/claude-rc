@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from clauderc import actions as actions  # тесты подменяют cli.actions.rename
+from clauderc import forward as forward  # тесты подменяют cli.forward.start/stop
 from clauderc import passport as passport  # тесты подменяют cli.passport.worktrees.inspect
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
 from clauderc import proxy as proxy  # тесты подменяют cli.proxy.exec_remote
@@ -104,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
 _LOCAL_ONLY_WHY = {
     "bot": "бот умер бы вместе с ssh-сессией — запусти его на той машине",
     "update": "обновление гасит приложение той машины и должно идти из её Терминала",
+    # "forward" сюда не доходит: `main` пропускает его мимо этой ветки выше по
+    # коду (`command != "forward"`) и сам кладёт args.host для _Commands.forward.
     "forward": "туннель строится с этой стороны",
 }
 
@@ -216,6 +219,13 @@ def _parser() -> argparse.ArgumentParser:
     sync_cmd.add_argument("paths", nargs="*", help="каталоги (по умолчанию текущий)")
     sync_cmd.add_argument("--branch", help="переключить на ветку перед подтягиванием")
     sync_cmd.add_argument("--no-fetch", action="store_false", dest="fetch", help="не ходить в сеть")
+
+    forward_cmd = sub.add_parser("forward", help="ssh-туннель к портам сессии на --host")
+    forward_cmd.add_argument("target")
+    forward_cmd.add_argument(
+        "ports", nargs="*", type=int, help="порты; пусто — те, что сессия слушает"
+    )
+    forward_cmd.add_argument("--stop", action="store_true")
 
     return parser
 
@@ -615,6 +625,40 @@ class _Commands:
         failed = counts[clauderc_sync.Outcome.failed]
         return EXIT_FAILED if failed else 0
 
+    @staticmethod
+    def forward(args: argparse.Namespace) -> int:
+        host: str | None = getattr(args, "host", None)
+        if not host:
+            print(
+                "forward работает только с --host: на одной машине пробрасывать нечего.",
+                file=sys.stderr,
+            )
+            return EXIT_ENVIRONMENT
+        if args.stop:
+            stopped = forward.stop(host, args.ports or None)
+            if not stopped:
+                print(f"Туннелей к {host} нет.")
+                return 0
+            for f in stopped:
+                print(f"снят {f.host}:{f.port} (pid {f.pid})")
+            return 0
+        ports: list[int] | None = list(args.ports)
+        if not ports:
+            ports = _remote_ports(host, args.target)
+            if ports is None:
+                return EXIT_FAILED
+            if not ports:
+                print("Сессия ничего не слушает — назови порт явно.", file=sys.stderr)
+                return EXIT_FAILED
+        try:
+            started = forward.start(host, ports)
+        except forward.ForwardError as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_FAILED
+        for f in started:
+            print(f"http://localhost:{f.port} → {f.host}:{f.port} (pid {f.pid})")
+        return 0
+
 
 class _TrustDeclined(RuntimeError):
     """Каталог требует подтверждения доверия, а подтвердить некому или отказались."""
@@ -690,6 +734,35 @@ def _host_name() -> str:
         return load_config(config_path).host
     except (ValueError, KeyError, OSError):
         return ""
+
+
+def _remote_ports(host: str, target: str) -> list[int] | None:
+    """Порты, которые слушает сессия `target` на `host` — из её же паспорта.
+
+    Возвращает `None` при неудаче (ssh, битый JSON, цель не нашлась/неоднозначна) —
+    сообщение об ошибке уже напечатано, `forward` дальше просто выходит с кодом.
+    """
+    code, out = proxy.run_remote(host, ["sessions", "--json"])
+    if code != 0:
+        print(f"ssh {host}: {out.strip()}", file=sys.stderr)
+        return None
+    try:
+        sessions = json.loads(out)["sessions"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        print(f"ssh {host}: непонятный ответ: {out.strip()}", file=sys.stderr)
+        return None
+    wanted = target.strip()
+    hits = [
+        s
+        for s in sessions
+        if wanted in {s.get("label"), s.get("tmux_name"), s.get("cwd"), s.get("name")}
+    ]
+    if len(hits) != 1:
+        print("Сессия не найдена или их несколько:", file=sys.stderr)
+        for s in sessions:
+            print(f"  {s.get('label')}\t{s.get('tmux_name')}\t{s.get('cwd')}", file=sys.stderr)
+        return None
+    return [int(p) for p in hits[0].get("listening", [])]
 
 
 def _current_version() -> str:

@@ -2568,3 +2568,62 @@ def test_host_without_value_is_an_error_not_a_local_run(
     monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: pytest.fail("proxied"))
     assert cli.main(["sessions", "--host"]) == 2
     assert "--host" in capsys.readouterr().err
+
+
+def test_forward_requires_host(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["forward", "oms"]) == 2
+    assert "--host" in capsys.readouterr().err
+
+
+def test_forward_takes_ports_from_remote_passport(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = json.dumps(
+        {
+            "sessions": [
+                {
+                    "label": "oms@x",
+                    "cwd": "/r/oms",
+                    "tmux_name": "session_A",
+                    "listening": [3000, 5173],
+                }
+            ]
+        }
+    )
+
+    def fake_run_remote(host: str, args: list[str], **kw: object) -> tuple[int, str]:
+        return 0, payload
+
+    monkeypatch.setattr(cli.proxy, "run_remote", fake_run_remote)
+    seen: dict[str, Any] = {}
+
+    def fake_start(host: str, ports: list[int]) -> list[cli.forward.Forward]:
+        seen.update(host=host, ports=ports)
+        return []
+
+    monkeypatch.setattr(cli.forward, "start", fake_start)
+    assert cli.main(["--host", "m1", "forward", "oms@x"]) == 0
+    assert seen == {"host": "m1", "ports": [3000, 5173]}
+
+
+def test_forward_explicit_ports_skip_remote_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_run_remote(host: str, args: list[str], **kw: object) -> tuple[int, str]:
+        pytest.fail("looked up")
+
+    monkeypatch.setattr(cli.proxy, "run_remote", fail_run_remote)
+    seen: dict[str, Any] = {}
+
+    def fake_start(host: str, ports: list[int]) -> list[cli.forward.Forward]:
+        seen.update(ports=ports)
+        return []
+
+    monkeypatch.setattr(cli.forward, "start", fake_start)
+    assert cli.main(["--host", "m1", "forward", "oms", "8080"]) == 0
+    assert seen["ports"] == [8080]
+
+
+def test_forward_stop(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    def fake_stop(host: str, ports: list[int] | None = None) -> list[cli.forward.Forward]:
+        return [cli.forward.Forward("m1", 3000, 1)]
+
+    monkeypatch.setattr(cli.forward, "stop", fake_stop)
+    assert cli.main(["--host", "m1", "forward", "oms", "--stop"]) == 0
+    assert "3000" in capsys.readouterr().out
