@@ -7,14 +7,22 @@
 from __future__ import annotations
 
 import os as os  # тесты подменяют forward.os.kill
+import re
 import signal
 import socket
 import subprocess as subprocess  # тесты подменяют forward.subprocess.Popen
+import time as time  # тесты подменяют forward.time.sleep
 from dataclasses import dataclass
 from pathlib import Path
 
 PID_DIR_ENV = "CLAUDE_RC_FORWARDS"
 _DEFAULT_DIR = "~/.claude-rc/forwards"
+# Сколько ждать после Popen, прежде чем поверить, что ssh не умер сразу
+# (например, из-за отказа авторизации).
+_SETTLE_S = 0.5
+# Имя хоста для ssh: без "/" и без ведущего "-" — иначе оно попадёт прямо в
+# путь pid-файла (../../etc/x сбежал бы из pid_dir()) или сойдёт за опцию ssh.
+_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class ForwardError(RuntimeError):
@@ -26,6 +34,11 @@ class Forward:
     host: str
     port: int
     pid: int
+
+
+def _check_host(host: str) -> None:
+    if not _HOST_RE.match(host):
+        raise ForwardError(f"недопустимое имя хоста: {host}")
 
 
 def pid_dir() -> Path:
@@ -47,6 +60,7 @@ def port_busy(port: int) -> bool:
 
 
 def start(host: str, ports: list[int]) -> list[Forward]:
+    _check_host(host)
     busy = [p for p in ports if port_busy(p)]
     if busy:
         raise ForwardError("порт уже занят локально: " + ", ".join(map(str, busy)))
@@ -61,6 +75,14 @@ def start(host: str, ports: list[int]) -> list[Forward]:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        time.sleep(_SETTLE_S)
+        rc = proc.poll()
+        if rc is not None:
+            # Туннели, поднятые раньше в этом же вызове, уже работают и не
+            # гасятся — неудача одного порта не должна рвать соседние.
+            raise ForwardError(
+                f"ssh -L {port} на {host} завершился сразу (код {rc}); проверь ssh {host}"
+            )
         _pid_file(host, port).write_text(str(proc.pid))
         started.append(Forward(host=host, port=port, pid=proc.pid))
     return started
@@ -82,14 +104,24 @@ def active() -> list[Forward]:
 
 
 def stop(host: str, ports: list[int] | None = None) -> list[Forward]:
+    _check_host(host)
     stopped: list[Forward] = []
+    denied: list[int] = []
     for f in active():
         if f.host != host or (ports is not None and f.port not in ports):
             continue
-        _pid_file(f.host, f.port).unlink(missing_ok=True)
         try:
             os.kill(f.pid, signal.SIGTERM)
         except ProcessLookupError:
-            continue  # ssh уже умер сам; файл убрали
+            _pid_file(f.host, f.port).unlink(missing_ok=True)  # ssh уже умер сам
+            continue
+        except PermissionError:
+            # pid, похоже, переиспользован чужим (привилегированным) процессом —
+            # файл не трогаем, чтобы не потерять единственную нить к настоящему ssh.
+            denied.append(f.port)
+            continue
+        _pid_file(f.host, f.port).unlink(missing_ok=True)
         stopped.append(f)
+    if denied:
+        raise ForwardError("не удалось снять (нет прав): " + ", ".join(map(str, denied)))
     return stopped

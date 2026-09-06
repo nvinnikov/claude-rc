@@ -2627,3 +2627,73 @@ def test_forward_stop(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFix
     monkeypatch.setattr(cli.forward, "stop", fake_stop)
     assert cli.main(["--host", "m1", "forward", "oms", "--stop"]) == 0
     assert "3000" in capsys.readouterr().out
+
+
+def test_forward_ambiguous_target_lists_matches(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = json.dumps(
+        {
+            "sessions": [
+                {"label": "oms@x", "cwd": "/r/oms", "tmux_name": "session_A", "listening": [3000]},
+                {"label": "oms@y", "cwd": "/r/oms2", "tmux_name": "session_B", "listening": [4000]},
+            ]
+        }
+    )
+
+    def fake_run_remote(host: str, args: list[str], **kw: object) -> tuple[int, str]:
+        return 0, payload
+
+    monkeypatch.setattr(cli.proxy, "run_remote", fake_run_remote)
+
+    def fail_start(host: str, ports: list[int]) -> list[cli.forward.Forward]:
+        pytest.fail("start called on an ambiguous target")
+
+    monkeypatch.setattr(cli.forward, "start", fail_start)
+    assert cli.main(["--host", "m1", "forward", "oms"]) == 1
+    err = capsys.readouterr().err
+    assert "oms@x" in err
+    assert "oms@y" in err
+
+
+def test_forward_target_listens_on_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = json.dumps(
+        {
+            "sessions": [
+                {"label": "oms@x", "cwd": "/r/oms", "tmux_name": "session_A", "listening": []}
+            ]
+        }
+    )
+
+    def fake_run_remote(host: str, args: list[str], **kw: object) -> tuple[int, str]:
+        return 0, payload
+
+    monkeypatch.setattr(cli.proxy, "run_remote", fake_run_remote)
+    assert cli.main(["--host", "m1", "forward", "oms@x"]) == 1
+    assert "назови порт" in capsys.readouterr().err
+
+
+def test_forward_bad_json_from_remote_is_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw = "claude-rc: команда не найдена"
+
+    def fake_run_remote(host: str, args: list[str], **kw: object) -> tuple[int, str]:
+        return 0, raw
+
+    monkeypatch.setattr(cli.proxy, "run_remote", fake_run_remote)
+    assert cli.main(["--host", "m1", "forward", "oms@x"]) == 1
+    assert raw in capsys.readouterr().err
+
+
+def test_forward_stop_nothing_active(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_stop(host: str, ports: list[int] | None = None) -> list[cli.forward.Forward]:
+        return []
+
+    monkeypatch.setattr(cli.forward, "stop", fake_stop)
+    assert cli.main(["--host", "m1", "forward", "oms", "--stop"]) == 0
+    assert "Туннелей к m1 нет." in capsys.readouterr().out

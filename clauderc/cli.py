@@ -635,7 +635,11 @@ class _Commands:
             )
             return EXIT_ENVIRONMENT
         if args.stop:
-            stopped = forward.stop(host, args.ports or None)
+            try:
+                stopped = forward.stop(host, args.ports or None)
+            except forward.ForwardError as exc:
+                print(str(exc), file=sys.stderr)
+                return EXIT_FAILED
             if not stopped:
                 print(f"Туннелей к {host} нет.")
                 return 0
