@@ -1937,6 +1937,50 @@ def test_rename_prints_new_label(
     assert "/rename" in err
 
 
+def test_send_prints_tail_when_asked(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_send_and_tail(
+        session: RemoteSession,
+        text: str,
+        *,
+        enter: bool = True,
+        wait_s: float = 3.0,
+        lines: int = 20,
+    ) -> str:
+        seen.update(text=text, enter=enter, lines=lines)
+        return "tail here"
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "send_and_tail", fake_send_and_tail)
+    assert cli.main(["send", "oms", "/mcp", "--tail", "7"]) == 0
+    assert seen == {"text": "/mcp", "enter": True, "lines": 7}
+    assert "tail here" in capsys.readouterr().out
+
+
+def test_send_no_enter_and_no_tail(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_send(session: RemoteSession, text: str, *, enter: bool = True) -> None:
+        seen.update(text=text, enter=enter)
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "send", fake_send)
+    assert cli.main(["send", "oms", "1", "--no-enter"]) == 0
+    assert seen == {"text": "1", "enter": False}
+    assert capsys.readouterr().out == ""
+
+
 def test_stop_by_session_id_is_unambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
     killed: list[str] = []
 

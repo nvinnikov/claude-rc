@@ -159,6 +159,23 @@ def _parser() -> argparse.ArgumentParser:
     rename_cmd.add_argument("target", help="ярлык, каталог или session_…")
     rename_cmd.add_argument("name")
 
+    send_cmd = sub.add_parser("send", help="набрать текст в панель сессии")
+    send_cmd.add_argument("target")
+    send_cmd.add_argument("text")
+    send_cmd.add_argument(
+        "--no-enter",
+        action="store_false",
+        dest="enter",
+        help="без Enter — для ответа одной клавишей",
+    )
+    send_cmd.add_argument(
+        "--tail",
+        type=int,
+        default=0,
+        metavar="N",
+        help="через 3 с напечатать N последних строк панели",
+    )
+
     doctor = sub.add_parser("doctor", help="проверить окружение")
     doctor.add_argument("--json", action="store_true", dest="as_json")
 
@@ -325,6 +342,29 @@ class _Commands:
                 "Приложение Claude имя не подхватило: у этой версии claude нет /rename.",
                 file=sys.stderr,
             )
+        return 0
+
+    @staticmethod
+    def send(args: argparse.Namespace) -> int:
+        try:
+            session = asyncio.run(_one(args.target))
+        except _Ambiguous as exc:
+            return _print_ambiguous(exc)
+        if session is None:
+            print(f"Сессия не найдена: {args.target}", file=sys.stderr)
+            return EXIT_FAILED
+        try:
+            if args.tail > 0:
+                print(
+                    asyncio.run(
+                        actions.send_and_tail(session, args.text, enter=args.enter, lines=args.tail)
+                    )
+                )
+            else:
+                asyncio.run(actions.send(session, args.text, enter=args.enter))
+        except actions.ActionError as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_FAILED
         return 0
 
     @staticmethod

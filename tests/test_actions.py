@@ -123,3 +123,16 @@ async def test_rename_raises_when_tmux_refuses(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(remote, "_run", _stub(lambda *a: (1, "no such session")))
     with pytest.raises(actions.ActionError, match="no such session"):
         await actions.rename(_session(), "new", settle_s=0)
+
+
+async def test_send_and_tail_waits_then_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def handler(*a: str) -> tuple[int, str]:
+        calls.append(a[0])
+        return (0, "a\nb\nc\n") if a[0] == "capture-pane" else (0, "")
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    out = await actions.send_and_tail(_session(), "/mcp", wait_s=0, lines=2)
+    assert out == "b\nc"
+    assert calls == ["send-keys", "send-keys", "capture-pane"]

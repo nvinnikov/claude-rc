@@ -55,6 +55,19 @@ async def tail(session: RemoteSession, lines: int = 5) -> str:
     return "\n".join(rows[-lines:]) if lines > 0 else ""
 
 
+async def send_and_tail(
+    session: RemoteSession, text: str, *, enter: bool = True, wait_s: float = 3.0, lines: int = 20
+) -> str:
+    """Посылает текст и читает хвост панели.
+
+    Пауза ждёт, пока TUI успеет отреагировать на команду — иначе хвост читаться
+    будет, пока ещё ничего не произошло, и вернёт старый вывод.
+    """
+    await send(session, text, enter=enter)
+    await asyncio.sleep(wait_s)
+    return await tail(session, lines=lines)
+
+
 def _repo_of(session: RemoteSession) -> str:
     label = session.label or ""
     if "@" in label:
