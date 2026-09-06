@@ -23,7 +23,7 @@ from aiogram.types import (
     User,
 )
 
-from clauderc import browse, history, passport, paths, worktrees
+from clauderc import actions, browse, history, passport, paths, worktrees
 from clauderc import sync as sync_mod
 from clauderc.browse import BrowseError
 from clauderc.config import Config, load_config
@@ -121,6 +121,41 @@ def _open_keyboard(url: str) -> InlineKeyboardMarkup | None:
     )
 
 
+def _session_keyboard(token: str, url: str) -> InlineKeyboardMarkup:
+    """Пульт под карточкой сессии: одна карточка обслуживает все кнопки —
+    `token` не гасится нажатием (кроме Stop), поэтому Bypass/mcp/Tail/Rename
+    можно жать по очереди.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    if url:
+        rows.append([InlineKeyboardButton(text="Open in Claude", url=url)])
+    rows.append(
+        [
+            InlineKeyboardButton(text="⏹ Stop", callback_data=f"stop:{token}"),
+            InlineKeyboardButton(text="🔓 Bypass", callback_data=f"byp:{token}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(text="🔌 /mcp", callback_data=f"mcp:{token}"),
+            InlineKeyboardButton(text="📋 Tail", callback_data=f"tail:{token}"),
+            InlineKeyboardButton(text="✏️ Rename", callback_data=f"ren:{token}"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _trust_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Trust", callback_data=f"trust:{token}"),
+                InlineKeyboardButton(text="Cancel", callback_data=f"notrust:{token}"),
+            ]
+        ]
+    )
+
+
 def _resume_keyboard(items: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     """Кнопки выбора диалога: по строке на вариант, в callback_data — только токен."""
     return InlineKeyboardMarkup(
@@ -143,6 +178,7 @@ class LaunchRequest:
     resume: str | None = None
     name: str | None = None
     new_worktree: bool = False
+    mode: str | None = None
 
 
 MAX_SESSION_NAME_LEN = 40
@@ -278,7 +314,10 @@ def _browse_card(cwd: Path) -> tuple[str, InlineKeyboardMarkup]:
     if pair:
         rows.append(pair)
 
-    launch_row = [InlineKeyboardButton(text="▶️ Start Claude RC", callback_data="nav:here")]
+    launch_row = [
+        InlineKeyboardButton(text="▶️ Start Claude RC", callback_data="nav:here"),
+        InlineKeyboardButton(text="🔓 Start (bypass)", callback_data="nav:bypass"),
+    ]
     # Вторая сессия в том же каталоге дралась бы за индекс и ветку — только через worktree.
     if browse.is_repo(cwd):
         launch_row.append(InlineKeyboardButton(text="🌿 New worktree", callback_data="nav:newwt"))
@@ -469,7 +508,7 @@ async def main() -> None:
     # сессию от новой, поднятой в том же каталоге после смерти прежней. Имя не годится:
     # `await_url` переименовывает сессию в её id, и запомненное имя перестаёт
     # существовать. Переименование `session_created` сохраняет, перезапуск — нет.
-    stop_pending: dict[str, tuple[str, int]] = {}
+    card_pending: dict[str, tuple[str, int]] = {}
     tree_pending: dict[str, Path] = {}
     # Значение — (id карточки, выбор): выбор любого варианта гасит остальные
     # токены той же карточки, чтобы два тапа не подняли две сессии в одном каталоге.
@@ -501,6 +540,21 @@ async def main() -> None:
     # поднимать. Как у ветки для Sync: ответ привязан через reply_to_message,
     # и чужой текст в имя не попадёт.
     name_pending: dict[int, LaunchRequest] = {}
+    # Ключ — id сообщения с запросом нового имени (ForceReply), значение — та же
+    # пара (каталог, время создания), что и у card_pending: имя сессии меняется
+    # у неё под ногами, поэтому саму сессию добываем заново через _same_session.
+    rename_pending: dict[int, tuple[str, int]] = {}
+
+    async def offer_trust(message: Message, need: TrustRequired) -> None:
+        token = uuid.uuid4().hex[:8]
+        trust_pending[token] = (need.tmux_name, need.cwd)
+        await message.answer(
+            "🔐 Claude впервые видит этот каталог и ждёт подтверждения.\n"
+            f"<code>{html.escape(need.cwd)}</code>\n\n"
+            "Он получит право читать, менять и запускать здесь файлы.",
+            parse_mode="HTML",
+            reply_markup=_trust_keyboard(token),
+        )
 
     async def ask_name(message: Message, request: LaunchRequest) -> None:
         text, markup = _name_prompt()
@@ -575,7 +629,7 @@ async def main() -> None:
                 str(cwd),
                 timeout_s=config.launch_timeout_s,
                 resume=resume,
-                permission_mode=config.permission_mode,
+                permission_mode=request.mode or config.permission_mode,
             )
         except TrustRequired as need:
             token = uuid.uuid4().hex[:8]
@@ -587,14 +641,7 @@ async def main() -> None:
                     "Он получит право читать, менять и запускать здесь файлы."
                 ),
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(text="Trust", callback_data=f"trust:{token}"),
-                            InlineKeyboardButton(text="Cancel", callback_data=f"notrust:{token}"),
-                        ]
-                    ]
-                ),
+                reply_markup=_trust_keyboard(token),
             )
             return
         except LaunchError as exc:
@@ -610,41 +657,45 @@ async def main() -> None:
             )
             return
 
+        token = uuid.uuid4().hex[:8]
+        card_pending[token] = (os.path.realpath(session.cwd), session.created_at)
         await notice.edit_text(
             told(
                 f"✅ Сессия поднята\n"
                 f"{_session_card(passport.build(session, host=config.host, tree=None))}"
             ),
             parse_mode="HTML",
-            reply_markup=_open_keyboard(session.url),
+            reply_markup=_session_keyboard(token, session.url),
         )
 
-    async def offer_start(message: Message, target: Path, branch: str | None) -> None:
+    async def offer_start(
+        message: Message, target: Path, branch: str | None, *, mode: str | None = None
+    ) -> None:
         """Запуск с выбором диалога, если в каталоге уже есть история.
 
         Для новой ветки истории быть не может — там свежий worktree, и лишний
         шаг только мешал бы.
         """
         if branch is not None:
-            await ask_name(message, LaunchRequest(target, branch=branch))
+            await ask_name(message, LaunchRequest(target, branch=branch, mode=mode))
             return
 
         found = history.conversations(str(target))
         if not found:
-            await ask_name(message, LaunchRequest(target))
+            await ask_name(message, LaunchRequest(target, mode=mode))
             return
 
         group = uuid.uuid4().hex[:8]
         items: list[tuple[str, str]] = []
         for label, resume in [("New session", None), ("Continue last", "last")]:
             token = uuid.uuid4().hex[:8]
-            resume_pending[token] = (group, LaunchRequest(target, resume=resume))
+            resume_pending[token] = (group, LaunchRequest(target, resume=resume, mode=mode))
             items.append((token, label))
         for conversation in found:
             token = uuid.uuid4().hex[:8]
             resume_pending[token] = (
                 group,
-                LaunchRequest(target, resume=conversation.session_id),
+                LaunchRequest(target, resume=conversation.session_id, mode=mode),
             )
             items.append((token, conversation.preview))
 
@@ -690,15 +741,11 @@ async def main() -> None:
             # за лимит выходит легко. Но держим именно путь, а не имя: имя сессии
             # меняется у неё под ногами — `await_url` переименовывает её в id, как
             # только появится ссылка, и запомненное имя перестало бы существовать.
-            stop_pending[token] = (real, session.created_at)
-            rows = []
-            if session.url:
-                rows.append([InlineKeyboardButton(text="Open in Claude", url=session.url)])
-            rows.append([InlineKeyboardButton(text="⏹ Stop", callback_data=f"stop:{token}")])
+            card_pending[token] = (real, session.created_at)
             await message.answer(
                 _session_card(p)[:3800],
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                reply_markup=_session_keyboard(token, session.url),
             )
 
         orphans = [tree for real, tree in trees.items() if real not in occupied]
@@ -1161,11 +1208,30 @@ async def main() -> None:
             f"🗑 Worktree <b>{html.escape(path.name)}</b> удалён.{note}", parse_mode="HTML"
         )
 
+    async def card_session(
+        query: CallbackQuery, prefix: str
+    ) -> tuple[RemoteSession | None, Message | None]:
+        """Сессия за кнопкой карточки, добытая заново по каталогу и времени создания.
+
+        `card_pending` не `pop`-ается здесь: одна карточка обслуживает несколько
+        нажатий (Bypass, /mcp, Tail, Rename) — только Stop гасит свой токен.
+        """
+        pending = card_pending.get((query.data or "").removeprefix(prefix))
+        message = _live_message(query)
+        if pending is None:
+            await query.answer("Карточка устарела")
+            return None, message
+        cwd, created_at = pending
+        session = _same_session(await find(cwd), created_at)
+        if session is None:
+            await query.answer("Сессия уже не жива")
+        return session, message
+
     @dp.callback_query(F.data.startswith("stop:"))
     async def on_stop(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        pending = stop_pending.pop((query.data or "").removeprefix("stop:"), None)
+        pending = card_pending.pop((query.data or "").removeprefix("stop:"), None)
         message = _live_message(query)
         if pending is None:
             await query.answer("Список устарел")
@@ -1188,6 +1254,76 @@ async def main() -> None:
             else f"Сессия <b>{html.escape(name)}</b> уже не жива.",
             parse_mode="HTML",
         )
+
+    @dp.callback_query(F.data.startswith("byp:"))
+    async def on_bypass(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        session, message = await card_session(query, "byp:")
+        if session is None or message is None:
+            return
+        await query.answer("Переоткрываю…")
+        try:
+            fresh = await actions.restart(
+                session,
+                kill=watcher.kill,
+                mode="bypassPermissions",
+                timeout_s=config.launch_timeout_s,
+            )
+        except (actions.ActionError, LaunchError) as exc:
+            await message.answer(
+                f"❌ Не перезапустилась.\n<pre>{html.escape(str(exc))}</pre>"[:3800],
+                parse_mode="HTML",
+            )
+            return
+        except TrustRequired as need:
+            await offer_trust(message, need)
+            return
+        token = uuid.uuid4().hex[:8]
+        card_pending[token] = (os.path.realpath(fresh.cwd), fresh.created_at)
+        await message.answer(
+            "🔓 Переоткрыта с bypassPermissions\n"
+            + _session_card(passport.build(fresh, host=config.host, tree=None)),
+            parse_mode="HTML",
+            reply_markup=_session_keyboard(token, fresh.url),
+        )
+
+    @dp.callback_query(F.data.startswith(("mcp:", "tail:")))
+    async def on_peek(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        prefix = "mcp:" if (query.data or "").startswith("mcp:") else "tail:"
+        session, message = await card_session(query, prefix)
+        if session is None or message is None:
+            return
+        await query.answer()
+        try:
+            text = (
+                await actions.send_and_tail(session, "/mcp", lines=25)
+                if prefix == "mcp:"
+                else await actions.tail(session, lines=25)
+            )
+        except actions.ActionError as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}", parse_mode="HTML")
+            return
+        await message.answer(f"<pre>{html.escape(text)}</pre>"[:3800], parse_mode="HTML")
+
+    @dp.callback_query(F.data.startswith("ren:"))
+    async def on_rename(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        session, message = await card_session(query, "ren:")
+        if session is None or message is None:
+            return
+        await query.answer()
+        prompt = await message.answer(
+            "Новое имя сессии — <b>ответом на это сообщение</b>.",
+            parse_mode="HTML",
+            reply_markup=ForceReply(
+                force_reply=True, selective=True, input_field_placeholder="имя сессии"
+            ),
+        )
+        rename_pending[prompt.message_id] = (os.path.realpath(session.cwd), session.created_at)
 
     @dp.callback_query(F.data.startswith("jump:"))
     async def on_jump(query: CallbackQuery) -> None:
@@ -1219,6 +1355,10 @@ async def main() -> None:
 
         if action == "here":
             await offer_start(message, state.cwd, None)
+            return
+
+        if action == "bypass":
+            await offer_start(message, state.cwd, None, mode="bypassPermissions")
             return
 
         if action == "newwt":
@@ -1413,6 +1553,24 @@ async def main() -> None:
         request = name_pending.pop(reply.message_id, None)
         if request is not None:
             await start_session(message, _apply_name(request, message.text or ""))
+            return
+
+        renaming = rename_pending.pop(reply.message_id, None)
+        if renaming is not None:
+            cwd, created_at = renaming
+            session = _same_session(await find(cwd), created_at)
+            if session is None:
+                await message.reply("Сессия уже не жива.")
+                return
+            try:
+                result = await actions.rename(session, message.text or "")
+            except actions.ActionError as exc:
+                await message.reply(f"❌ {html.escape(str(exc))}", parse_mode="HTML")
+                return
+            note = "" if result.app_renamed else "\n⚠️ Приложение не переименовалось."
+            await message.reply(
+                f"✏️ Теперь <b>{html.escape(result.label)}</b>{note}", parse_mode="HTML"
+            )
             return
 
         card_id = branch_pending.pop(reply.message_id, None)

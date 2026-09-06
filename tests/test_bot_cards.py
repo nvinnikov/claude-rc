@@ -7,6 +7,7 @@ from clauderc import passport
 from clauderc.bot import (
     LaunchRequest,
     _apply_name,
+    _browse_card,
     _chunk_report,
     _died_text,
     _has_repos,
@@ -17,6 +18,7 @@ from clauderc.bot import (
     _same_session,
     _selected_targets,
     _session_card,
+    _session_keyboard,
     _sync_line,
     _sync_report_line,
     _sync_unavailable_line,
@@ -345,3 +347,25 @@ def test_pull_line_escapes_html() -> None:
     result = SyncResult(Path("/repos/oms"), Outcome.failed, "<evil>", "<b>")
     line = _pull_line(result)
     assert "&lt;evil&gt;" in line and "&lt;b&gt;" in line
+
+
+def test_session_keyboard_has_every_lever() -> None:
+    markup = _session_keyboard("tok", "https://claude.ai/code/session_A")
+    data = [b.callback_data or b.url for row in markup.inline_keyboard for b in row]
+    assert data == [
+        "https://claude.ai/code/session_A",
+        "stop:tok",
+        "byp:tok",
+        "mcp:tok",
+        "tail:tok",
+        "ren:tok",
+    ]
+    assert all(
+        len((b.callback_data or "").encode()) <= 64 for row in markup.inline_keyboard for b in row
+    )
+
+
+def test_browse_card_offers_bypass_start(tmp_path: Path) -> None:
+    _, keyboard = _browse_card(tmp_path)
+    data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert "nav:here" in data and "nav:bypass" in data
