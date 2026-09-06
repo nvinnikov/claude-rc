@@ -176,3 +176,16 @@ async def remove(root: Path, name: str, *, force: bool = False) -> Worktree:
     if code != 0:
         raise WorktreeError(out.strip()[-_ERROR_TAIL:])
     return info
+
+
+async def label(path: Path) -> str:
+    """Ярлык сессии: репозиторий и ветка одной строкой.
+
+    Один ярлык на все поверхности — имя в приложении Claude, карточка бота,
+    имя tmux-сессии до переименования. Имя каталога worktree для этого не
+    годится: `demo-wt-feature-x` — слаг, а человек ищет сессию по репозиторию
+    и ветке. Не git-каталог ярлыку не мешает: там имя каталога и есть всё,
+    что о нём известно.
+    """
+    info = await inspect(path)
+    return f"{info.repo}@{info.branch}" if info is not None else path.name

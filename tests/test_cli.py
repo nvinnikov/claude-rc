@@ -2137,3 +2137,67 @@ def test_start_pull_leaves_a_directory_with_a_live_session_alone(
     assert cli.main(["start", str(tmp_path), "--pull"]) == 0
     assert pulled == []
     assert "не тяну" in capsys.readouterr().out
+
+
+def test_start_names_the_session_by_repo_and_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Ярлык, а не имя каталога: у worktree каталог зовётся demo-wt-feature-x,
+    # и в приложении сессия называлась слагом вместо репозитория и ветки.
+    seen: dict[str, Any] = {}
+
+    async def fake_label(path: Path) -> str:
+        seen["labelled"] = path
+        return "demo@wt/feature-x"
+
+    async def fake_launch(label: str, cwd: str, **kwargs: Any) -> RemoteSession:
+        seen["label"] = label
+        return _session()
+
+    monkeypatch.setattr(cli.worktrees, "label", fake_label)
+    monkeypatch.setattr(cli, "launch", fake_launch)
+
+    assert cli.main(["start", str(tmp_path)]) == 0
+    assert seen["label"] == "demo@wt/feature-x"
+    assert seen["labelled"] == tmp_path
+
+
+def test_whoami_json_describes_the_enclosing_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Ради агента внутри сессии: одной командой узнать, кто он и куда идёт tmux.
+    async def fake(cwd: str) -> RemoteSession:
+        return _session()
+
+    monkeypatch.setattr(cli, "find_enclosing", fake)
+    assert cli.main(["whoami", "--json", str(tmp_path)]) == 0
+
+    payload: dict[str, Any] = json.loads(capsys.readouterr().out)
+    assert list(payload) == ["session"]
+    assert payload["session"]["tmux_name"] == "rc-oms"
+    assert payload["session"]["attach"] == "tmux attach -d -t =rc-oms"
+
+
+def test_whoami_plain_prints_the_attach_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake(cwd: str) -> RemoteSession:
+        return _session()
+
+    monkeypatch.setattr(cli, "find_enclosing", fake)
+    assert cli.main(["whoami", str(tmp_path)]) == 0
+
+    out = capsys.readouterr().out
+    assert "tmux attach -d -t =rc-oms" in out
+    assert "https://claude.ai/code/session_A" in out
+
+
+def test_whoami_outside_a_session_says_so(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake(cwd: str) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "find_enclosing", fake)
+    assert cli.main(["whoami", str(tmp_path)]) == 1
+    assert capsys.readouterr().err.strip()

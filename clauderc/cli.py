@@ -37,6 +37,7 @@ from clauderc.remote import (
     await_url,
     confirm_trust,
     find,
+    find_enclosing,
     kill_all,
     kill_tmux,
     launch,
@@ -80,6 +81,10 @@ def _parser() -> argparse.ArgumentParser:
 
     sessions = sub.add_parser("sessions", help="живые RC-сессии")
     sessions.add_argument("--json", action="store_true", dest="as_json")
+
+    whoami = sub.add_parser("whoami", help="чья это сессия: ярлык, id, ссылка, подсадка")
+    whoami.add_argument("path", nargs="?", default=".", help="каталог (по умолчанию текущий)")
+    whoami.add_argument("--json", action="store_true", dest="as_json")
 
     start = sub.add_parser("start", help="поднять сессию")
     start.add_argument("path", nargs="?", default=".", help="каталог (по умолчанию текущий)")
@@ -144,6 +149,27 @@ class _Commands:
             return 0
         for session in found:
             print(f"{session.name}\t{session.cwd}\t{int(session.uptime_s())}s\t{session.url}")
+        return 0
+
+    @staticmethod
+    def whoami(args: argparse.Namespace) -> int:
+        """Кто эта сессия — для того, кто внутри неё.
+
+        Ищется по каталогу, а не по имени: имя меняется у сессии под ногами, а
+        каталог — единственный надёжный ключ. Подходит и подкаталог: агент почти
+        никогда не стоит в корне worktree.
+        """
+        target = Path(args.path).expanduser()
+        session = asyncio.run(find_enclosing(str(target)))
+        if session is None:
+            print(f"В {target} не видно RC-сессии.", file=sys.stderr)
+            return EXIT_FAILED
+        if args.as_json:
+            print(json.dumps({"session": _as_dict(session)}, ensure_ascii=False))
+            return 0
+        print(f"{session.name}\t{session.cwd}")
+        print(session.url)
+        print(attach_command(session.tmux_name))
         return 0
 
     @staticmethod
@@ -404,10 +430,14 @@ def _current_version() -> str:
 def _as_dict(session: RemoteSession) -> dict[str, Any]:
     return {
         "name": session.name,
+        "label": session.label,
         "tmux_name": session.tmux_name,
         "cwd": session.cwd,
         "url": session.url,
         "uptime_s": int(session.uptime_s()),
+        # Готовая команда, а не имя: собирать её самому пришлось бы каждому
+        # читателю, и каждый забыл бы про -L у изолированного сервера.
+        "attach": attach_command(session.tmux_name),
     }
 
 
@@ -435,7 +465,8 @@ async def _start(
         config = load_config(paths.config_file())
         cwd = await worktrees.ensure(target, branch, config.worktree_root)
     try:
-        return await launch(cwd.name, str(cwd), resume=resume, permission_mode=permission_mode)
+        label = await worktrees.label(cwd)
+        return await launch(label, str(cwd), resume=resume, permission_mode=permission_mode)
     except TrustRequired as need:
         return await _ask_trust(need)
 

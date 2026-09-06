@@ -69,7 +69,11 @@ _TAIL_CHARS = 400
 # Ссылку кладём в user-опцию сессии: TUI перерисовывает панель и вытирает её
 # из видимого буфера, а пережить рестарт бота она должна.
 _URL_OPTION = "@rc_url"
-_FORMAT = "#{session_name}\t#{session_path}\t#{session_created}\t#{@rc_url}"
+# Ярлык сессии — репозиторий и ветка, тот же, что видит человек в приложении.
+# В опции, а не выведенный из имени tmux: имя после переименования — id сессии
+# Claude, и ветку по нему не восстановить.
+_LABEL_OPTION = "@rc_label"
+_FORMAT = "#{session_name}\t#{session_path}\t#{session_created}\t#{@rc_url}\t#{@rc_label}"
 
 # CLAUDE_CODE_* чистим уже внутри панели: tmux-сервер мог быть поднят из-под
 # Claude Code, и унаследованный CLAUDE_CODE_CHILD_SESSION выключит сохранение
@@ -127,11 +131,12 @@ def attach_command(tmux_name: str) -> str:
 
 @dataclass(frozen=True)
 class RemoteSession:
-    name: str  # имя репозитория, как его видит пользователь
+    name: str  # как сессия зовётся в карточке
     tmux_name: str
     cwd: str
     url: str
     created_at: int  # unix-время создания tmux-сессии
+    label: str = ""  # ярлык repo@branch; пуст у сессий прежней версии
 
     def uptime_s(self) -> float:
         return max(0.0, time.time() - self.created_at)
@@ -173,9 +178,9 @@ async def list_sessions() -> list[RemoteSession]:
     sessions: list[RemoteSession] = []
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) != 4:
+        if len(parts) != 5:
             continue
-        tmux_name, path, created, url = parts
+        tmux_name, path, created, url, label = parts
         # Наши сессии — либо ещё не переименованные (префикс), либо уже
         # названные id сессии Claude (тогда имя ни о чём не говорит, но
         # `@rc_url` выставлен). Одного признака мало: по префиксу не видно
@@ -184,19 +189,22 @@ async def list_sessions() -> list[RemoteSession]:
             continue  # чужие tmux-сессии не трогаем
         sessions.append(
             RemoteSession(
-                name=_display_name(path, tmux_name),
+                name=label or _display_name(path, tmux_name),
                 tmux_name=tmux_name,
                 cwd=path,
                 url=url,
                 created_at=int(created) if created.isdigit() else 0,
+                label=label,
             )
         )
     return sorted(sessions, key=lambda s: s.name)
 
 
 def _display_name(cwd: str, tmux_name: str) -> str:
-    """Как сессию зовут в карточке. Имя tmux после переименования — id сессии
-    Claude, и человеку он не говорит ничего; каталог говорит.
+    """Запасное имя для сессий без ярлыка — поднятых прежней версией.
+
+    Имя tmux после переименования — id сессии Claude, и человеку он не говорит
+    ничего; каталог говорит.
     """
     return os.path.basename(cwd.rstrip(os.sep)) or tmux_name.removeprefix(PREFIX)
 
@@ -214,6 +222,10 @@ async def resolve(target: str) -> list[RemoteSession]:
     Список, а не одна: имя каталога в дереве не уникально (два клона одного
     репо), и «погасить oms», когда их три, — не то, что можно решить за
     человека. Уникален только id, поэтому им и различают.
+
+    Голое имя репозитория (`oms` при ярлыке `oms@wt/x`) — тоже цель: его человек
+    набирает по привычке, и ответить на него «нет такой сессии», когда их три,
+    хуже, чем показать три.
     """
     wanted = target.strip()
     if not wanted:
@@ -226,7 +238,11 @@ async def resolve(target: str) -> list[RemoteSession]:
     # трогает, и `~/code/oms` из сообщения не совпал бы ни с чем. Строке без
     # тильды `expanduser` ничего не делает, так что имени это не мешает.
     path = os.path.expanduser(wanted)
-    return [s for s in sessions if s.name == wanted or same_path(s.cwd, path)]
+    return [
+        s
+        for s in sessions
+        if s.name == wanted or s.label.split("@", 1)[0] == wanted or same_path(s.cwd, path)
+    ]
 
 
 async def find(cwd: str) -> RemoteSession | None:
@@ -242,7 +258,27 @@ async def find(cwd: str) -> RemoteSession | None:
     return None
 
 
-async def _unique_name(repo: str, cwd: str) -> str:
+async def find_enclosing(cwd: str) -> RemoteSession | None:
+    """Сессия, которой принадлежит каталог: он сам или любой его родитель.
+
+    Ради `claude-rc whoami`: агент внутри сессии почти никогда не стоит в корне
+    worktree, а `find` сравнивает пути точно и из подкаталога сессию не узнаёт.
+    Список берётся один раз — подъём по родителям не должен превращаться в
+    столько же вызовов tmux, сколько уровней в пути.
+    """
+    sessions = await list_sessions()
+    path = os.path.realpath(cwd)
+    while True:
+        for session in sessions:
+            if same_path(session.cwd, path):
+                return session
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+
+
+async def _unique_name(label: str, cwd: str) -> str:
     """Свободное имя сессии: базовое, а при коллизии — с родительскими каталогами.
 
     Имя сессии человек видит в карточке и набирает сам — в `/rckill` и в
@@ -251,7 +287,7 @@ async def _unique_name(repo: str, cwd: str) -> str:
     Родительский каталог различает их сам, поэтому в имя добавляется он, и
     ровно столько уровней, сколько нужно для уникальности.
     """
-    base = session_name(repo)
+    base = session_name(label)
     taken = {s.tmux_name for s in await list_sessions()}
     if base not in taken:
         return base
@@ -323,7 +359,7 @@ def _resume_flag(resume: str | None) -> str:
 
 
 async def launch(
-    repo: str,
+    label: str,
     cwd: str,
     *,
     timeout_s: float = 90.0,
@@ -336,6 +372,12 @@ async def launch(
     проверка на уже живую сессию в `cwd` его не отменяет — сессия одна на каталог.
 
     `permission_mode` — с какими правами начинать (см. `PERMISSION_MODES`).
+
+    `label` — единственное имя сессии на все поверхности: оно уходит и в
+    `--remote-control` (как сессия зовётся в приложении Claude), и в `-n`
+    (prompt box, `/resume`-пикер, заголовок терминала), и в имя tmux-сессии.
+    Без `-n` приложение подставляет своё авто-название, и одна и та же сессия
+    зовётся по-разному в каждом из трёх мест.
     """
     if not tmux_available():
         raise LaunchError("tmux не найден в PATH — поставь через `brew install tmux`")
@@ -344,14 +386,20 @@ async def launch(
     if existing is not None:
         return existing
 
-    name = await _unique_name(repo, cwd)
+    name = await _unique_name(label, cwd)
     command = (
         _SCRUB_ENV
-        + f"exec {shlex.quote(CLAUDE_BIN)} --remote-control {shlex.quote(repo)}"
+        + f"exec {shlex.quote(CLAUDE_BIN)} --remote-control {shlex.quote(label)}"
+        + f" -n {shlex.quote(label)}"
         + _permission_flag(permission_mode)
         + _resume_flag(resume)
     )
     await _run("new-session", "-d", "-s", name, "-x", _COLS, "-y", _ROWS, "-c", cwd, command)
+    # Ярлык — сразу, не дожидаясь ссылки: сессия, умершая до неё, тоже должна
+    # называться в отчёте о смерти так же, как её звали при запуске.
+    stored, why = await _run("set-option", "-t", f"={name}:", _LABEL_OPTION, label, check=False)
+    if stored != 0:
+        log.warning("set %s on %s failed: %s", _LABEL_OPTION, name, why.strip())
     return await await_url(name, cwd, timeout_s=timeout_s)
 
 

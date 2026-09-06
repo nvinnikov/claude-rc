@@ -560,7 +560,7 @@ async def main() -> None:
 
         try:
             session = await launch(
-                cwd.name,
+                await worktrees.label(cwd),
                 str(cwd),
                 timeout_s=config.launch_timeout_s,
                 resume=resume,

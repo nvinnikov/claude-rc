@@ -286,3 +286,22 @@ async def test_generated_branch_makes_usable_worktree(repo: Path, tmp_path: Path
     info = await worktrees.inspect(path)
     assert info is not None and info.branch == branch
     assert path.name.startswith("demo-wt-")
+
+
+async def test_label_names_repo_and_branch(repo: Path) -> None:
+    assert await worktrees.label(repo) == "demo@main"
+
+
+async def test_label_of_worktree_keeps_parent_repo_name(repo: Path, tmp_path: Path) -> None:
+    # Каталог worktree зовётся demo-wt-feature-x, но человеку важны репозиторий
+    # и ветка, а не слаг каталога.
+    path = await worktrees.ensure(repo, "wt/feature-x", tmp_path / "wt")
+
+    assert await worktrees.label(path) == "demo@wt/feature-x"
+
+
+async def test_label_falls_back_to_directory_name_outside_git(tmp_path: Path) -> None:
+    plain = tmp_path / "notes"
+    plain.mkdir()
+
+    assert await worktrees.label(plain) == "notes"

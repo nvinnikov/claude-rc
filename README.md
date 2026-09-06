@@ -230,6 +230,13 @@ A persistent keyboard sits under the input field: `📁 PWD`, `💬 Chats`, `�
 If a session is already alive in a directory you get its link back rather than a second
 session — sessions are keyed by working directory, not by name.
 
+A session is called **one and the same thing everywhere**: `repo@branch` — `oms@main` for a
+repository, `oms@wt/feature-x` for a worktree. That label is what the bot card shows, what
+the Claude app shows both in the session list and in the prompt box (it is passed as
+`--remote-control` *and* `-n`), and what the tmux session is named until the link arrives.
+Without it each surface invented its own name — the app an auto-generated one, the card the
+directory name, tmux a slug — and matching them up by eye was on you.
+
 Every session card carries **two ways in**, and they share one identifier: the link, which
 opens the session in the Claude app, and the same `session_…` id (`🖥`), which opens it in a
 terminal. As soon as Claude prints the link, the tmux session is renamed to the id from it —
@@ -251,10 +258,10 @@ whoever is working right now. The Claude app is unaffected: it talks to the sess
 API, not through tmux. `=` means an exact match, so a target can't land on a session whose
 name merely starts the same way.
 
-Because ids identify sessions and directory names no longer have to, cards, `/rckill` and
-`claude-rc stop` show and take the directory name as a label. Where a label matches more than
-one session — three clones of one repository — nothing is killed: you get the ids back and
-pick.
+Because ids identify sessions and names no longer have to, cards, `/rckill` and
+`claude-rc stop` show and take the `repo@branch` label. The bare repository name works too —
+`/rckill oms` when `oms@main` and `oms@wt/x` are both up. Where a target matches more than one
+session, nothing is killed: you get the ids back and pick.
 
 ### Repository sync
 
@@ -478,6 +485,7 @@ uv tool install .
 |---|---|
 | `claude-rc version` | version |
 | `claude-rc sessions [--json]` | live RC sessions |
+| `claude-rc whoami [path] [--json]` | which session owns this directory: label, id, link, attach command |
 | `claude-rc start [path] [--branch b] [--resume last\|id] [--pull] [--permission-mode m]` | start a session (default: current directory) |
 | `claude-rc stop <name\|path>` / `claude-rc stop --all` | kill a session |
 | `claude-rc doctor [--json]` | check tmux, claude and the config |
@@ -527,6 +535,17 @@ are walked in parallel.
 The non-obvious constraints this project is built around — the ones that cost debugging time
 and shaped the code:
 
+- **One label per session, across every surface.** `repo@branch` goes into
+  `--remote-control` (the name in the Claude app), `-n` (prompt box, `/resume` picker,
+  terminal title), the tmux session name and the bot card at once. Left to themselves the
+  surfaces disagree: without `-n` the app makes up its own title, and the worktree directory
+  is a slug (`oms-wt-feature-x`) that says less than the branch it came from. The label is
+  stored in the tmux user option `@rc_label`, set at `new-session` rather than after the
+  link, so a session that died before printing one is still named in the report of its death.
+- **`claude-rc whoami` is how an agent on the machine finds itself.** It matches by
+  directory *and its parents*: an agent almost never stands in the root of the worktree, and
+  an exact `find(cwd)` would miss it from a subdirectory. `--json` gives the whole mapping —
+  label, `session_…` id, link, ready-made attach command — in one call.
 - **A session's key is its working directory, not its name.** Repository names in a tree
   aren't unique (two clones of one repo), and name lookup handed back a link to a session in
   someone else's directory. `find(cwd)` compares `realpath`; the tmux session name survives
