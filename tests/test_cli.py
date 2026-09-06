@@ -1981,6 +1981,68 @@ def test_send_no_enter_and_no_tail(
     assert capsys.readouterr().out == ""
 
 
+def test_send_text_starting_with_dash_via_separator(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_send(session: RemoteSession, text: str, *, enter: bool = True) -> None:
+        seen.update(text=text, enter=enter)
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "send", fake_send)
+    assert cli.main(["send", "oms", "--", "-x"]) == 0
+    assert seen == {"text": "-x", "enter": True}
+    assert capsys.readouterr().out == ""
+
+
+def test_send_option_like_text_via_separator(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_send(session: RemoteSession, text: str, *, enter: bool = True) -> None:
+        seen.update(text=text, enter=enter)
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "send", fake_send)
+    assert cli.main(["send", "oms", "--", "--tail"]) == 0
+    assert seen == {"text": "--tail", "enter": True}
+    assert capsys.readouterr().out == ""
+
+
+def test_send_all_flags_combined(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_send_and_tail(
+        session: RemoteSession,
+        text: str,
+        *,
+        enter: bool = True,
+        wait_s: float = 3.0,
+        lines: int = 20,
+    ) -> str:
+        seen.update(text=text, enter=enter, lines=lines)
+        return "output"
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "send_and_tail", fake_send_and_tail)
+    assert cli.main(["send", "oms", "/mcp", "--no-enter", "--tail", "3"]) == 0
+    assert seen == {"text": "/mcp", "enter": False, "lines": 3}
+    assert "output" in capsys.readouterr().out
+
+
 def test_stop_by_session_id_is_unambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
     killed: list[str] = []
 

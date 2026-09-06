@@ -161,7 +161,10 @@ def _parser() -> argparse.ArgumentParser:
 
     send_cmd = sub.add_parser("send", help="набрать текст в панель сессии")
     send_cmd.add_argument("target")
-    send_cmd.add_argument("text")
+    send_cmd.add_argument(
+        "text",
+        help="текст; начинающийся с «-» передавай после `--`: send oms -- -x",
+    )
     send_cmd.add_argument(
         "--no-enter",
         action="store_false",
@@ -175,6 +178,7 @@ def _parser() -> argparse.ArgumentParser:
         metavar="N",
         help="через 3 с напечатать N последних строк панели",
     )
+    send_cmd.epilog = "Пример: claude-rc send oms -- -x"
 
     doctor = sub.add_parser("doctor", help="проверить окружение")
     doctor.add_argument("--json", action="store_true", dest="as_json")
