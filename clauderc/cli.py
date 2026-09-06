@@ -117,6 +117,12 @@ def _parser() -> argparse.ArgumentParser:
 
     sessions = sub.add_parser("sessions", help="живые RC-сессии")
     sessions.add_argument("--json", action="store_true", dest="as_json")
+    sessions.add_argument(
+        "--no-probe",
+        action="store_false",
+        dest="probe",
+        help="не опрашивать состояние панели и порты (без capture-pane и lsof)",
+    )
 
     whoami = sub.add_parser("whoami", help="чья это сессия: ярлык, id, ссылка, подсадка")
     whoami.add_argument("path", nargs="?", default=".", help="каталог (по умолчанию текущий)")
@@ -193,7 +199,7 @@ class _Commands:
     def sessions(args: argparse.Namespace) -> int:
         found = asyncio.run(list_sessions())
         host = _host_name()
-        passports = asyncio.run(passport.collect(found, host=host))
+        passports = asyncio.run(passport.collect(found, host=host, probe=args.probe))
         if args.as_json:
             print(
                 json.dumps(

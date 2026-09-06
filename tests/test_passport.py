@@ -1,8 +1,9 @@
+import dataclasses
 import json
 from pathlib import Path
 
 import pytest
-from clauderc import passport, remote
+from clauderc import passport, remote, state_probe
 from clauderc.remote import RemoteSession
 from clauderc.worktrees import Worktree
 
@@ -62,10 +63,24 @@ def test_as_dict_keeps_the_old_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     # Старые читатели sessions --json опираются на name/label/tmux_name/cwd/url/uptime_s/attach.
     monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
     d = passport.as_dict(passport.build(_session(), host="", tree=_tree()))
-    assert {"name", "label", "tmux_name", "cwd", "url", "uptime_s", "attach"} <= set(d)
+    assert {
+        "name",
+        "label",
+        "tmux_name",
+        "cwd",
+        "url",
+        "uptime_s",
+        "attach",
+        "state",
+        "last_lines",
+        "listening",
+    } <= set(d)
     assert d["host"] == ""
     assert d["session_id"] == "session_01ABC"
     assert d["cli"] == "claude-rc"
+    assert d["state"] == ""
+    assert d["last_lines"] == []
+    assert d["listening"] == []
     json.dumps(d)  # сериализуемо без кастомного энкодера
 
 
@@ -93,6 +108,51 @@ async def test_collect_inspects_each_cwd(monkeypatch: pytest.MonkeyPatch) -> Non
         return _tree() if str(path) == "/repos/oms" else None
 
     monkeypatch.setattr(passport.worktrees, "inspect", fake_inspect)
-    found = await passport.collect([_session()], host="m1")
+    found = await passport.collect([_session()], host="m1", probe=False)
     assert [p.branch for p in found] == ["mcp-fix"]
     assert found[0].host == "m1"
+
+
+async def test_collect_probes_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_inspect(path: Path) -> Worktree | None:
+        return None
+
+    async def fake_probe(tmux_name: str, *, lines: int = 5) -> state_probe.SessionState:
+        return state_probe.SessionState(
+            state=state_probe.State.NEEDS_INPUT, last_lines=("❯ 1. Yes",), listening=(3000,)
+        )
+
+    monkeypatch.setattr(passport.worktrees, "inspect", fake_inspect)
+    monkeypatch.setattr(passport.state_probe, "probe", fake_probe)
+    (p,) = await passport.collect([_session()], host="")
+    assert p.state == "needs_input"
+    assert p.listening == (3000,)
+    d = passport.as_dict(p)
+    assert d["state"] == "needs_input" and d["listening"] == [3000]
+    assert d["last_lines"] == ["❯ 1. Yes"]
+    assert "ждёт ответа" in passport.as_text(p) and "3000" in passport.as_text(p)
+
+
+async def test_collect_can_skip_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_inspect(path: Path) -> Worktree | None:
+        return None
+
+    async def boom(tmux_name: str, *, lines: int = 5) -> state_probe.SessionState:
+        raise AssertionError("probe must not be called")
+
+    monkeypatch.setattr(passport.worktrees, "inspect", fake_inspect)
+    monkeypatch.setattr(passport.state_probe, "probe", boom)
+    (p,) = await passport.collect([_session()], host="", probe=False)
+    assert p.state == ""
+
+
+def test_state_line_words() -> None:
+    base = passport.build(_session(), host="", tree=None)
+    for state, word in [
+        ("idle", "свободна"),
+        ("working", "работает"),
+        ("needs_input", "ждёт ответа"),
+        ("unknown", "состояние неясно"),
+    ]:
+        assert word in passport.state_line(dataclasses.replace(base, state=state))
+    assert passport.state_line(base) == ""

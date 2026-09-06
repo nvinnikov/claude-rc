@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 
 from clauderc import bot as bot_module
+from clauderc import passport
 from clauderc.bot import (
     LaunchRequest,
     _apply_name,
@@ -302,7 +303,8 @@ def test_session_card_is_the_passport_html() -> None:
         created_at=int(time.time()),
         label="oms@x",
     )
-    text = _session_card(session, host="m1", tree=None)
+    p = passport.build(session, host="m1", tree=None)
+    text = _session_card(p)
     assert "<b>oms@x</b>" in text
     assert "ssh m1 -t" in text
     assert "claude-rc --host m1" in text

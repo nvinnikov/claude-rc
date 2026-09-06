@@ -207,9 +207,9 @@ def _label(path: Path, roots: tuple[Path, ...]) -> str:
     return str(path)
 
 
-def _session_card(session: RemoteSession, *, host: str, tree: Worktree | None) -> str:
+def _session_card(p: passport.Passport) -> str:
     """Единственный рендер карточки сессии в боте — тот же паспорт, что и у CLI."""
-    return passport.as_html(passport.build(session, host=host, tree=tree))
+    return passport.as_html(p)
 
 
 def _same_session(session: RemoteSession | None, created_at: int) -> RemoteSession | None:
@@ -521,7 +521,8 @@ async def main() -> None:
         alive_here = await find(str(target))
         if alive_here is not None and branch is None:
             await notice.edit_text(
-                f"Уже поднята.\n{_session_card(alive_here, host=config.host, tree=None)}",
+                f"Уже поднята.\n"
+                f"{_session_card(passport.build(alive_here, host=config.host, tree=None))}",
                 parse_mode="HTML",
                 reply_markup=_open_keyboard(alive_here.url),
             )
@@ -559,7 +560,10 @@ async def main() -> None:
         alive = await find(str(cwd))
         if alive is not None:
             await notice.edit_text(
-                told(f"Уже поднята.\n{_session_card(alive, host=config.host, tree=None)}"),
+                told(
+                    f"Уже поднята.\n"
+                    f"{_session_card(passport.build(alive, host=config.host, tree=None))}"
+                ),
                 parse_mode="HTML",
                 reply_markup=_open_keyboard(alive.url),
             )
@@ -607,7 +611,10 @@ async def main() -> None:
             return
 
         await notice.edit_text(
-            told(f"✅ Сессия поднята\n{_session_card(session, host=config.host, tree=None)}"),
+            told(
+                f"✅ Сессия поднята\n"
+                f"{_session_card(passport.build(session, host=config.host, tree=None))}"
+            ),
             parse_mode="HTML",
             reply_markup=_open_keyboard(session.url),
         )
@@ -671,10 +678,11 @@ async def main() -> None:
             os.path.realpath(t.path): t for t in await worktrees.list_all(config.worktree_root)
         }
         occupied: set[str] = set()
+        passports = await passport.collect(sessions, host=config.host)
 
         # По сообщению на сессию: гасить надо конкретную, и кнопка должна быть рядом
         # со своей ссылкой, а не в общей простыне.
-        for session in sessions:
+        for session, p in zip(sessions, passports, strict=True):
             real = os.path.realpath(session.cwd)
             occupied.add(real)
             token = uuid.uuid4().hex[:8]
@@ -688,7 +696,7 @@ async def main() -> None:
                 rows.append([InlineKeyboardButton(text="Open in Claude", url=session.url)])
             rows.append([InlineKeyboardButton(text="⏹ Stop", callback_data=f"stop:{token}")])
             await message.answer(
-                _session_card(session, host=config.host, tree=trees.get(real)),
+                _session_card(p),
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
@@ -1276,7 +1284,8 @@ async def main() -> None:
             return
 
         await message.answer(
-            f"✅ Сессия поднята\n{_session_card(session, host=config.host, tree=None)}",
+            f"✅ Сессия поднята\n"
+            f"{_session_card(passport.build(session, host=config.host, tree=None))}",
             parse_mode="HTML",
             reply_markup=_open_keyboard(session.url),
         )
@@ -1437,7 +1446,7 @@ async def main() -> None:
         for session in await list_sessions():
             await bot.send_message(
                 config.allowed_user_id,
-                _session_card(session, host=config.host, tree=None),
+                _session_card(passport.build(session, host=config.host, tree=None)),
                 parse_mode="HTML",
                 reply_markup=_open_keyboard(session.url),
             )

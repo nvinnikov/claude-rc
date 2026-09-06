@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from clauderc import actions, cli, proxy, remote
+from clauderc import actions, cli, proxy, remote, state_probe
 from clauderc import update as update_mod
 from clauderc.remote import LaunchError, RemoteSession, TrustRequired
 from clauderc.worktrees import Worktree
@@ -49,6 +49,10 @@ def test_version_prints_something(capsys: pytest.CaptureFixture[str]) -> None:
     assert capsys.readouterr().out.strip()
 
 
+async def _fake_probe(tmux_name: str, *, lines: int = 5) -> state_probe.SessionState:
+    return state_probe.SessionState(state=state_probe.State.IDLE, last_lines=(), listening=())
+
+
 def test_sessions_json_has_stable_envelope(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -57,6 +61,7 @@ def test_sessions_json_has_stable_envelope(
 
     monkeypatch.setattr(cli, "list_sessions", fake)
     monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
+    monkeypatch.setattr(cli.passport.state_probe, "probe", _fake_probe)
     assert cli.main(["sessions", "--json"]) == 0
 
     payload: dict[str, Any] = json.loads(capsys.readouterr().out)
@@ -64,6 +69,7 @@ def test_sessions_json_has_stable_envelope(
     assert list(payload) == ["sessions"]
     assert payload["sessions"][0]["name"] == "oms"
     assert payload["sessions"][0]["url"] == "https://claude.ai/code/session_A"
+    assert payload["sessions"][0]["state"] == "idle"
 
 
 def test_sessions_plain_lists_names(
@@ -72,9 +78,13 @@ def test_sessions_plain_lists_names(
     async def fake() -> list[RemoteSession]:
         return [_session()]
 
+    async def boom(tmux_name: str, *, lines: int = 5) -> state_probe.SessionState:
+        raise AssertionError("--no-probe must not call state_probe.probe")
+
     monkeypatch.setattr(cli, "list_sessions", fake)
     monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
-    assert cli.main(["sessions"]) == 0
+    monkeypatch.setattr(cli.passport.state_probe, "probe", boom)
+    assert cli.main(["sessions", "--no-probe"]) == 0
     assert "oms" in capsys.readouterr().out
 
 
