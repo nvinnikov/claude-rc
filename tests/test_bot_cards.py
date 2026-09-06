@@ -108,6 +108,15 @@ def test_apply_name_keeps_explicit_branch() -> None:
     assert out.branch == "feat/x"
 
 
+def test_apply_name_truncates_long_name() -> None:
+    # Длинное имя не должно уезжать в кнопку/заголовок целиком — обрезаем до
+    # MAX_SESSION_NAME_LEN, и ветка для нового worktree считается уже от
+    # обрезанного имени, а не от исходного.
+    out = _apply_name(LaunchRequest(target=Path("/r"), new_worktree=True), "x" * 50)
+    assert out.name is not None and len(out.name) == bot_module.MAX_SESSION_NAME_LEN
+    assert out.branch == "wt/" + "x" * bot_module.MAX_SESSION_NAME_LEN
+
+
 def test_name_prompt_is_a_force_reply() -> None:
     text, markup = _name_prompt()
     assert "ответом" in text

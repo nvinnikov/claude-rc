@@ -1092,7 +1092,9 @@ async def main() -> None:
             return
         await message.edit_reply_markup(reply_markup=None)
         # Ветка уже выкачена в этом каталоге — второй worktree заводить не нужно.
-        await ask_name(message, LaunchRequest(path))
+        # offer_start сам решит: есть история — предложит Continue/диалоги,
+        # нет — сразу спросит имя (ask_name внутри «пустой истории» ветки).
+        await offer_start(message, path, None)
 
     @dp.callback_query(F.data.startswith(("wtrm:", "wtrmf:")))
     async def on_tree_remove(query: CallbackQuery) -> None:
