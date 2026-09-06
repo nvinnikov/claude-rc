@@ -6,6 +6,12 @@ import pytest
 from clauderc import cli, remote
 from clauderc import update as update_mod
 from clauderc.remote import LaunchError, RemoteSession, TrustRequired
+from clauderc.worktrees import Worktree
+
+
+async def _fake_no_worktree(path: Path) -> Worktree | None:
+    """Заглушка `worktrees.inspect` — юнит-тест не должен ходить в git по /repos/…"""
+    return None
 
 
 def _session(name: str = "oms") -> RemoteSession:
@@ -44,6 +50,7 @@ def test_sessions_json_has_stable_envelope(
         return [_session()]
 
     monkeypatch.setattr(cli, "list_sessions", fake)
+    monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
     assert cli.main(["sessions", "--json"]) == 0
 
     payload: dict[str, Any] = json.loads(capsys.readouterr().out)
@@ -60,6 +67,7 @@ def test_sessions_plain_lists_names(
         return [_session()]
 
     monkeypatch.setattr(cli, "list_sessions", fake)
+    monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
     assert cli.main(["sessions"]) == 0
     assert "oms" in capsys.readouterr().out
 
@@ -2170,6 +2178,7 @@ def test_whoami_json_describes_the_enclosing_session(
         return _session()
 
     monkeypatch.setattr(cli, "find_enclosing", fake)
+    monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
     assert cli.main(["whoami", "--json", str(tmp_path)]) == 0
 
     payload: dict[str, Any] = json.loads(capsys.readouterr().out)
@@ -2185,6 +2194,7 @@ def test_whoami_plain_prints_the_attach_command(
         return _session()
 
     monkeypatch.setattr(cli, "find_enclosing", fake)
+    monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
     assert cli.main(["whoami", str(tmp_path)]) == 0
 
     out = capsys.readouterr().out

@@ -22,6 +22,7 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from clauderc import passport as passport  # тесты подменяют cli.passport.worktrees.inspect
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
 from clauderc import setup as setup  # тесты подменяют cli.setup.verify_token/catch_user_id
 from clauderc import sync as clauderc_sync  # _Commands.sync затенил бы модуль sync
@@ -141,14 +142,19 @@ class _Commands:
     @staticmethod
     def sessions(args: argparse.Namespace) -> int:
         found = asyncio.run(list_sessions())
+        host = _host_name()
+        passports = asyncio.run(passport.collect(found, host=host))
         if args.as_json:
-            print(json.dumps({"sessions": [_as_dict(s) for s in found]}, ensure_ascii=False))
+            print(
+                json.dumps(
+                    {"sessions": [passport.as_dict(p) for p in passports]}, ensure_ascii=False
+                )
+            )
             return 0
-        if not found:
+        if not passports:
             print("Живых сессий нет.")
             return 0
-        for session in found:
-            print(f"{session.name}\t{session.cwd}\t{int(session.uptime_s())}s\t{session.url}")
+        print("\n\n".join(passport.as_text(p) for p in passports))
         return 0
 
     @staticmethod
@@ -164,12 +170,13 @@ class _Commands:
         if session is None:
             print(f"В {target} не видно RC-сессии.", file=sys.stderr)
             return EXIT_FAILED
+        host = _host_name()
+        tree = asyncio.run(worktrees.inspect(Path(session.cwd)))
+        p = passport.build(session, host=host, tree=tree)
         if args.as_json:
-            print(json.dumps({"session": _as_dict(session)}, ensure_ascii=False))
+            print(json.dumps({"session": passport.as_dict(p)}, ensure_ascii=False))
             return 0
-        print(f"{session.name}\t{session.cwd}")
-        print(session.url)
-        print(attach_command(session.tmux_name))
+        print(passport.as_text(p))
         return 0
 
     @staticmethod
@@ -420,25 +427,22 @@ _OUTCOME_LABEL = {
 }
 
 
+def _host_name() -> str:
+    """`host` из конфига, если он есть и читается; иначе пусто — локальные формы."""
+    config_path = paths.config_file()
+    if not config_path.is_file():
+        return ""
+    try:
+        return load_config(config_path).host
+    except (ValueError, KeyError, OSError):
+        return ""
+
+
 def _current_version() -> str:
     try:
         return package_version("claude-rc")
     except PackageNotFoundError:
         return "unknown (пакет не установлен)"
-
-
-def _as_dict(session: RemoteSession) -> dict[str, Any]:
-    return {
-        "name": session.name,
-        "label": session.label,
-        "tmux_name": session.tmux_name,
-        "cwd": session.cwd,
-        "url": session.url,
-        "uptime_s": int(session.uptime_s()),
-        # Готовая команда, а не имя: собирать её самому пришлось бы каждому
-        # читателю, и каждый забыл бы про -L у изолированного сервера.
-        "attach": attach_command(session.tmux_name),
-    }
 
 
 async def _start(
