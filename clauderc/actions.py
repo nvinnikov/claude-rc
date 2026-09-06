@@ -41,7 +41,9 @@ async def send(session: RemoteSession, text: str, *, enter: bool = True) -> None
     if code != 0:
         raise ActionError(out.strip() or f"send-keys: код {code}")
     if enter:
-        await remote._run("send-keys", "-t", _pane(session), "Enter", check=False)
+        code, out = await remote._run("send-keys", "-t", _pane(session), "Enter", check=False)
+        if code != 0:
+            raise ActionError(out.strip() or f"send-keys Enter: код {code}")
 
 
 async def tail(session: RemoteSession, lines: int = 5) -> str:

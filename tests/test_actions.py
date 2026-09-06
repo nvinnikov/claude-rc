@@ -56,6 +56,20 @@ async def test_send_without_enter(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == [("send-keys", "-t", "=session_01ABC:", "-l", "1")]
 
 
+async def test_send_raises_when_enter_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def handler(*a: str) -> tuple[int, str]:
+        calls.append(a)
+        if a[-1] == "Enter":
+            return 1, "can't find session"
+        return 0, ""
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    with pytest.raises(actions.ActionError, match="can't find session"):
+        await actions.send(_session(), "/mcp")
+
+
 async def test_tail_returns_last_lines(monkeypatch: pytest.MonkeyPatch) -> None:
     pane = "\n".join(f"line{i}" for i in range(10)) + "\n\n\n"
     monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, pane)))
