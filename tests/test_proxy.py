@@ -8,6 +8,19 @@ def test_strip_host_handles_both_spellings() -> None:
     assert proxy.strip_host(["sessions"]) == (None, ["sessions"])
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["sessions", "--host"],
+        ["--host", "--json", "sessions"],
+        ["--host=", "sessions"],
+    ],
+)
+def test_strip_host_rejects_missing_value(argv: list[str]) -> None:
+    with pytest.raises(proxy.HostError, match="--host"):
+        proxy.strip_host(argv)
+
+
 def test_command_of_skips_options() -> None:
     assert proxy.command_of(["--json", "sessions"]) == "sessions"
     assert proxy.command_of([]) is None
@@ -27,8 +40,9 @@ def test_relative_paths_only_for_path_commands() -> None:
 
 def test_remote_argv_quotes_and_prepends_path() -> None:
     argv = proxy.remote_argv("m1", ["send", "oms@x", "hi there; rm -rf /"], tty=False)
-    assert argv[:3] == ["ssh", "-T", "m1"]
-    command = argv[3]
+    # "--" перед host: хост, начинающийся с "-", не должен читаться как опция ssh.
+    assert argv[:4] == ["ssh", "-T", "--", "m1"]
+    command = argv[4]
     # PATH: неинтерактивный ssh не читает .zshrc, и ~/.local/bin (uv tool) там нет
     assert command.startswith('export PATH="$HOME/.local/bin:$PATH"; ')
     assert "claude-rc send oms@x 'hi there; rm -rf /'" in command
@@ -64,7 +78,7 @@ def test_run_remote_returns_output(monkeypatch: pytest.MonkeyPatch) -> None:
     code, out = proxy.run_remote("m1", ["sessions", "--json"])
     assert code == 0
     assert out == "ok\n"
-    assert seen[0][:3] == ["ssh", "-T", "m1"]
+    assert seen[0][:4] == ["ssh", "-T", "--", "m1"]
 
 
 def test_run_remote_returns_stderr_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -27,15 +27,25 @@ _VALUED_OPTIONS = frozenset({"--branch", "--resume", "--permission-mode", "--nam
 _PATH_PREFIX = 'export PATH="$HOME/.local/bin:$PATH"; '
 
 
+class HostError(ValueError):
+    """`--host` дан без имени хоста — не «выполнить локально», а ошибка."""
+
+
 def strip_host(argv: list[str]) -> tuple[str | None, list[str]]:
     host: str | None = None
     rest: list[str] = []
     it = iter(argv)
     for arg in it:
         if arg == "--host":
-            host = next(it, None)
+            value = next(it, None)
+            if not value or value.startswith("-"):
+                raise HostError("--host требует имя хоста")
+            host = value
         elif arg.startswith("--host="):
-            host = arg.removeprefix("--host=")
+            value = arg.removeprefix("--host=")
+            if not value:
+                raise HostError("--host требует имя хоста")
+            host = value
         else:
             rest.append(arg)
     return host, rest
@@ -68,7 +78,8 @@ def relative_paths(argv: list[str]) -> list[str]:
 
 def remote_argv(host: str, args: list[str], *, tty: bool) -> list[str]:
     command = _PATH_PREFIX + shlex.join(["claude-rc", *args])
-    return ["ssh", "-t" if tty else "-T", host, command]
+    # "--" перед host: хост, начинающийся с "-", не должен читаться как опция ssh.
+    return ["ssh", "-t" if tty else "-T", "--", host, command]
 
 
 def exec_remote(host: str, args: list[str]) -> None:

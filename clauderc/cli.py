@@ -66,7 +66,11 @@ def run() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    host, rest = proxy.strip_host(raw)
+    try:
+        host, rest = proxy.strip_host(raw)
+    except proxy.HostError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_ENVIRONMENT
     host = host or os.environ.get(proxy.HOST_ENV) or None
     command = proxy.command_of(rest)
     if host and command != "forward":

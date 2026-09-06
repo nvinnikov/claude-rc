@@ -2298,3 +2298,11 @@ def test_host_refuses_relative_paths(
     monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: pytest.fail("proxied"))
     assert cli.main(["--host", "m1", "start", "."]) == 2
     assert "абсолютн" in capsys.readouterr().err
+
+
+def test_host_without_value_is_an_error_not_a_local_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: pytest.fail("proxied"))
+    assert cli.main(["sessions", "--host"]) == 2
+    assert "--host" in capsys.readouterr().err
