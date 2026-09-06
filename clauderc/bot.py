@@ -1,10 +1,12 @@
 import asyncio
+import dataclasses
 import html
 import logging
 import os
 import time
 import uuid
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -129,12 +131,50 @@ def _resume_keyboard(items: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     )
 
 
-ResumeChoice = tuple[Path, str | None, str | None]
+@dataclass(frozen=True)
+class LaunchRequest:
+    """Параметры запуска сессии — то, что копится по шагам (ветка, потом имя)
+    до вызова `start_session`, вместо кортежа, который на четвёртом поле стал
+    бы нечитаемым.
+    """
+
+    target: Path
+    branch: str | None = None
+    resume: str | None = None
+    name: str | None = None
+    new_worktree: bool = False
+
+
+MAX_SESSION_NAME_LEN = 40
+
+
+def _name_prompt() -> tuple[str, ForceReply]:
+    return (
+        "Как назвать сессию? Пришли имя <b>ответом на это сообщение</b> "
+        "или <code>-</code>, чтобы обойтись веткой.",
+        ForceReply(force_reply=True, selective=True, input_field_placeholder="имя сессии или -"),
+    )
+
+
+def _apply_name(request: LaunchRequest, text: str) -> LaunchRequest:
+    """Пристраивает ответ на запрос имени к уже собранному `LaunchRequest`.
+
+    `-` или пустой ответ — без имени. Для нового worktree без явной ветки имя
+    превращается в ветку (`branch_for`), а без имени та же ветка получает
+    временную метку (`generate_branch`) — как до этого шага.
+    """
+    name = text.strip()[:MAX_SESSION_NAME_LEN]
+    if name == "-":
+        name = ""
+    branch = request.branch
+    if request.new_worktree and not branch:
+        branch = worktrees.branch_for(name) if name else worktrees.generate_branch()
+    return dataclasses.replace(request, name=name or None, branch=branch)
 
 
 def _pop_resume_group(
-    pending: dict[str, tuple[str, ResumeChoice]], token: str
-) -> ResumeChoice | None:
+    pending: dict[str, tuple[str, LaunchRequest]], token: str
+) -> LaunchRequest | None:
     """Достаёт выбранный вариант и гасит остальные токены той же карточки.
 
     Варианты одной карточки независимы только с виду: выбор любого из них должен
@@ -433,7 +473,7 @@ async def main() -> None:
     tree_pending: dict[str, Path] = {}
     # Значение — (id карточки, выбор): выбор любого варианта гасит остальные
     # токены той же карточки, чтобы два тапа не подняли две сессии в одном каталоге.
-    resume_pending: dict[str, tuple[str, ResumeChoice]] = {}
+    resume_pending: dict[str, tuple[str, LaunchRequest]] = {}
     # Выбор живёт в памяти и привязан к сообщению: восстанавливать наполовину
     # сделанный выбор после перезапуска опаснее, чем начать заново. Хранится
     # путями, а не индексами: индекс — позиция в листинге на момент отрисовки,
@@ -457,10 +497,18 @@ async def main() -> None:
     # карточки Sync. Ответ Telegram привязывает к запросу через reply_to_message,
     # так что случайное текстовое сообщение не подставится вместо имени ветки.
     branch_pending: dict[int, int] = {}
+    # Ключ — id сообщения с запросом имени сессии (ForceReply), значение — что
+    # поднимать. Как у ветки для Sync: ответ привязан через reply_to_message,
+    # и чужой текст в имя не попадёт.
+    name_pending: dict[int, LaunchRequest] = {}
 
-    async def start_session(
-        message: Message, target: Path, branch: str | None, resume: str | None = None
-    ) -> None:
+    async def ask_name(message: Message, request: LaunchRequest) -> None:
+        text, markup = _name_prompt()
+        prompt = await message.answer(text, parse_mode="HTML", reply_markup=markup)
+        name_pending[prompt.message_id] = request
+
+    async def start_session(message: Message, request: LaunchRequest) -> None:
+        target, branch, resume = request.target, request.branch, request.resume
         head = f"⏳ Поднимаю сессию в <code>{html.escape(str(target))}</code>"
         if branch:
             head += f"\nветка <code>{html.escape(branch)}</code>"
@@ -519,7 +567,7 @@ async def main() -> None:
 
         try:
             session = await launch(
-                await worktrees.label(cwd),
+                await worktrees.label(cwd, name=request.name),
                 str(cwd),
                 timeout_s=config.launch_timeout_s,
                 resume=resume,
@@ -571,23 +619,26 @@ async def main() -> None:
         шаг только мешал бы.
         """
         if branch is not None:
-            await start_session(message, target, branch)
+            await ask_name(message, LaunchRequest(target, branch=branch))
             return
 
         found = history.conversations(str(target))
         if not found:
-            await start_session(message, target, None)
+            await ask_name(message, LaunchRequest(target))
             return
 
         group = uuid.uuid4().hex[:8]
         items: list[tuple[str, str]] = []
         for label, resume in [("New session", None), ("Continue last", "last")]:
             token = uuid.uuid4().hex[:8]
-            resume_pending[token] = (group, (target, None, resume))
+            resume_pending[token] = (group, LaunchRequest(target, resume=resume))
             items.append((token, label))
         for conversation in found:
             token = uuid.uuid4().hex[:8]
-            resume_pending[token] = (group, (target, None, conversation.session_id))
+            resume_pending[token] = (
+                group,
+                LaunchRequest(target, resume=conversation.session_id),
+            )
             items.append((token, conversation.preview))
 
         await message.answer(
@@ -1041,7 +1092,7 @@ async def main() -> None:
             return
         await message.edit_reply_markup(reply_markup=None)
         # Ветка уже выкачена в этом каталоге — второй worktree заводить не нужно.
-        await offer_start(message, path, None)
+        await ask_name(message, LaunchRequest(path))
 
     @dp.callback_query(F.data.startswith(("wtrm:", "wtrmf:")))
     async def on_tree_remove(query: CallbackQuery) -> None:
@@ -1161,7 +1212,7 @@ async def main() -> None:
             return
 
         if action == "newwt":
-            await start_session(message, state.cwd, worktrees.generate_branch())
+            await ask_name(message, LaunchRequest(state.cwd, new_worktree=True))
             return
 
         if action == "up":
@@ -1257,8 +1308,10 @@ async def main() -> None:
             await message.answer("Выбор устарел, повтори запуск.")
             return
         await message.edit_reply_markup(reply_markup=None)
-        target, branch, resume = choice
-        await start_session(message, target, branch, resume)
+        if choice.resume is None:
+            await ask_name(message, choice)
+            return
+        await start_session(message, choice)
 
     @dp.callback_query(F.data.startswith("sync:"))
     async def on_sync(query: CallbackQuery) -> None:
@@ -1332,19 +1385,25 @@ async def main() -> None:
         await sync_card(message.chat.id, message.message_id, state.cwd)
 
     @dp.message(F.reply_to_message & F.text)
-    async def on_branch_reply(message: Message) -> None:
-        """Имя ветки для карточки Sync приходит ответом на её же запрос.
+    async def on_text_reply(message: Message) -> None:
+        """Имя сессии или ветки для Sync приходит ответом на свой же запрос.
 
         Ответ через Telegram `reply_to_message` — не произвольное следующее
-        сообщение: так две открытые карточки не путают ветки между собой, а
-        забытая заявка не подхватывает случайный текст, не имеющий к ней
-        отношения.
+        сообщение: так две открытые карточки не путают ветки (или запуски)
+        между собой, а забытая заявка не подхватывает случайный текст, не
+        имеющий к ней отношения.
         """
         if not _is_authorized(message.from_user, config.allowed_user_id):
             return
         reply = message.reply_to_message
         if reply is None:
             return
+
+        request = name_pending.pop(reply.message_id, None)
+        if request is not None:
+            await start_session(message, _apply_name(request, message.text or ""))
+            return
+
         card_id = branch_pending.pop(reply.message_id, None)
         if card_id is None:
             return
@@ -1360,7 +1419,7 @@ async def main() -> None:
         # оставшиеся падения того же опроса тогда пропадут без следа.
         try:
             token = uuid.uuid4().hex[:8]
-            resume_pending[token] = (token, (Path(died.cwd), None, "last"))
+            resume_pending[token] = (token, LaunchRequest(Path(died.cwd), resume="last"))
             await bot.send_message(
                 config.allowed_user_id,
                 _died_text(died),

@@ -4,10 +4,12 @@ from pathlib import Path
 
 from clauderc import bot as bot_module
 from clauderc.bot import (
-    ResumeChoice,
+    LaunchRequest,
+    _apply_name,
     _chunk_report,
     _died_text,
     _has_repos,
+    _name_prompt,
     _pop_resume_group,
     _pull_line,
     _resume_keyboard,
@@ -64,12 +66,12 @@ def test_died_text_escapes_html() -> None:
 def test_pop_resume_group_clears_sibling_tokens() -> None:
     # Два быстрых тапа по разным кнопкам одной карточки не должны поднять две
     # сессии: выбор одного варианта гасит соседние токены той же карточки.
-    choice_a: ResumeChoice = (Path("/repos/oms"), None, None)
-    choice_b: ResumeChoice = (Path("/repos/oms"), None, "last")
-    pending: dict[str, tuple[str, ResumeChoice]] = {
+    choice_a = LaunchRequest(target=Path("/repos/oms"))
+    choice_b = LaunchRequest(target=Path("/repos/oms"), resume="last")
+    pending: dict[str, tuple[str, LaunchRequest]] = {
         "t0": ("g1", choice_a),
         "t1": ("g1", choice_b),
-        "t2": ("g2", (Path("/repos/geo"), None, None)),
+        "t2": ("g2", LaunchRequest(target=Path("/repos/geo"))),
     }
 
     picked = _pop_resume_group(pending, "t0")
@@ -80,10 +82,36 @@ def test_pop_resume_group_clears_sibling_tokens() -> None:
 
 
 def test_pop_resume_group_unknown_token_returns_none() -> None:
-    pending: dict[str, tuple[str, ResumeChoice]] = {"t0": ("g1", (Path("/repos/oms"), None, None))}
+    pending: dict[str, tuple[str, LaunchRequest]] = {
+        "t0": ("g1", LaunchRequest(target=Path("/repos/oms")))
+    }
 
     assert _pop_resume_group(pending, "stale") is None
     assert "t0" in pending, "неизвестный токен не должен трогать чужую карточку"
+
+
+def test_apply_name_skips_on_dash() -> None:
+    req = LaunchRequest(target=Path("/r"), new_worktree=True)
+    out = _apply_name(req, "-")
+    assert out.name is None
+    assert out.branch is not None and out.branch.startswith("wt/")
+
+
+def test_apply_name_derives_branch_for_new_worktree() -> None:
+    out = _apply_name(LaunchRequest(target=Path("/r"), new_worktree=True), "MCP fix")
+    assert out.name == "MCP fix"
+    assert out.branch == "wt/mcp-fix"
+
+
+def test_apply_name_keeps_explicit_branch() -> None:
+    out = _apply_name(LaunchRequest(target=Path("/r"), branch="feat/x"), "x")
+    assert out.branch == "feat/x"
+
+
+def test_name_prompt_is_a_force_reply() -> None:
+    text, markup = _name_prompt()
+    assert "ответом" in text
+    assert markup.force_reply is True and markup.selective is True
 
 
 def test_no_direct_kill_calls_bypass_watcher() -> None:
