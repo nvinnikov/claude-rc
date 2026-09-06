@@ -85,6 +85,7 @@ async def _exec(argv: list[str], timeout_s: float = _EXEC_TIMEOUT_S) -> tuple[in
 
 
 async def _descendants(root: str) -> list[str]:
+    """Обход дерева процессов через `pgrep -P`; порядок узлов не важен."""
     pids, queue = [root], [root]
     while queue:
         code, out = await _exec(["pgrep", "-P", queue.pop()])
@@ -118,7 +119,11 @@ async def listening_ports(tmux_name: str) -> tuple[int, ...]:
     code, out = await _exec(
         ["lsof", "-a", "-p", ",".join(pids), "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-Fn"]
     )
-    return _parse_lsof(out) if code == 0 else ()
+    # lsof выходит с кодом 1, если хоть один pid из списка уже умер (типичная гонка
+    # с pgrep), но всё равно печатает сокеты живых — код игнорируем, кроме «бинаря нет».
+    if code == 127:
+        return ()
+    return _parse_lsof(out)
 
 
 async def probe(tmux_name: str, *, lines: int = 5) -> SessionState:

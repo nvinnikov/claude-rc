@@ -93,3 +93,22 @@ async def test_listening_ports_empty_when_lsof_missing(monkeypatch: pytest.Monke
     monkeypatch.setattr(remote, "_run", run)
     monkeypatch.setattr(state_probe, "_exec", exec_)
     assert await state_probe.listening_ports("session_X") == ()
+
+
+async def test_listening_ports_survives_lsof_exit_1_with_dead_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # lsof выходит с кодом 1, если один из перечисленных pid уже умер (гонка с pgrep),
+    # но живые сокеты в stdout всё равно печатает — их не теряем.
+    async def run(*a: str, check: bool = True) -> tuple[int, str]:
+        return 0, "100\n"
+
+    async def exec_(argv: list[str], timeout_s: float = 5.0) -> tuple[int, str]:
+        if argv[0] == "pgrep":
+            return 1, ""
+        assert argv[0] == "lsof"
+        return 1, "n*:3000\n"
+
+    monkeypatch.setattr(remote, "_run", run)
+    monkeypatch.setattr(state_probe, "_exec", exec_)
+    assert await state_probe.listening_ports("session_X") == (3000,)
