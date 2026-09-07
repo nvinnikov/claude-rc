@@ -24,16 +24,19 @@ _NEEDS_INPUT = (
     re.compile(r"Yes, I trust this folder"),
     re.compile(r"Do you want to"),
     re.compile(r"\(y/n\)", re.IGNORECASE),
-    re.compile(r"^\s*❯?\s*\d+[.)]\s+\S", re.MULTILINE),
+    # Каретка обязательна: без неё в диалог записывался любой ответ claude с
+    # нумерованным списком, и свободная сессия показывалась как «ждёт ответа».
+    # Подсвеченный пункт диалог рисует именно с ней.
+    re.compile(r"^\s*❯\s*\d+[.)]\s+\S", re.MULTILINE),
 )
 _WORKING = (
     re.compile(r"esc to interrupt"),
     re.compile(r"^[✻✶✳✢·✽]\s+\S+ing…", re.MULTILINE),
 )
-_IDLE = (
-    re.compile(r"^\s*❯\s*$", re.MULTILINE),
-    re.compile(r"^\s*│\s*>\s*│?\s*$", re.MULTILINE),
-)
+# Рамка ввода claude — пустая каретка на своей строке. Второго шаблона (│ > │)
+# здесь нет намеренно: ни один настоящий снимок панели его не даёт, а шаблон
+# без снимка — это догадка, которая когда-нибудь совпадёт не с тем.
+_IDLE = (re.compile(r"^\s*❯\s*$", re.MULTILINE),)
 
 
 class State(StrEnum):

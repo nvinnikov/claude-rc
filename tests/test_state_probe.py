@@ -112,3 +112,13 @@ async def test_listening_ports_survives_lsof_exit_1_with_dead_pid(
     monkeypatch.setattr(remote, "_run", run)
     monkeypatch.setattr(state_probe, "_exec", exec_)
     assert await state_probe.listening_ports("session_X") == (3000,)
+
+
+def test_numbered_list_without_a_caret_is_not_a_dialog() -> None:
+    # Ответ claude с нумерованным списком — не диалог: подсвеченный пункт
+    # диалог рисует с кареткой, обычный текст — нет.
+    assert state_probe.classify(_pane("idle") + "1. первый пункт\n") is State.IDLE
+
+
+def test_numbered_list_does_not_interrupt_working() -> None:
+    assert state_probe.classify(_pane("working") + "1) шаг\n") is State.WORKING
