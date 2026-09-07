@@ -133,9 +133,11 @@ async def _pane_asks(tmux_name: str) -> bool:
     `confirm_trust`, только тут выбор делает не человек, а мы за него. Карточку
     могли показать задолго до появления диалога, поэтому состояние спрашиваем
     перед отправкой, а не берём из карточки. Tail только читает и не спрашивает.
+
+    Спрашиваем `classify_pane`, а не `probe`: порты к вопросу не относятся, а
+    их поиск обходит дерево процессов и задерживает отклик кнопки.
     """
-    observed = await state_probe.probe(tmux_name, lines=3)
-    return observed.state is state_probe.State.NEEDS_INPUT
+    return await state_probe.classify_pane(tmux_name) is state_probe.State.NEEDS_INPUT
 
 
 def _session_keyboard(token: str, url: str) -> InlineKeyboardMarkup:
@@ -264,6 +266,17 @@ def _is_own_prompt(reply: Message, bot_id: int) -> bool:
     молчим — оно не к нам.
     """
     return reply.from_user is not None and reply.from_user.id == bot_id
+
+
+def _error_card(prefix: str, exc: object) -> str:
+    """Заголовок и текст исключения в `<pre>`, отрезанные по-честному.
+
+    Отрез считает `pre_block` — по сырому тексту и по экранированной длине.
+    Срез уже собранной и экранированной строки уносит закрывающий тег или
+    половину «&lt;», и Telegram отвечает 400 на всё сообщение: человек не
+    получает ничего вместо укороченного.
+    """
+    return f"{prefix}\n{passport.pre_block(str(exc), 3500)}"
 
 
 def _bypass_failed_text(exc: str) -> str:
@@ -667,8 +680,7 @@ async def main() -> None:
                 cwd = await worktrees.ensure(target, branch, config.worktree_root)
             except WorktreeError as exc:
                 await notice.edit_text(
-                    told(f"❌ Worktree не создан.\n<pre>{html.escape(str(exc))}</pre>")[:3800],
-                    parse_mode="HTML",
+                    told(_error_card("❌ Worktree не создан.", exc)), parse_mode="HTML"
                 )
                 return
 
@@ -718,10 +730,7 @@ async def main() -> None:
                 # или исчезла между capture и list) — без метки watcher
                 # опросил бы её как упавшую следом за этим же сообщением.
                 watcher.expect_death(exc.tmux_name, str(cwd))
-            await notice.edit_text(
-                told(f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>")[:3800],
-                parse_mode="HTML",
-            )
+            await notice.edit_text(told(_error_card("❌ Не поднялось.", exc)), parse_mode="HTML")
             return
 
         token = uuid.uuid4().hex[:8]
@@ -1200,9 +1209,7 @@ async def main() -> None:
         try:
             await worktrees.remove(config.worktree_root, name, force=force)
         except WorktreeError as exc:
-            await message.reply(
-                f"❌ Не удалился.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
-            )
+            await message.reply(_error_card("❌ Не удалился.", exc), parse_mode="HTML")
             return
 
         note = " Сессия погашена." if session is not None else ""
@@ -1273,11 +1280,7 @@ async def main() -> None:
         try:
             await worktrees.remove(config.worktree_root, path.name, force=forced)
         except WorktreeError as exc:
-            # Отрез считает `pre_block`: срез готовой строки уносит закрывающий
-            # тег или половину «&lt;», и Telegram отвергает сообщение целиком.
-            await message.edit_text(
-                "❌ Не удалился.\n" + passport.pre_block(str(exc), 3500), parse_mode="HTML"
-            )
+            await message.edit_text(_error_card("❌ Не удалился.", exc), parse_mode="HTML")
             return
 
         note = " Сессия погашена." if session is not None else ""
@@ -1364,7 +1367,7 @@ async def main() -> None:
         except actions.ActionError as exc:
             # actions.restart поднимает ActionError только из проверки kill —
             # сессия ещё жива, к перезапуску даже не приступали.
-            await message.answer(f"❌ {html.escape(str(exc))}"[:3800], parse_mode="HTML")
+            await message.answer(_error_card("❌", exc), parse_mode="HTML")
             return
         except LaunchError as exc:
             # LaunchError идёт только из remote.launch — до этой точки прежняя
@@ -1539,9 +1542,7 @@ async def main() -> None:
                 # или исчезла между capture и list) — без метки watcher
                 # опросил бы её как упавшую следом за этим же сообщением.
                 watcher.expect_death(exc.tmux_name, cwd)
-            await message.answer(
-                f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
-            )
+            await message.answer(_error_card("❌ Не поднялось.", exc), parse_mode="HTML")
             return
 
         token = uuid.uuid4().hex[:8]

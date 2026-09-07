@@ -137,3 +137,28 @@ def test_numbered_list_without_a_caret_is_not_a_dialog() -> None:
 
 def test_numbered_list_does_not_interrupt_working() -> None:
     assert state_probe.classify(_pane("working") + "1) шаг\n") is State.WORKING
+
+
+async def test_classify_pane_reads_only_the_pane(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Один capture-pane и разбор: ни list-panes, ни pgrep, ни lsof.
+    seen: list[tuple[str, ...]] = []
+
+    async def run(*argv: str, check: bool = True) -> tuple[int, str]:
+        seen.append(argv)
+        return 0, _pane("needs_input")
+
+    async def boom(tmux_name: str) -> tuple[int, ...]:
+        raise AssertionError("порты тут не спрашивают")
+
+    monkeypatch.setattr(remote, "_run", run)
+    monkeypatch.setattr(state_probe, "listening_ports", boom)
+    assert await state_probe.classify_pane("session_X") is State.NEEDS_INPUT
+    assert seen == [("capture-pane", "-p", "-J", "-t", "=session_X:")]
+
+
+async def test_classify_pane_reports_dead_when_tmux_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run(*argv: str, check: bool = True) -> tuple[int, str]:
+        return 1, "can't find session"
+
+    monkeypatch.setattr(remote, "_run", run)
+    assert await state_probe.classify_pane("session_X") is State.DEAD

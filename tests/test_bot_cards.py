@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from aiogram.types import Chat, Message, User
 from clauderc import bot as bot_module
-from clauderc import passport, state_probe
+from clauderc import passport, remote, state_probe
 from clauderc.bot import (
     LaunchRequest,
     _apply_name,
@@ -33,10 +33,15 @@ from clauderc.remote import RemoteSession
 from clauderc.sync import Outcome, RepoStatus, SyncResult
 from clauderc.watch import Died
 
+
 # Гашение обязано идти через Watcher — иначе намеренно погашенная сессия
 # попадает в отчёт как упавшая (см. CLAUDE.md, «Точки гашения»). Ловим прямой
 # вызов remote.kill_* мимо `watcher.`, чтобы регрессия не держалась на ручном
 # грепе при следующей правке bot.py.
+def _pane_fixture(name: str) -> str:
+    return (Path(__file__).parent / "fixtures" / "panes" / f"{name}.txt").read_text()
+
+
 _DIRECT_KILL = re.compile(r"(?<!watcher\.)\b(?:kill_tmux|kill_all|kill_session)\(")
 
 
@@ -444,19 +449,48 @@ def test_reply_without_author_is_not_ours() -> None:
 async def test_pane_asks_blocks_when_a_dialog_is_open(monkeypatch: pytest.MonkeyPatch) -> None:
     # Кнопки, печатающие в панель, заканчиваются Enter — а Enter подтверждает
     # подсвеченный пункт открытого диалога, вплоть до «Yes, and don't ask again».
-    async def fake_probe(tmux_name: str, *, lines: int = 5) -> state_probe.SessionState:
+    async def fake_classify(tmux_name: str) -> state_probe.State:
         assert tmux_name == "session_01A"
-        return state_probe.SessionState(state=state_probe.State.NEEDS_INPUT, last_lines=())
+        return state_probe.State.NEEDS_INPUT
 
-    monkeypatch.setattr(bot_module.state_probe, "probe", fake_probe)
+    monkeypatch.setattr(bot_module.state_probe, "classify_pane", fake_classify)
     assert await bot_module._pane_asks("session_01A") is True
 
 
 async def test_pane_asks_lets_a_free_session_through(monkeypatch: pytest.MonkeyPatch) -> None:
     # Всё, кроме открытого вопроса, — не повод отказывать: неизвестное состояние
     # (сломанный обновлением claude шаблон) не должно запирать кнопки навсегда.
-    async def fake_probe(tmux_name: str, *, lines: int = 5) -> state_probe.SessionState:
-        return state_probe.SessionState(state=state_probe.State.UNKNOWN, last_lines=())
+    async def fake_classify(tmux_name: str) -> state_probe.State:
+        return state_probe.State.UNKNOWN
 
-    monkeypatch.setattr(bot_module.state_probe, "probe", fake_probe)
+    monkeypatch.setattr(bot_module.state_probe, "classify_pane", fake_classify)
     assert await bot_module._pane_asks("session_01A") is False
+
+
+async def test_pane_asks_does_not_look_for_ports(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Порты к вопросу «открыт ли диалог» не относятся, а их поиск обходит дерево
+    # процессов через pgrep и lsof — это секунды на отклик кнопки.
+    async def boom(tmux_name: str) -> tuple[int, ...]:
+        raise AssertionError("listening_ports звать не надо")
+
+    async def run(*argv: str, check: bool = True) -> tuple[int, str]:
+        return 0, _pane_fixture("idle")
+
+    monkeypatch.setattr(bot_module.state_probe, "listening_ports", boom)
+    monkeypatch.setattr(remote, "_run", run)
+    assert await bot_module._pane_asks("session_01A") is False
+
+
+def test_error_card_survives_a_message_full_of_angle_brackets() -> None:
+    # Ровно тот случай, ради которого заведён pre_block: срез уже экранированной
+    # строки обрывается на «&l» и Telegram отвергает сообщение целиком.
+    card = bot_module._error_card("❌ Не поднялось.", RuntimeError("<" * 5000))
+    assert card.startswith("❌ Не поднялось.\n<pre>")
+    assert card.endswith("</pre>")
+    assert "&l" not in card.removesuffix("</pre>").rsplit("&lt;", 1)[-1]
+    assert len(card) <= 3600
+
+
+def test_error_card_keeps_a_short_message_whole() -> None:
+    card = bot_module._error_card("❌", RuntimeError("сессия oms не погасла"))
+    assert card == "❌\n<pre>сессия oms не погасла</pre>"

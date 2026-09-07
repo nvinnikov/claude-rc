@@ -44,13 +44,18 @@ def _check_host(host: str) -> None:
         raise ForwardError(f"недопустимое имя хоста: {host}")
 
 
-def _is_ssh(pid: int) -> bool:
-    """Тот ли это процесс, чей pid мы записали.
+def _is_ssh(pid: int) -> bool | None:
+    """Тот ли это процесс, чей pid мы записали. `None` — выяснить не удалось.
 
     ssh мог умереть сам (оборвалась сеть), pid-файл при этом остаётся, а pid
     к следующему `--stop` занимает кто угодно. `ProcessLookupError` такой случай
     не ловит — процесс-то есть. Спрашиваем имя команды и снимаем только ssh;
-    всё остальное значит, что туннеля давно нет, а файл протух.
+    ответ «это не ssh» значит, что туннеля давно нет, а файл протух.
+
+    Молчание `ps` (бинаря нет, не ответил за таймаут) — не то же самое: живой
+    ssh мог продолжать форвардить порт, и удалить его pid-файл значило бы
+    потерять единственную нить к нему. Тот же довод, что у `PermissionError`
+    ниже, поэтому и решение то же — файл оставить, человеку сказать.
     """
     try:
         done = subprocess.run(
@@ -61,8 +66,7 @@ def _is_ssh(pid: int) -> bool:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        # ps нет или не ответил — уверенности, что это ssh, нет тем более.
-        return False
+        return None
     return os.path.basename(done.stdout.strip()) == "ssh"
 
 
@@ -135,7 +139,13 @@ def stop(host: str, ports: list[int] | None = None) -> list[Forward]:
     for f in active():
         if f.host != host or (ports is not None and f.port not in ports):
             continue
-        if not _is_ssh(f.pid):
+        owner = _is_ssh(f.pid)
+        if owner is None:
+            # ps не ответил: ssh мог быть жив, и без pid-файла снять его будет
+            # уже нечем. Оставляем файл и говорим об этом вслух.
+            denied.append(f.port)
+            continue
+        if not owner:
             # pid занят не ssh: туннеля нет, а SIGTERM ушёл бы чужому процессу.
             # Файл убираем — он и есть протухшая запись.
             _pid_file(f.host, f.port).unlink(missing_ok=True)
@@ -153,5 +163,7 @@ def stop(host: str, ports: list[int] | None = None) -> list[Forward]:
         _pid_file(f.host, f.port).unlink(missing_ok=True)
         stopped.append(f)
     if denied:
-        raise ForwardError("не удалось снять (нет прав): " + ", ".join(map(str, denied)))
+        raise ForwardError(
+            "не удалось снять (нет прав или процесс не опознан): " + ", ".join(map(str, denied))
+        )
     return stopped

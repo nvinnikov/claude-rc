@@ -197,10 +197,26 @@ def test_is_ssh_reads_the_command_name(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _real_is_ssh(4242) is False
 
 
-def test_is_ssh_is_false_when_ps_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Без ответа ps уверенности, что это ssh, нет — значит не гасим.
+def test_is_ssh_is_unknown_when_ps_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Без ответа ps ничего не известно — ни что это ssh, ни что это не он.
     def fake_run(argv: list[str], **kw: object) -> None:
         raise OSError("ps нет")
 
     monkeypatch.setattr(forward.subprocess, "run", fake_run)
-    assert _real_is_ssh(4242) is False
+    assert _real_is_ssh(4242) is None
+
+
+def test_stop_keeps_the_pid_file_when_the_process_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, pid_dir: Path
+) -> None:
+    # ps не ответил: ssh мог быть жив и продолжать форвардить порт. Удалить
+    # файл значило бы потерять единственную нить к нему — молчаливо и навсегда.
+    (pid_dir / "m1-3000.pid").write_text("4242")
+    killed: list[int] = []
+    monkeypatch.setattr(forward, "_is_ssh", lambda pid: None)
+    monkeypatch.setattr(forward.os, "kill", lambda pid, sig: killed.append(pid))
+
+    with pytest.raises(forward.ForwardError, match="3000"):
+        forward.stop("m1")
+    assert killed == []
+    assert (pid_dir / "m1-3000.pid").exists()

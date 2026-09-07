@@ -132,8 +132,24 @@ async def listening_ports(tmux_name: str) -> tuple[int, ...]:
     return _parse_lsof(out)
 
 
+async def _capture(tmux_name: str) -> tuple[int, str]:
+    return await remote._run("capture-pane", "-p", "-J", "-t", f"={tmux_name}:", check=False)
+
+
+async def classify_pane(tmux_name: str) -> State:
+    """Только состояние: один `capture-pane` и разбор, без обхода портов.
+
+    Вопрос «открыт ли в панели диалог» задаётся на каждый тап кнопки, а поиск
+    портов из `probe` — это `list-panes`, дерево процессов через `pgrep -P` и
+    `lsof`. На сессии с ветвистым деревом он добавляет к отклику кнопки секунды
+    и к ответу не относится вовсе.
+    """
+    code, pane = await _capture(tmux_name)
+    return State.DEAD if code != 0 else classify(pane)
+
+
 async def probe(tmux_name: str, *, lines: int = 5) -> SessionState:
-    code, pane = await remote._run("capture-pane", "-p", "-J", "-t", f"={tmux_name}:", check=False)
+    code, pane = await _capture(tmux_name)
     if code != 0:
         return SessionState(state=State.DEAD, last_lines=())
     return SessionState(
