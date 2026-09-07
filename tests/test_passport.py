@@ -216,3 +216,22 @@ def test_as_html_stays_under_the_telegram_limit_on_a_quoted_tail() -> None:
 
     assert len(html_text) < 3800
     assert html_text.endswith("</pre>")
+
+
+def test_html_marks_the_link_line_like_the_text_one() -> None:
+    # Обе поверхности рисует один паспорт — расхождение в разметке строк и есть
+    # та болезнь, ради которой он заведён.
+    p = passport.build(
+        RemoteSession(
+            name="oms",
+            tmux_name="session_01ABC",
+            cwd="/repos/oms",
+            url="https://claude.ai/code/session_01ABC",
+            created_at=0,
+            label="oms@x",
+        ),
+        host="",
+        tree=None,
+    )
+    assert "🔗 https://claude.ai/code/session_01ABC" in passport.as_html(p)
+    assert "🔗 https://claude.ai/code/session_01ABC" in passport.as_text(p)

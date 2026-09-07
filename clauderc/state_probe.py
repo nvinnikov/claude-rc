@@ -22,7 +22,10 @@ _TAIL_FOR_CLASSIFY = 12
 
 _NEEDS_INPUT = (
     re.compile(r"Yes, I trust this folder"),
-    re.compile(r"Do you want to"),
+    # Только с начала строки: диалог печатает вопрос своей строкой, а в прозе
+    # claude «…, do you want to see more?» встречается посреди ответа — и
+    # свободная сессия показывалась бы как ждущая ответа.
+    re.compile(r"^\s*Do you want to", re.MULTILINE),
     re.compile(r"\(y/n\)", re.IGNORECASE),
     # Каретка обязательна: без неё в диалог записывался любой ответ claude с
     # нумерованным списком, и свободная сессия показывалась как «ждёт ответа».

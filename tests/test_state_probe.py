@@ -25,6 +25,21 @@ def test_classify_real_panes(fixture: str, expected: State) -> None:
     assert state_probe.classify(_pane(fixture)) is expected
 
 
+def test_prose_about_wanting_something_is_not_a_dialog() -> None:
+    """«Do you want to» посреди ответа claude — проза, а не вопрос.
+
+    Диалог печатает вопрос своей строкой, поэтому шаблон привязан к её началу.
+    Без привязки свободная сессия показывалась бы как ждущая ответа — и кнопки,
+    печатающие в панель, отказывали бы на пустом месте.
+    """
+    rows = _pane("idle").rstrip("\n").split("\n")
+    # Строка внутри окна классификации (последние 12), иначе проверять нечего.
+    rows[-10] = "  \u23bf  Found 3 more files. Do you want to see them?"
+    pane = "\n".join(rows)
+    assert "Do you want to" in "\n".join(rows[-state_probe._TAIL_FOR_CLASSIFY :])
+    assert state_probe.classify(pane) is State.IDLE
+
+
 def test_dialog_wins_over_prompt() -> None:
     # Диалог рисуется поверх рамки ввода — пустой ❯ ниже не делает сессию idle.
     pane = "Do you want to proceed?\n❯ 1. Yes\n  2. No\n\n❯ \n"

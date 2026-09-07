@@ -138,14 +138,6 @@ async def _pane_asks(tmux_name: str) -> bool:
     return observed.state is state_probe.State.NEEDS_INPUT
 
 
-def _open_keyboard(url: str) -> InlineKeyboardMarkup | None:
-    if not url:
-        return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Open in Claude", url=url)]]
-    )
-
-
 def _session_keyboard(token: str, url: str) -> InlineKeyboardMarkup:
     """Пульт под карточкой сессии: одна карточка обслуживает все кнопки —
     `token` не гасится нажатием (кроме Stop), поэтому Bypass/mcp/Tail/Rename
@@ -1281,8 +1273,10 @@ async def main() -> None:
         try:
             await worktrees.remove(config.worktree_root, path.name, force=forced)
         except WorktreeError as exc:
+            # Отрез считает `pre_block`: срез готовой строки уносит закрывающий
+            # тег или половину «&lt;», и Telegram отвергает сообщение целиком.
             await message.edit_text(
-                f"❌ Не удалился.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
+                "❌ Не удалился.\n" + passport.pre_block(str(exc), 3500), parse_mode="HTML"
             )
             return
 
@@ -1550,11 +1544,17 @@ async def main() -> None:
             )
             return
 
+        token = uuid.uuid4().hex[:8]
+        card_pending[token] = (
+            os.path.realpath(session.cwd),
+            session.tmux_id,
+            session.created_at,
+        )
         await message.answer(
             f"✅ Сессия поднята\n"
             f"{_session_card(passport.build(session, host=config.host, tree=None))}",
             parse_mode="HTML",
-            reply_markup=_open_keyboard(session.url),
+            reply_markup=_session_keyboard(token, session.url),
         )
 
     @dp.callback_query(F.data.startswith("rc:"))
@@ -1735,11 +1735,20 @@ async def main() -> None:
     # здесь (бота заблокировали, сеть недоступна) не должна срывать поллинг.
     try:
         for session in await list_sessions():
+            # Пульт тот же, что в /rc: текст карточки после рестарта бота
+            # совпадает с обычной, и карточка без Stop/Bypass/Tail читалась бы
+            # сбоем, а не замыслом. Токен свежий — прежние умерли с процессом.
+            token = uuid.uuid4().hex[:8]
+            card_pending[token] = (
+                os.path.realpath(session.cwd),
+                session.tmux_id,
+                session.created_at,
+            )
             await bot.send_message(
                 config.allowed_user_id,
                 _session_card(passport.build(session, host=config.host, tree=None)),
                 parse_mode="HTML",
-                reply_markup=_open_keyboard(session.url),
+                reply_markup=_session_keyboard(token, session.url),
             )
     except Exception:
         log.warning("failed to send startup session list", exc_info=True)

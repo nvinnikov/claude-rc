@@ -436,9 +436,9 @@ It asks three things:
 It writes `~/.config/claude-rc/config.toml` with mode `600` (and the directory `700`) —
 that file holds a live token; a repeat run narrows the permissions even if the file used to
 be wider. A repeat `claude-rc setup` pre-fills the previous values as hints and changes only
-what you answer — an empty answer keeps the old value. Six technical fields the wizard
+what you answer — an empty answer keeps the old value. Seven technical fields the wizard
 never asks about (`worktree_root`, `state_path`, `scan_depth`, `launch_timeout_s`,
-`permission_mode`, `pull_before_start`) are carried over verbatim on rewrite; anything else outside that list (including human
+`permission_mode`, `pull_before_start`, `host`) are carried over verbatim on rewrite; anything else outside that list (including human
 comments) is not preserved.
 
 Then open the ClaudeRC app or run `claude-rc bot`.
@@ -459,6 +459,10 @@ Then open the ClaudeRC app or run `claude-rc bot`.
    - `permission_mode` — optional: what a session starts with, so it doesn't stop and
      ask at every step while you're holding a phone
    - `pull_before_start` — optional: fetch origin before a session starts
+   - `host` — optional: how this machine is reached over ssh from your other ones (an
+     alias from `~/.ssh/config`). Only needed once there's a second machine: with it the
+     session passport prints a ready `ssh <host> -t 'tmux attach …'` and the
+     `claude-rc --host <host>` prefix
 3. `chmod 600 config.toml`
 
 The config is looked up in order: the path in `$CLAUDE_RC_CONFIG` if set; otherwise

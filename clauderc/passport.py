@@ -222,7 +222,7 @@ def as_html(p: Passport) -> str:
         f"<code>{e(p.cwd)}</code>",
         e(_tree_line(p)),
         e(state_line(p)),
-        e(p.url) if p.url else "ссылка неизвестна",
+        f"🔗 {e(p.url)}" if p.url else "🔗 ссылка неизвестна",
         f"🖥 <code>{e(p.attach)}</code>",
         f"🤖 <code>{e(p.cli)} send {e(shlex.quote(p.label))} '/mcp' --tail</code>",
     ]
