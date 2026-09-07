@@ -20,9 +20,17 @@ LOCAL_ONLY = frozenset({"bot", "forward", "update"})
 TTY_COMMANDS = frozenset({"connect", "start", "setup"})
 # Команды с путём в позиционном аргументе: относительный путь означал бы
 # каталог этой машины, а исполняется команда на той.
-PATH_COMMANDS = frozenset({"start", "whoami", "sync", "connect"})
+PATH_COMMANDS = frozenset(
+    {"start", "whoami", "sync", "connect", "stop", "restart", "rename", "send"}
+)
+# Здесь путём может быть каждый позиционный аргумент.
+_ALL_POSITIONALS = frozenset({"start", "whoami", "sync"})
+# Здесь пустая цель означает «текущий каталог» (`connect` — только с `--start`).
+_IMPLICIT_CWD = frozenset({"start", "whoami"})
 # Опции этих команд, у которых есть значение — чтобы не принять его за путь.
-_VALUED_OPTIONS = frozenset({"--branch", "--resume", "--permission-mode", "--name", "--mode"})
+_VALUED_OPTIONS = frozenset(
+    {"--branch", "--resume", "--permission-mode", "--name", "--mode", "--tail"}
+)
 # Неинтерактивный ssh не читает .zshrc; uv tool кладёт бинарь в ~/.local/bin.
 _PATH_PREFIX = 'export PATH="$HOME/.local/bin:$PATH"; '
 
@@ -74,10 +82,7 @@ def _looks_like_path(arg: str) -> bool:
     return "@" not in arg and (os.sep in arg or arg in (".", ".."))
 
 
-def relative_paths(argv: list[str]) -> list[str]:
-    command = command_of(argv)
-    if command not in PATH_COMMANDS:
-        return []
+def _split(argv: list[str], command: str) -> tuple[list[str], list[str]]:
     positionals: list[str] = []
     options: list[str] = []
     skip = False
@@ -92,19 +97,39 @@ def relative_paths(argv: list[str]) -> list[str]:
             options.append(arg)
             continue
         positionals.append(arg)
-    if command == "connect":
-        # Цель, не похожая на путь, — ярлык или session_…: её резолвит та
-        # сторона, и относительной она не бывает. Пустая цель означает каталог
-        # только вместе с `--start`; иначе это «единственная живая сессия».
+    return positionals, options
+
+
+def relative_paths(argv: list[str]) -> list[str]:
+    """Аргументы команды, которые та сторона разрешит не от того каталога.
+
+    Правило у каждой команды своё, и разница существенная:
+
+    * `start`/`whoami`/`sync` — путь в каждом позиционном аргументе; у первых
+      двух пустой список означает текущий каталог;
+    * `connect` — единственный позиционный, и только если он похож на путь:
+      ярлык и `session_…` резолвит та сторона. Пустая цель означает каталог
+      только вместе с `--start`, иначе это «единственная живая сессия»;
+    * `stop`/`restart`/`rename`/`send` — цель тоже бывает каталогом
+      (`remote.resolve` делает `expanduser` и сравнивает пути), но только
+      **первый** позиционный: второй у `send` — свободный текст, у `rename` —
+      новое имя. Пустоту точкой здесь не подменяем: цель у всех четырёх
+      обязательна, а `stop --all` каталога не имеет вовсе.
+    """
+    command = command_of(argv)
+    if command not in PATH_COMMANDS:
+        return []
+    positionals, options = _split(argv, command)
+    if command in _ALL_POSITIONALS:
+        candidates = positionals or (["."] if command in _IMPLICIT_CWD else [])
+    else:
         # Пустоту считаем до фильтрации: отфильтрованный ярлык — это заданная
         # цель, а не отсутствующая, и подменять его точкой нельзя.
-        had_target = bool(positionals)
-        positionals = [p for p in positionals if _looks_like_path(p)]
-        if not had_target and "--start" in options:
-            positionals = ["."]
-    elif not positionals and command != "sync":
-        positionals = ["."]
-    return [p for p in positionals if not (os.path.isabs(p) or p.startswith("~"))]
+        target = positionals[:1]
+        candidates = [p for p in target if _looks_like_path(p)]
+        if not target and command == "connect" and "--start" in options:
+            candidates = ["."]
+    return [p for p in candidates if not (os.path.isabs(p) or p.startswith("~"))]
 
 
 def remote_argv(host: str, args: list[str], *, tty: bool) -> list[str]:

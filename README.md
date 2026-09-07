@@ -701,8 +701,14 @@ and shaped the code:
   `http://localhost:<port>` will run, i.e. here — the one deliberate exception to
   "`--host` = run it there," and it's called out above rather than left to be discovered.
 - **A relative path is refused under `--host`.** The command runs as a plain local
-  `claude-rc` on the far machine with no idea what directory this one meant; `.` or `../foo`
-  would resolve against a shell it never lived in, so it's rejected instead of guessed at.
+  `claude-rc` on the far machine with no idea what directory this one meant; a
+  non-interactive ssh starts in `$HOME`, so `.` or `../foo` would resolve against that
+  instead, and it's rejected rather than guessed at. The check knows each command's rule by
+  name: for `start`/`whoami`/`sync` every positional is a path, for
+  `connect`/`stop`/`restart`/`rename`/`send` only the first one and only if it looks like a
+  path (`send`'s second positional is free text, `rename`'s is the new name). Leaving out a
+  command that takes a directory as its target means killing or renaming a session in the
+  far machine's `$HOME` instead of the one that was meant.
 - **Non-interactive ssh doesn't read `.zshrc`, so the `PATH` fix is explicit.** `ssh host cmd`
   (unlike `ssh -t host`) skips the login-shell rc files that put `~/.local/bin` on `PATH` —
   exactly where `uv tool install` puts `claude-rc`. `proxy.remote_argv` prepends that

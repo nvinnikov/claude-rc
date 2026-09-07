@@ -2554,11 +2554,23 @@ def test_host_refuses_local_only_commands(
     assert command in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["start", "."],
+        # Цель `stop`/`restart`/`rename` — «имя сессии или каталог», и каталог
+        # `resolve` разрешает честно: «.» на той стороне — её $HOME.
+        ["stop", "."],
+        ["restart", "../oms"],
+        ["rename", "./x", "new"],
+        ["send", "./x", "hi"],
+    ],
+)
 def test_host_refuses_relative_paths(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], argv: list[str]
 ) -> None:
     monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: pytest.fail("proxied"))
-    assert cli.main(["--host", "m1", "start", "."]) == 2
+    assert cli.main(["--host", "m1", *argv]) == 2
     assert "абсолютн" in capsys.readouterr().err
 
 

@@ -144,3 +144,31 @@ def test_relative_paths_keeps_worktree_labels_out_of_connect() -> None:
     # Пустая цель с --start по-прежнему означает каталог этой машины.
     assert proxy.relative_paths(["connect", "--start"]) == ["."]
     assert proxy.relative_paths(["connect", "./x", "--start"]) == ["./x"]
+
+
+def test_relative_paths_covers_targets_that_may_be_a_directory() -> None:
+    # `stop`, `restart`, `rename` и `send` принимают каталог как цель:
+    # `remote.resolve` делает expanduser и сравнивает пути. Неинтерактивный ssh
+    # стартует в $HOME, поэтому «.» на той стороне — домашний каталог, а не тот,
+    # из которого позвали: в лучшем случае «сессия не найдена», в худшем
+    # погашена чужая.
+    assert proxy.relative_paths(["stop", "."]) == ["."]
+    assert proxy.relative_paths(["stop", "../oms"]) == ["../oms"]
+    assert proxy.relative_paths(["stop", "oms@x"]) == []
+    assert proxy.relative_paths(["restart", "session_01A", "--mode", "plan"]) == []
+    assert proxy.relative_paths(["restart", "./oms"]) == ["./oms"]
+    assert proxy.relative_paths(["rename", "./x", "new"]) == ["./x"]
+    assert proxy.relative_paths(["rename", "oms", "new"]) == []
+    # Цель у всех четырёх обязательна, точкой пустоту не подменяем:
+    # `stop --all` каталога не имеет вовсе.
+    assert proxy.relative_paths(["stop", "--all"]) == []
+
+
+def test_relative_paths_checks_only_the_target_of_send() -> None:
+    # Второй позиционный у `send` — свободный текст, и слэш в нём не путь.
+    assert proxy.relative_paths(["send", "oms", "run ./b.sh"]) == []
+    assert proxy.relative_paths(["send", "./x", "hi"]) == ["./x"]
+    # У `rename` второй позиционный — новое имя, оно тоже не цель.
+    assert proxy.relative_paths(["rename", "oms", "./new"]) == []
+    # --tail со значением: число не должно сойти за цель.
+    assert proxy.relative_paths(["send", "--tail", "20", "oms", "hi"]) == []
