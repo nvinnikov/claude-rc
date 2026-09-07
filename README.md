@@ -529,7 +529,7 @@ claude-rc --host m1 forward oms@fix       # then open http://localhost:<port>
 
 `whoami` is for the agent *inside* a session; a steering agent is not inside one and should
 use `sessions --json`. `state` is what the pane shows (`idle`, `working`, `needs_input`,
-`unknown`), never what claude knows — read `last_lines` when in doubt. `--no-probe` skips
+`dead`, `unknown`), never what claude knows — read `last_lines` when in doubt. `--no-probe` skips
 the pane capture and port lookup for a faster listing when state isn't needed. Text for
 `send` that starts with `-` goes after `--`: `claude-rc send oms -- -x`.
 
