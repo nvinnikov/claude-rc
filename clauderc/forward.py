@@ -28,15 +28,25 @@ _SETTLE_S = 0.5
 _HOST_RE = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
-class ForwardError(RuntimeError):
-    pass
-
-
 @dataclass(frozen=True)
 class Forward:
     host: str
     port: int
     pid: int
+
+
+class ForwardError(RuntimeError):
+    """Отказ, который мог случиться уже после того, как часть туннелей поднялась.
+
+    `started` — те, что работают: они не гасятся (сосед не виноват в чужой
+    неудаче), и промолчать о них значило бы выдать частичный успех за чистый
+    провал. Человек чинит ssh, повторяет вызов и получает «порт уже занят
+    локально» — про собственный туннель с прошлой попытки.
+    """
+
+    def __init__(self, message: str, *, started: list[Forward] | None = None) -> None:
+        super().__init__(message)
+        self.started: list[Forward] = list(started or [])
 
 
 def _check_host(host: str) -> None:
@@ -108,9 +118,12 @@ def start(host: str, ports: list[int]) -> list[Forward]:
         rc = proc.poll()
         if rc is not None:
             # Туннели, поднятые раньше в этом же вызове, уже работают и не
-            # гасятся — неудача одного порта не должна рвать соседние.
+            # гасятся — неудача одного порта не должна рвать соседние. Поэтому
+            # они уезжают с исключением: снаружи их надо напечатать, иначе
+            # следующая попытка споткнётся о них же как о занятые порты.
             raise ForwardError(
-                f"ssh -L {port} на {host} завершился сразу (код {rc}); проверь ssh {host}"
+                f"ssh -L {port} на {host} завершился сразу (код {rc}); проверь ssh {host}",
+                started=started,
             )
         _pid_file(host, port).write_text(str(proc.pid))
         started.append(Forward(host=host, port=port, pid=proc.pid))

@@ -76,6 +76,30 @@ def test_start_rejects_ssh_that_dies_immediately(
     assert not (pid_dir / "m1-3000.pid").exists()
 
 
+def test_start_carries_the_tunnels_it_already_raised(
+    monkeypatch: pytest.MonkeyPatch, pid_dir: Path
+) -> None:
+    # Первый порт поднялся, второй умер. Поднятый не гасится — значит и молчать
+    # о нём нельзя: без него повтор упрётся в «порт уже занят локально: 3000»,
+    # указывающее на собственный туннель с прошлой попытки.
+    def fake_popen(argv: list[str], **kw: object) -> _FakeProc:
+        return _FakeProc(argv, poll_result=None if "3000:localhost:3000" in argv else 255)
+
+    monkeypatch.setattr(forward.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(forward, "port_busy", lambda port: False)
+    with pytest.raises(forward.ForwardError) as caught:
+        forward.start("m1", [3000, 3001])
+    assert caught.value.started == [forward.Forward(host="m1", port=3000, pid=4242)]
+    assert (pid_dir / "m1-3000.pid").read_text().strip() == "4242"
+    assert not (pid_dir / "m1-3001.pid").exists()
+
+
+def test_forward_error_without_started_is_empty_not_none() -> None:
+    # `started` читают безусловно — отсутствующий список стал бы TypeError
+    # ровно там, где человеку нужно сообщение об ошибке.
+    assert forward.ForwardError("boom").started == []
+
+
 def test_port_busy_detects_a_listener() -> None:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))

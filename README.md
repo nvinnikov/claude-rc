@@ -700,6 +700,11 @@ and shaped the code:
   far machine; `forward`'s ssh tunnel has to listen where the browser opening
   `http://localhost:<port>` will run, i.e. here — the one deliberate exception to
   "`--host` = run it there," and it's called out above rather than left to be discovered.
+- **A partial `forward` is not a failure.** Tunnels that came up before another port's ssh
+  died keep running — a neighbour's failure is not theirs — so staying quiet about them would
+  report a partial success as a clean failure. `ForwardError` carries them in `started`, the
+  CLI prints them before the error text and points at `--stop`; otherwise the retry after
+  fixing ssh hits "port already in use" on the caller's own leftover tunnel.
 - **A relative path is refused under `--host`.** The command runs as a plain local
   `claude-rc` on the far machine with no idea what directory this one meant; a
   non-interactive ssh starts in `$HOME`, so `.` or `../foo` would resolve against that

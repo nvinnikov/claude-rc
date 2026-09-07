@@ -2702,6 +2702,28 @@ def test_forward_bad_json_from_remote_is_not_a_traceback(
     assert raw in capsys.readouterr().err
 
 
+def test_forward_prints_tunnels_that_survived_a_partial_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Поднятые туннели работают и после отказа. Напечатать их обязательно:
+    # иначе повтор упрётся в «порт уже занят локально» про них же, а способ
+    # снять (`--stop`) человек нигде не видел.
+    def fake_start(host: str, ports: list[int]) -> list[cli.forward.Forward]:
+        raise cli.forward.ForwardError(
+            "ssh -L 3001 на m1 завершился сразу (код 255); проверь ssh m1",
+            started=[cli.forward.Forward("m1", 3000, 77)],
+        )
+
+    monkeypatch.setattr(cli.forward, "start", fake_start)
+    assert cli.main(["--host", "m1", "forward", "oms@x", "3000", "3001"]) == 1
+    out = capsys.readouterr()
+    assert "http://localhost:3000" in out.out
+    assert "pid 77" in out.out
+    assert "3001" in out.err
+    assert "--stop" in out.err
+    assert "oms@x" in out.err
+
+
 def test_forward_stop_nothing_active(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

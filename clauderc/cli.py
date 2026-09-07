@@ -668,11 +668,23 @@ class _Commands:
         try:
             started = forward.start(host, ports)
         except forward.ForwardError as exc:
+            # Часть туннелей могла подняться до отказа — они работают, и
+            # промолчать о них значит выдать частичный успех за чистый провал:
+            # следующая попытка споткнётся о них же как о занятых портах.
+            _print_forwards(exc.started)
             print(str(exc), file=sys.stderr)
+            print(
+                f"снять: claude-rc --host {host} forward {args.target} --stop",
+                file=sys.stderr,
+            )
             return EXIT_FAILED
-        for f in started:
-            print(f"http://localhost:{f.port} → {f.host}:{f.port} (pid {f.pid})")
+        _print_forwards(started)
         return 0
+
+
+def _print_forwards(forwards: list[forward.Forward]) -> None:
+    for f in forwards:
+        print(f"http://localhost:{f.port} → {f.host}:{f.port} (pid {f.pid})")
 
 
 class _TrustDeclined(RuntimeError):
