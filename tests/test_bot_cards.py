@@ -4,9 +4,10 @@ import re
 import time
 from pathlib import Path
 
+import pytest
 from aiogram.types import Chat, Message, User
 from clauderc import bot as bot_module
-from clauderc import passport
+from clauderc import passport, state_probe
 from clauderc.bot import (
     LaunchRequest,
     _apply_name,
@@ -438,3 +439,24 @@ def test_reply_to_someone_else_is_not_our_business() -> None:
 def test_reply_without_author_is_not_ours() -> None:
     orphan = _reply_from(42).model_copy(update={"from_user": None})
     assert _is_own_prompt(orphan, 42) is False
+
+
+async def test_pane_asks_blocks_when_a_dialog_is_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Кнопки, печатающие в панель, заканчиваются Enter — а Enter подтверждает
+    # подсвеченный пункт открытого диалога, вплоть до «Yes, and don't ask again».
+    async def fake_probe(tmux_name: str, *, lines: int = 5) -> state_probe.SessionState:
+        assert tmux_name == "session_01A"
+        return state_probe.SessionState(state=state_probe.State.NEEDS_INPUT, last_lines=())
+
+    monkeypatch.setattr(bot_module.state_probe, "probe", fake_probe)
+    assert await bot_module._pane_asks("session_01A") is True
+
+
+async def test_pane_asks_lets_a_free_session_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Всё, кроме открытого вопроса, — не повод отказывать: неизвестное состояние
+    # (сломанный обновлением claude шаблон) не должно запирать кнопки навсегда.
+    async def fake_probe(tmux_name: str, *, lines: int = 5) -> state_probe.SessionState:
+        return state_probe.SessionState(state=state_probe.State.UNKNOWN, last_lines=())
+
+    monkeypatch.setattr(bot_module.state_probe, "probe", fake_probe)
+    assert await bot_module._pane_asks("session_01A") is False

@@ -625,6 +625,11 @@ and shaped the code:
   changed. When the highlighted option turned out to be the decline, Claude exited, the tmux
   session ended with it, and the human got "the session ended without a link" in reply to
   their own "I trust it" tap. The dialog prints the number itself, so that's what we use.
+- **Buttons that type into the pane ask for its state first.** `🔌 /mcp` and `✏️ Rename` end
+  with a separate `Enter`, and `Enter` confirms whichever option an open dialog highlights —
+  up to "Yes, and don't ask again". The card may have been drawn long before the dialog
+  appeared, so `state_probe.probe` runs right before sending and a `needs_input` pane gets a
+  refusal instead of an answer given on the human's behalf. `📋 Tail` only reads and doesn't ask.
 - **A dead session is reported with the last pane we saw, not the failed `capture-pane`.**
   Once the session is gone tmux prints `can't find session`, and that used to reach the human
   instead of what was on screen before it died — the only clue as to why.

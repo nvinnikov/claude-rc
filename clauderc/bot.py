@@ -24,6 +24,7 @@ from aiogram.types import (
 )
 
 from clauderc import actions, browse, history, passport, paths, worktrees
+from clauderc import state_probe as state_probe  # тесты подменяют bot.state_probe.probe
 from clauderc import sync as sync_mod
 from clauderc.browse import BrowseError
 from clauderc.config import Config, load_config
@@ -118,6 +119,23 @@ def _live_message(query: CallbackQuery) -> Message | None:
     ни edit_text, ни answer, и обращение к ним падает.
     """
     return query.message if isinstance(query.message, Message) else None
+
+
+BUSY_PANE_TEXT = "В панели открыт вопрос — ответь на него в приложении, потом повтори."
+
+
+async def _pane_asks(tmux_name: str) -> bool:
+    """Ждёт ли панель ответа на открытый диалог.
+
+    Кнопки, которые печатают в панель (`🔌 /mcp`, `✏️ Rename`), заканчиваются
+    отдельным Enter, а Enter подтверждает подсвеченный пункт открытого диалога —
+    и подсвеченным бывает «Yes, and don't ask again». Это та же грабля, что у
+    `confirm_trust`, только тут выбор делает не человек, а мы за него. Карточку
+    могли показать задолго до появления диалога, поэтому состояние спрашиваем
+    перед отправкой, а не берём из карточки. Tail только читает и не спрашивает.
+    """
+    observed = await state_probe.probe(tmux_name, lines=3)
+    return observed.state is state_probe.State.NEEDS_INPUT
 
 
 def _open_keyboard(url: str) -> InlineKeyboardMarkup | None:
@@ -1396,6 +1414,9 @@ async def main() -> None:
         if session is None or message is None:
             return
         await query.answer()
+        if prefix == "mcp:" and await _pane_asks(session.tmux_name):
+            await message.answer(BUSY_PANE_TEXT)
+            return
         try:
             text = (
                 await actions.send_and_tail(session, "/mcp", lines=25)
@@ -1667,6 +1688,9 @@ async def main() -> None:
             session = _same_session(await find(cwd), tmux_id, created_at)
             if session is None:
                 await message.reply("Сессия уже не жива.")
+                return
+            if await _pane_asks(session.tmux_name):
+                await message.reply(BUSY_PANE_TEXT)
                 return
             try:
                 result = await actions.rename(session, message.text or "")
