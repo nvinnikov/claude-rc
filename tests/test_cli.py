@@ -3,9 +3,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from clauderc import cli, remote
+from clauderc import actions, cli, proxy, remote, state_probe
 from clauderc import update as update_mod
 from clauderc.remote import LaunchError, RemoteSession, TrustRequired
+from clauderc.worktrees import Worktree
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Без этого случайный CLAUDE_RC_HOST в окружении проксировал бы чужие тесты."""
+    monkeypatch.delenv(proxy.HOST_ENV, raising=False)
+
+
+async def _fake_no_worktree(path: Path) -> Worktree | None:
+    """Заглушка `worktrees.inspect` — юнит-тест не должен ходить в git по /repos/…"""
+    return None
 
 
 def _session(name: str = "oms") -> RemoteSession:
@@ -37,6 +49,10 @@ def test_version_prints_something(capsys: pytest.CaptureFixture[str]) -> None:
     assert capsys.readouterr().out.strip()
 
 
+async def _fake_probe(tmux_name: str, *, lines: int = 5) -> state_probe.SessionState:
+    return state_probe.SessionState(state=state_probe.State.IDLE, last_lines=(), listening=())
+
+
 def test_sessions_json_has_stable_envelope(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -44,6 +60,8 @@ def test_sessions_json_has_stable_envelope(
         return [_session()]
 
     monkeypatch.setattr(cli, "list_sessions", fake)
+    monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
+    monkeypatch.setattr(cli.passport.state_probe, "probe", _fake_probe)
     assert cli.main(["sessions", "--json"]) == 0
 
     payload: dict[str, Any] = json.loads(capsys.readouterr().out)
@@ -51,6 +69,7 @@ def test_sessions_json_has_stable_envelope(
     assert list(payload) == ["sessions"]
     assert payload["sessions"][0]["name"] == "oms"
     assert payload["sessions"][0]["url"] == "https://claude.ai/code/session_A"
+    assert payload["sessions"][0]["state"] == "idle"
 
 
 def test_sessions_plain_lists_names(
@@ -59,8 +78,13 @@ def test_sessions_plain_lists_names(
     async def fake() -> list[RemoteSession]:
         return [_session()]
 
+    async def boom(tmux_name: str, *, lines: int = 5) -> state_probe.SessionState:
+        raise AssertionError("--no-probe must not call state_probe.probe")
+
     monkeypatch.setattr(cli, "list_sessions", fake)
-    assert cli.main(["sessions"]) == 0
+    monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
+    monkeypatch.setattr(cli.passport.state_probe, "probe", boom)
+    assert cli.main(["sessions", "--no-probe"]) == 0
     assert "oms" in capsys.readouterr().out
 
 
@@ -1896,6 +1920,275 @@ def test_stop_refuses_to_guess_between_same_named_sessions(
     assert killed == []
 
 
+def test_rename_prints_new_label(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    async def fake_rename(session: RemoteSession, name: str) -> actions.RenameResult:
+        return actions.RenameResult(label=f"oms@{name}", app_renamed=False)
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "rename", fake_rename)
+    assert cli.main(["rename", "oms", "fix"]) == 0
+    out, err = capsys.readouterr()
+    assert out.strip() == "oms@fix"
+    assert "/rename" in err
+
+
+def test_restart_uses_kill_tmux_and_prints_passport(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_restart(
+        session: RemoteSession, *, kill: Any, mode: str | None = None, timeout_s: float = 90.0
+    ) -> RemoteSession:
+        seen["mode"] = mode
+        assert await kill("rc-oms", "/repos/oms") is True
+        return _session()
+
+    async def fake_kill(tmux_name: str) -> bool:
+        return True
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli, "kill_tmux", fake_kill)
+    monkeypatch.setattr(cli.actions, "restart", fake_restart)
+    monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
+    assert cli.main(["restart", "oms", "--mode", "bypassPermissions"]) == 0
+    assert seen["mode"] == "bypassPermissions"
+    assert "session_A" in capsys.readouterr().out
+
+
+def test_send_prints_tail_when_asked(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_send_and_tail(
+        session: RemoteSession,
+        text: str,
+        *,
+        enter: bool = True,
+        wait_s: float = 3.0,
+        lines: int = 20,
+    ) -> str:
+        seen.update(text=text, enter=enter, lines=lines)
+        return "tail here"
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "send_and_tail", fake_send_and_tail)
+    assert cli.main(["send", "oms", "/mcp", "--tail", "7"]) == 0
+    assert seen == {"text": "/mcp", "enter": True, "lines": 7}
+    assert "tail here" in capsys.readouterr().out
+
+
+def test_send_no_enter_and_no_tail(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_send(session: RemoteSession, text: str, *, enter: bool = True) -> None:
+        seen.update(text=text, enter=enter)
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "send", fake_send)
+    assert cli.main(["send", "oms", "1", "--no-enter"]) == 0
+    assert seen == {"text": "1", "enter": False}
+    assert capsys.readouterr().out == ""
+
+
+def test_send_text_starting_with_dash_via_separator(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_send(session: RemoteSession, text: str, *, enter: bool = True) -> None:
+        seen.update(text=text, enter=enter)
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "send", fake_send)
+    assert cli.main(["send", "oms", "--", "-x"]) == 0
+    assert seen == {"text": "-x", "enter": True}
+    assert capsys.readouterr().out == ""
+
+
+def test_send_option_like_text_via_separator(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_send(session: RemoteSession, text: str, *, enter: bool = True) -> None:
+        seen.update(text=text, enter=enter)
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "send", fake_send)
+    assert cli.main(["send", "oms", "--", "--tail"]) == 0
+    assert seen == {"text": "--tail", "enter": True}
+    assert capsys.readouterr().out == ""
+
+
+def test_send_all_flags_combined(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_send_and_tail(
+        session: RemoteSession,
+        text: str,
+        *,
+        enter: bool = True,
+        wait_s: float = 3.0,
+        lines: int = 20,
+    ) -> str:
+        seen.update(text=text, enter=enter, lines=lines)
+        return "output"
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "send_and_tail", fake_send_and_tail)
+    assert cli.main(["send", "oms", "/mcp", "--no-enter", "--tail", "3"]) == 0
+    assert seen == {"text": "/mcp", "enter": False, "lines": 3}
+    assert "output" in capsys.readouterr().out
+
+
+def test_connect_execs_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    seen: list[list[str]] = []
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.os, "execvp", lambda file, args: seen.append(args))
+    assert cli.main(["connect", "oms"]) == 0
+    assert seen == [["tmux", "attach", "-d", "-t", "=rc-oms"]]
+
+
+def test_connect_without_tty_hints_ssh_t(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=False))
+    monkeypatch.setattr(cli.os, "execvp", lambda file, args: pytest.fail("exec"))
+    assert cli.main(["connect", "oms"]) == 2
+    assert "ssh -t" in capsys.readouterr().err
+
+
+def test_connect_picks_the_only_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_list() -> list[RemoteSession]:
+        return [_session()]
+
+    seen: list[list[str]] = []
+    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.os, "execvp", lambda file, args: seen.append(args))
+    assert cli.main(["connect"]) == 0
+    assert seen[0][-1] == "=rc-oms"
+
+
+def test_connect_url_only_prints(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.os, "execvp", lambda file, args: pytest.fail("exec"))
+    assert cli.main(["connect", "oms", "--url"]) == 0
+    assert capsys.readouterr().out.strip() == "https://claude.ai/code/session_A"
+
+
+def test_connect_lists_when_several_and_no_target(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_list() -> list[RemoteSession]:
+        return [_session("a"), _session("b")]
+
+    monkeypatch.setattr(cli, "list_sessions", fake_list)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=False))
+    assert cli.main(["connect"]) == 2
+    assert "rc-a" in capsys.readouterr().err
+
+
+def test_connect_start_launches_and_attaches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return []
+
+    async def fake_start(
+        target: Path, branch: str | None, resume: str | None, **kwargs: Any
+    ) -> RemoteSession:
+        return _session()
+
+    seen: list[list[str]] = []
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli, "_start", fake_start)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+    monkeypatch.setattr(cli.os, "execvp", lambda file, args: seen.append(args))
+    assert cli.main(["connect", str(tmp_path), "--start"]) == 0
+    assert seen == [["tmux", "attach", "-d", "-t", "=rc-oms"]]
+
+
+def test_connect_start_rejects_missing_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return []
+
+    async def fake_start(
+        target: Path, branch: str | None, resume: str | None, **kwargs: Any
+    ) -> RemoteSession:
+        pytest.fail("_start")
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli, "_start", fake_start)
+    assert cli.main(["connect", str(tmp_path / "nope"), "--start"]) == 2
+    assert capsys.readouterr().err.strip()
+
+
+def test_connect_start_branch_without_config_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return []
+
+    async def fake_start(
+        target: Path, branch: str | None, resume: str | None, **kwargs: Any
+    ) -> RemoteSession:
+        pytest.fail("_start")
+
+    missing_config = tmp_path / "config.toml"
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli, "_start", fake_start)
+    monkeypatch.setattr(cli.paths, "config_file", lambda: missing_config)
+
+    assert cli.main(["connect", str(tmp_path), "--start", "--branch", "feature/x"]) == 2
+    err = capsys.readouterr().err
+    assert str(missing_config) in err
+
+
 def test_stop_by_session_id_is_unambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
     killed: list[str] = []
 
@@ -2137,3 +2430,358 @@ def test_start_pull_leaves_a_directory_with_a_live_session_alone(
     assert cli.main(["start", str(tmp_path), "--pull"]) == 0
     assert pulled == []
     assert "не тяну" in capsys.readouterr().out
+
+
+def test_start_names_the_session_by_repo_and_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Ярлык, а не имя каталога: у worktree каталог зовётся demo-wt-feature-x,
+    # и в приложении сессия называлась слагом вместо репозитория и ветки.
+    seen: dict[str, Any] = {}
+
+    async def fake_label(path: Path, *, name: str | None = None) -> str:
+        seen["labelled"] = path
+        return "demo@wt/feature-x"
+
+    async def fake_launch(label: str, cwd: str, **kwargs: Any) -> RemoteSession:
+        seen["label"] = label
+        return _session()
+
+    monkeypatch.setattr(cli.worktrees, "label", fake_label)
+    monkeypatch.setattr(cli, "launch", fake_launch)
+
+    assert cli.main(["start", str(tmp_path)]) == 0
+    assert seen["label"] == "demo@wt/feature-x"
+    assert seen["labelled"] == tmp_path
+
+
+def test_start_name_becomes_label_and_new_worktree_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def fake_ensure(repo: Path, branch: str, root: Path) -> Path:
+        seen["branch"] = branch
+        return tmp_path
+
+    async def fake_label(path: Path, *, name: str | None = None) -> str:
+        return f"oms@{name}"
+
+    async def fake_launch(label: str, cwd: str, **kw: Any) -> RemoteSession:
+        seen["label"] = label
+        return _session()
+
+    monkeypatch.setattr(cli.worktrees, "ensure", fake_ensure)
+    monkeypatch.setattr(cli.worktrees, "label", fake_label)
+    monkeypatch.setattr(cli, "launch", fake_launch)
+
+    config = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    config.write_text(f'bot_token = "x"\nallowed_user_id = 1\nrc_roots = ["{root}"]\n')
+    monkeypatch.setattr(cli.paths, "config_file", lambda: config)
+
+    # --new-worktree без --branch — ветка выводится из имени
+    assert cli.main(["start", str(tmp_path), "--new-worktree", "--name", "MCP fix"]) == 0
+    assert seen["branch"] == "wt/mcp-fix"
+    assert seen["label"] == "oms@MCP fix"
+
+
+def test_whoami_json_describes_the_enclosing_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Ради агента внутри сессии: одной командой узнать, кто он и куда идёт tmux.
+    async def fake(cwd: str) -> RemoteSession:
+        return _session()
+
+    monkeypatch.setattr(cli, "find_enclosing", fake)
+    monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
+    assert cli.main(["whoami", "--json", str(tmp_path)]) == 0
+
+    payload: dict[str, Any] = json.loads(capsys.readouterr().out)
+    assert list(payload) == ["session"]
+    assert payload["session"]["tmux_name"] == "rc-oms"
+    assert payload["session"]["attach"] == "tmux attach -d -t =rc-oms"
+
+
+def test_whoami_plain_prints_the_attach_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake(cwd: str) -> RemoteSession:
+        return _session()
+
+    monkeypatch.setattr(cli, "find_enclosing", fake)
+    monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
+    assert cli.main(["whoami", str(tmp_path)]) == 0
+
+    out = capsys.readouterr().out
+    assert "tmux attach -d -t =rc-oms" in out
+    assert "https://claude.ai/code/session_A" in out
+
+
+def test_whoami_outside_a_session_says_so(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake(cwd: str) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "find_enclosing", fake)
+    assert cli.main(["whoami", str(tmp_path)]) == 1
+    assert capsys.readouterr().err.strip()
+
+
+def test_host_flag_proxies_through_ssh(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[str]] = []
+    monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: seen.append([host, *args]))
+    cli.main(["--host", "m1", "sessions", "--json"])
+    assert seen == [["m1", "sessions", "--json"]]
+
+
+def test_host_env_is_used_when_no_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+    monkeypatch.setenv(proxy.HOST_ENV, "m3")
+    monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: seen.append(host))
+    cli.main(["sessions"])
+    assert seen == ["m3"]
+
+
+@pytest.mark.parametrize("command", ["bot", "update"])
+def test_host_refuses_local_only_commands(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: pytest.fail("proxied"))
+    assert cli.main(["--host", "m1", command]) == 2
+    assert command in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["start", "."],
+        # Цель `stop`/`restart`/`rename` — «имя сессии или каталог», и каталог
+        # `resolve` разрешает честно: «.» на той стороне — её $HOME.
+        ["stop", "."],
+        ["restart", "../oms"],
+        ["rename", "./x", "new"],
+        ["send", "./x", "hi"],
+    ],
+)
+def test_host_refuses_relative_paths(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: pytest.fail("proxied"))
+    assert cli.main(["--host", "m1", *argv]) == 2
+    assert "абсолютн" in capsys.readouterr().err
+
+
+def test_host_without_value_is_an_error_not_a_local_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli.proxy, "exec_remote", lambda host, args: pytest.fail("proxied"))
+    assert cli.main(["sessions", "--host"]) == 2
+    assert "--host" in capsys.readouterr().err
+
+
+def test_forward_requires_host(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["forward", "oms"]) == 2
+    assert "--host" in capsys.readouterr().err
+
+
+def test_forward_takes_ports_from_remote_passport(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = json.dumps(
+        {
+            "sessions": [
+                {
+                    "label": "oms@x",
+                    "cwd": "/r/oms",
+                    "tmux_name": "session_A",
+                    "listening": [3000, 5173],
+                }
+            ]
+        }
+    )
+
+    def fake_run_remote(host: str, args: list[str], **kw: object) -> tuple[int, str]:
+        return 0, payload
+
+    monkeypatch.setattr(cli.proxy, "run_remote", fake_run_remote)
+    seen: dict[str, Any] = {}
+
+    def fake_start(host: str, ports: list[int]) -> list[cli.forward.Forward]:
+        seen.update(host=host, ports=ports)
+        return []
+
+    monkeypatch.setattr(cli.forward, "start", fake_start)
+    assert cli.main(["--host", "m1", "forward", "oms@x"]) == 0
+    assert seen == {"host": "m1", "ports": [3000, 5173]}
+
+
+def test_forward_explicit_ports_skip_remote_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_run_remote(host: str, args: list[str], **kw: object) -> tuple[int, str]:
+        pytest.fail("looked up")
+
+    monkeypatch.setattr(cli.proxy, "run_remote", fail_run_remote)
+    seen: dict[str, Any] = {}
+
+    def fake_start(host: str, ports: list[int]) -> list[cli.forward.Forward]:
+        seen.update(ports=ports)
+        return []
+
+    monkeypatch.setattr(cli.forward, "start", fake_start)
+    assert cli.main(["--host", "m1", "forward", "oms", "8080"]) == 0
+    assert seen["ports"] == [8080]
+
+
+def test_forward_stop(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    def fake_stop(host: str, ports: list[int] | None = None) -> list[cli.forward.Forward]:
+        return [cli.forward.Forward("m1", 3000, 1)]
+
+    monkeypatch.setattr(cli.forward, "stop", fake_stop)
+    assert cli.main(["--host", "m1", "forward", "oms", "--stop"]) == 0
+    assert "3000" in capsys.readouterr().out
+
+
+def test_forward_ambiguous_target_lists_matches(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Голое имя репозитория подходит обеим сессиям — как и в `remote.resolve`.
+    # Выбирать за человека, к какой из них строить туннель, нельзя.
+    payload = json.dumps(
+        {
+            "sessions": [
+                {"label": "oms@x", "cwd": "/r/oms", "tmux_name": "session_A", "listening": [3000]},
+                {"label": "oms@y", "cwd": "/r/oms2", "tmux_name": "session_B", "listening": [4000]},
+            ]
+        }
+    )
+
+    def fake_run_remote(host: str, args: list[str], **kw: object) -> tuple[int, str]:
+        return 0, payload
+
+    monkeypatch.setattr(cli.proxy, "run_remote", fake_run_remote)
+
+    def fail_start(host: str, ports: list[int]) -> list[cli.forward.Forward]:
+        pytest.fail("start called on an ambiguous target")
+
+    monkeypatch.setattr(cli.forward, "start", fail_start)
+    assert cli.main(["--host", "m1", "forward", "oms"]) == 1
+    err = capsys.readouterr().err
+    assert "oms@x" in err
+    assert "oms@y" in err
+
+
+def test_forward_target_listens_on_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = json.dumps(
+        {
+            "sessions": [
+                {"label": "oms@x", "cwd": "/r/oms", "tmux_name": "session_A", "listening": []}
+            ]
+        }
+    )
+
+    def fake_run_remote(host: str, args: list[str], **kw: object) -> tuple[int, str]:
+        return 0, payload
+
+    monkeypatch.setattr(cli.proxy, "run_remote", fake_run_remote)
+    assert cli.main(["--host", "m1", "forward", "oms@x"]) == 1
+    assert "назови порт" in capsys.readouterr().err
+
+
+def test_forward_bad_json_from_remote_is_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw = "claude-rc: команда не найдена"
+
+    def fake_run_remote(host: str, args: list[str], **kw: object) -> tuple[int, str]:
+        return 0, raw
+
+    monkeypatch.setattr(cli.proxy, "run_remote", fake_run_remote)
+    assert cli.main(["--host", "m1", "forward", "oms@x"]) == 1
+    assert raw in capsys.readouterr().err
+
+
+def test_forward_prints_tunnels_that_survived_a_partial_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Поднятые туннели работают и после отказа. Напечатать их обязательно:
+    # иначе повтор упрётся в «порт уже занят локально» про них же, а способ
+    # снять (`--stop`) человек нигде не видел.
+    def fake_start(host: str, ports: list[int]) -> list[cli.forward.Forward]:
+        raise cli.forward.ForwardError(
+            "ssh -L 3001 на m1 завершился сразу (код 255); проверь ssh m1",
+            started=[cli.forward.Forward("m1", 3000, 77)],
+        )
+
+    monkeypatch.setattr(cli.forward, "start", fake_start)
+    assert cli.main(["--host", "m1", "forward", "oms@x", "3000", "3001"]) == 1
+    out = capsys.readouterr()
+    assert "http://localhost:3000" in out.out
+    assert "pid 77" in out.out
+    assert "3001" in out.err
+    assert "--stop" in out.err
+    assert "oms@x" in out.err
+
+
+def test_forward_stop_nothing_active(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_stop(host: str, ports: list[int] | None = None) -> list[cli.forward.Forward]:
+        return []
+
+    monkeypatch.setattr(cli.forward, "stop", fake_stop)
+    assert cli.main(["--host", "m1", "forward", "oms", "--stop"]) == 0
+    assert "Туннелей к m1 нет." in capsys.readouterr().out
+
+
+def test_forward_accepts_a_bare_repo_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `remote.resolve` голое имя репозитория принимает; forward отвечал на него
+    # «не найдена» и расходился с `send`/`stop` на тех же данных.
+    payload = json.dumps(
+        {
+            "sessions": [
+                {
+                    "label": "oms@wt/x",
+                    "cwd": "/r/oms",
+                    "tmux_name": "session_A",
+                    "listening": [3000],
+                }
+            ]
+        }
+    )
+
+    def fake_run_remote(host: str, args: list[str], **kw: object) -> tuple[int, str]:
+        return 0, payload
+
+    monkeypatch.setattr(cli.proxy, "run_remote", fake_run_remote)
+    seen: dict[str, Any] = {}
+
+    def fake_start(host: str, ports: list[int]) -> list[cli.forward.Forward]:
+        seen.update(ports=ports)
+        return []
+
+    monkeypatch.setattr(cli.forward, "start", fake_start)
+    assert cli.main(["--host", "m1", "forward", "oms"]) == 0
+    assert seen["ports"] == [3000]
+
+
+def test_restart_says_the_old_session_is_already_gone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # LaunchError идёт уже после kill: прежней сессии нет, и человек должен
+    # узнать об этом, а не гадать по одному тексту ошибки запуска.
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    async def fake_restart(
+        session: RemoteSession, *, kill: Any, mode: str | None = None, timeout_s: float = 90.0
+    ) -> RemoteSession:
+        raise LaunchError("ссылка не появилась за 90с")
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "restart", fake_restart)
+    assert cli.main(["restart", "oms"]) == 1
+    err = capsys.readouterr().err
+    assert "ссылка не появилась" in err
+    assert "Прежняя сессия погашена, заново не поднялась." in err

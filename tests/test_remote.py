@@ -1,3 +1,6 @@
+import asyncio
+import logging
+import re
 import subprocess
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
@@ -16,7 +19,7 @@ from clauderc.remote import (
 # Обработчик подменённого tmux: (команда, аргументы…) -> (код возврата, вывод)
 Handler = Callable[..., tuple[int, str]]
 
-_ROW = "rc-oms\t/repos/oms\t1700000000\thttps://claude.ai/code/session_A"
+_ROW = "rc-oms\t/repos/oms\t1700000000\thttps://claude.ai/code/session_A\t\t\t$1"
 
 
 def _stub(handler: Handler) -> Callable[..., Awaitable[tuple[int, str]]]:
@@ -59,14 +62,37 @@ def test_attach_argv_detaches_others_and_matches_exactly(monkeypatch: pytest.Mon
     assert remote.attach_argv("rc-oms") == ["tmux", "attach", "-d", "-t", "=rc-oms"]
 
 
+def test_attach_argv_read_only_and_control(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(remote.TMUX_SOCKET_ENV, raising=False)
+    assert remote.attach_argv("s", read_only=True) == ["tmux", "attach", "-d", "-r", "-t", "=s"]
+    assert remote.attach_argv("s", control=True) == ["tmux", "-CC", "attach", "-d", "-t", "=s"]
+
+
+def test_attach_argv_control_with_socket_keeps_flag_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # -CC идёт после -L socket и перед attach — не перед tmux и не после attach.
+    monkeypatch.setenv(remote.TMUX_SOCKET_ENV, "sock")
+    assert remote.attach_argv("s", control=True) == [
+        "tmux",
+        "-L",
+        "sock",
+        "-CC",
+        "attach",
+        "-d",
+        "-t",
+        "=s",
+    ]
+
+
 async def test_list_sessions_parses_rows_and_ignores_foreign(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     out = "\n".join(
         [
             _ROW,
-            "work\t/elsewhere\t1700000001\t",  # чужая tmux-сессия
-            "rc-geo\t/repos/geo\t1700000002\thttps://claude.ai/code/session_B",
+            "work\t/elsewhere\t1700000001\t\t\t\t$2",  # чужая tmux-сессия
+            "rc-geo\t/repos/geo\t1700000002\thttps://claude.ai/code/session_B\t\t\t$3",
         ]
     )
     monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, out)))
@@ -195,17 +221,24 @@ async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch: pytest.Monk
     stub.write_text(f'#!/bin/sh\necho "remote control active at"\necho "{url}"\nsleep 30\n')
     stub.chmod(0o755)
     monkeypatch.setattr(remote, "CLAUDE_BIN", str(stub))
-    repo = f"pytest-{uuid.uuid4().hex[:8]}"
+    label = f"pytest-{uuid.uuid4().hex[:8]}@wt/feature-x"
 
     before = _default_server_sessions()
     try:
-        session = await remote.launch(repo, str(tmp_path), timeout_s=20)
+        session = await remote.launch(label, str(tmp_path), timeout_s=20)
 
         assert session.url == url
         # Сессия переименована в id из ссылки — один идентификатор и для
         # приложения, и для `tmux attach`. Настоящий tmux принял его как имя.
         assert session.tmux_name == url.rsplit("/", 1)[-1]
-        assert session.name == tmp_path.name
+        # Ярлык пережил переименование: настоящий tmux принял @rc_label и отдал
+        # его обратно в формате list-sessions.
+        assert session.label == label
+        assert session.name == label
+        assert session.mode == remote.DEFAULT_PERMISSION_MODE
+        # Настоящий tmux отдал `#{session_id}` — вид `$N`. Это удостоверение
+        # экземпляра для Watcher, и оно переживает переименование выше.
+        assert re.fullmatch(r"\$\d+", session.tmux_id), session.tmux_id
         # tmux отдаёт разрешённый путь: на macOS /var — симлинк на /private/var
         assert Path(session.cwd).resolve() == tmp_path.resolve()
         assert session.tmux_name in {s.tmux_name for s in await remote.list_sessions()}
@@ -218,7 +251,7 @@ async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch: pytest.Monk
         assert await remote.kill_tmux(session.tmux_name) is True
         assert not await remote.list_sessions()
     finally:
-        await remote._run("kill-session", "-t", f"=rc-{repo}", check=False)
+        await remote._run("kill-session", "-t", f"={remote.session_name(label)}", check=False)
         await remote._run("kill-session", "-t", f"={url.rsplit('/', 1)[-1]}", check=False)
         # Гасим и сам изолированный сервер, иначе процесс tmux -L останется висеть.
         await remote._run("kill-server", check=False)
@@ -226,12 +259,59 @@ async def test_launch_against_real_tmux(tmp_path: Path, monkeypatch: pytest.Monk
     assert _default_server_sessions() == before
 
 
+@pytest.mark.skipif(not remote.tmux_available(), reason="нет tmux")
+async def test_send_and_restart_against_real_tmux(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from clauderc import actions
+
+    socket_name = f"claude-rc-pytest-{uuid.uuid4().hex[:8]}"
+    monkeypatch.setenv(remote.TMUX_SOCKET_ENV, socket_name)
+    url = "https://claude.ai/code/session_" + uuid.uuid4().hex[:16]
+    stub = tmp_path / "fake-claude"
+    # `cat` — чтобы набранный текст остался на экране: echo его печатает как ввод.
+    stub.write_text(f'#!/bin/sh\necho "remote control active at"\necho "{url}"\ncat\n')
+    stub.chmod(0o755)
+    monkeypatch.setattr(remote, "CLAUDE_BIN", str(stub))
+    label = f"pytest-{uuid.uuid4().hex[:8]}@mcp-fix"
+
+    async def kill(tmux_name: str, cwd: str) -> bool:
+        return await remote.kill_tmux(tmux_name)
+
+    try:
+        # Посторонняя сессия держит tmux-сервер живым на время перезапуска.
+        # Без неё гашение единственной сессии уносит сервер, следующий
+        # `new-session` поднимает новый, и нумерация `$N` начинается заново —
+        # у перезапущенной сессии оказывается тот же `$0`. Это не выдумка теста,
+        # а обычный расклад на машине, где tmux используют только под RC; на
+        # него `Watcher` отвечает не ключом, а вычёркиванием из снимка
+        # (`Watcher._forget`), и проверяется он отдельным тестом в test_watch.
+        await remote._run("new-session", "-d", "-s", "keepalive", "sleep 60", check=False)
+        session = await remote.launch(label, str(tmp_path), timeout_s=20)
+        await actions.send(session, "hello pane")
+        await asyncio.sleep(0.5)
+        assert "hello pane" in await actions.tail(session, lines=10)
+
+        fresh = await actions.restart(session, kill=kill, timeout_s=20)
+        assert fresh.label == label
+        assert fresh.mode == remote.DEFAULT_PERMISSION_MODE
+        assert fresh.cwd == session.cwd
+        # Ради чего всё и затевалось: `created_at` идёт целыми секундами и
+        # перезапуск различает как повезёт (сравнивать его здесь значило бы
+        # гонять тест на секундомере — это делают тесты Watcher на готовых
+        # снимках), а `#{session_id}` различает всегда, пока жив сервер.
+        assert fresh.tmux_id != session.tmux_id
+        assert re.fullmatch(r"\$\d+", fresh.tmux_id), fresh.tmux_id
+    finally:
+        await remote._run("kill-server", check=False)
+
+
 async def test_find_matches_by_directory_not_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """Два клона с одинаковым basename — сессия ищется по каталогу."""
     rows = "\n".join(
         [
-            "rc-claude-rules\t/a/claude-rules\t1700000000\thttps://claude.ai/code/session_A",
-            "rc-claude-rules-9f1c2d\t/b/claude-rules\t1700000001\thttps://claude.ai/code/session_B",
+            "rc-claude-rules\t/a/claude-rules\t1700000000\thttps://claude.ai/code/session_A\t\t\t$4",
+            "rc-claude-rules-9f1c2d\t/b/claude-rules\t1700000001\thttps://claude.ai/code/session_B\t\t\t$5",
         ]
     )
     monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, rows)))
@@ -307,7 +387,7 @@ async def test_await_url_ignores_trust_prompt_after_confirmation(
     assert session.url.endswith("session_A")
 
 
-_FRESH = "rc-repo\t/repos/repo\t1700000000\thttps://claude.ai/code/session_A"
+_FRESH = "rc-repo\t/repos/repo\t1700000000\thttps://claude.ai/code/session_A\t\t\t$6"
 
 
 def _capture_new_session(commands: list[str]) -> Handler:
@@ -451,7 +531,7 @@ async def test_await_url_renames_the_session_to_the_claude_id(
             renamed.append(args)
             return 0, ""
         if args[0] == "list-sessions":
-            return 0, "session_01ABCdef\t/repos/oms\t1000\t" + url
+            return 0, "session_01ABCdef\t/repos/oms\t1000\t" + url + "\t\t\t$7"
         return 0, ""
 
     monkeypatch.setattr(remote, "_run", _stub(handler))
@@ -474,7 +554,7 @@ async def test_await_url_survives_a_failed_rename(monkeypatch: pytest.MonkeyPatc
         if args[0] == "rename-session":
             return 1, "duplicate session"
         if args[0] == "list-sessions":
-            return 0, f"rc-oms\t/repos/oms\t1000\t{url}"
+            return 0, f"rc-oms\t/repos/oms\t1000\t{url}\t\t\t$8"
         return 0, ""
 
     monkeypatch.setattr(remote, "_run", _stub(handler))
@@ -488,9 +568,9 @@ async def test_await_url_survives_a_failed_rename(monkeypatch: pytest.MonkeyPatc
 async def test_list_sessions_keeps_renamed_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
     """После переименования префикса нет — узнаём своих по `@rc_url`."""
     rows = (
-        "session_01ABCdef\t/repos/oms\t1000\thttps://claude.ai/code/session_01ABCdef\n"
-        "rc-fresh\t/repos/fresh\t1001\t\n"  # ещё не дождалась ссылки
-        "work\t/repos/work\t1002\t\n"  # чужая
+        "session_01ABCdef\t/repos/oms\t1000\thttps://claude.ai/code/session_01ABCdef\t\t\t$9\n"
+        "rc-fresh\t/repos/fresh\t1001\t\t\t\t$10\n"  # ещё не дождалась ссылки
+        "work\t/repos/work\t1002\t\t\t\t$11\n"  # чужая
     )
     monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, rows)))
 
@@ -499,8 +579,8 @@ async def test_list_sessions_keeps_renamed_sessions(monkeypatch: pytest.MonkeyPa
 
 async def test_resolve_matches_id_name_and_directory(monkeypatch: pytest.MonkeyPatch) -> None:
     rows = (
-        "session_01A\t/repos/oms\t1000\thttps://claude.ai/code/session_01A\n"
-        "session_01B\t/forks/oms\t1001\thttps://claude.ai/code/session_01B\n"
+        "session_01A\t/repos/oms\t1000\thttps://claude.ai/code/session_01A\t\t\t$12\n"
+        "session_01B\t/forks/oms\t1001\thttps://claude.ai/code/session_01B\t\t\t$13\n"
     )
     monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, rows)))
 
@@ -532,7 +612,7 @@ async def test_await_url_keeps_the_name_when_the_url_was_not_stored(
             renamed.append(args)
             return 0, ""
         if args[0] == "list-sessions":
-            return 0, f"rc-oms\t/repos/oms\t1000\t{url}"
+            return 0, f"rc-oms\t/repos/oms\t1000\t{url}\t\t\t$14"
         return 0, ""
 
     monkeypatch.setattr(remote, "_run", _stub(handler))
@@ -546,7 +626,7 @@ async def test_await_url_keeps_the_name_when_the_url_was_not_stored(
 async def test_resolve_expands_a_tilde_in_the_target(monkeypatch: pytest.MonkeyPatch) -> None:
     """`/rckill ~/code/oms` — realpath тильду не разворачивает, resolve обязан."""
     home = Path.home()
-    rows = f"session_01A\t{home}/code/oms\t1000\thttps://claude.ai/code/session_01A\n"
+    rows = f"session_01A\t{home}/code/oms\t1000\thttps://claude.ai/code/session_01A\t\t\t$15\n"
     monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, rows)))
 
     assert [s.tmux_name for s in await remote.resolve("~/code/oms")] == ["session_01A"]
@@ -613,23 +693,25 @@ async def test_launch_passes_the_permission_mode(monkeypatch: pytest.MonkeyPatch
     assert "--permission-mode acceptEdits" in created[0][-1]
 
 
-async def test_launch_without_a_permission_mode_adds_no_flag(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_launch_defaults_to_auto_and_stores_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Без флага режим теперь auto, и он же уходит в @rc_mode.
     created: list[tuple[str, ...]] = []
+    options: list[tuple[str, ...]] = []
 
-    def handler(*args: str) -> tuple[int, str]:
-        if args[0] == "new-session":
-            created.append(args)
+    def handler(*a: str) -> tuple[int, str]:
+        if a[0] == "new-session":
+            created.append(a)
+        if a[0] == "set-option":
+            options.append(a)
+        if a[0] == "list-sessions":
+            return 0, ""
         return 0, ""
 
     monkeypatch.setattr(remote, "_run", _stub(handler))
-    monkeypatch.setattr(remote, "_POLL_S", 0.0)
-
     with pytest.raises(LaunchError):
         await remote.launch("oms", "/repos/oms", timeout_s=0.05)
-
-    assert "--permission-mode" not in created[0][-1]
+    assert "--permission-mode auto" in created[0][-1]
+    assert ("set-option", "-t", "=rc-oms:", "@rc_mode", "auto") in options
 
 
 async def test_permission_mode_is_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -649,3 +731,137 @@ async def test_permission_mode_is_quoted(monkeypatch: pytest.MonkeyPatch) -> Non
         await remote.launch("oms", "/repos/oms", timeout_s=0.05, permission_mode="a b")
 
     assert "--permission-mode 'a b'" in created[0][-1]
+
+
+_LABEL = "oms@wt/feature-x"
+
+
+async def test_launch_names_the_session_for_every_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Один ярлык разом в имя Remote Control (приложение) и в display name
+    # (-n: prompt box, /resume-пикер, заголовок терминала). Без -n приложение
+    # показывает своё авто-название, и сессия зовётся по-разному в трёх местах.
+    commands: list[str] = []
+    _fast(monkeypatch, commands)
+
+    await remote.launch(_LABEL, "/repos/repo", timeout_s=5)
+
+    assert f"--remote-control {_LABEL}" in commands[0]
+    assert f"-n {_LABEL}" in commands[0]
+
+
+async def test_launch_stores_label_in_tmux_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Ярлык кладётся сразу при создании сессии, а не после ссылки: сессия,
+    # умершая до неё, должна остаться опознаваемой.
+    options: list[tuple[str, ...]] = []
+
+    def handler(*args: str) -> tuple[int, str]:
+        if args[0] == "set-option":
+            options.append(tuple(args))
+        if args[0] == "capture-pane":
+            return 0, "https://claude.ai/code/session_A"
+        if args[0] == "list-sessions":
+            return (0, _FRESH) if options else (0, "")
+        return 0, ""
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    monkeypatch.setattr(remote, "tmux_available", lambda: True)
+    monkeypatch.setattr(remote, "_POLL_S", 0)
+
+    await remote.launch(_LABEL, "/repos/repo", timeout_s=5)
+
+    assert any(remote._LABEL_OPTION in args and _LABEL in args for args in options)
+
+
+async def test_list_sessions_reads_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = "session_A\t/repos/oms\t1700000000\thttps://claude.ai/code/session_A\toms@x\tplan\t$16"
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, row)))
+    (s,) = await remote.list_sessions()
+    assert s.mode == "plan"
+
+
+async def test_list_sessions_reads_label_and_shows_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = f"session_A\t/repos/wt/oms-wt-feature-x\t1700000000\thttps://x\t{_LABEL}\t\t$17"
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, row)))
+
+    (session,) = await remote.list_sessions()
+
+    assert session.label == _LABEL
+    # Ярлык и есть то, как сессия зовётся в карточке: слаг каталога
+    # (oms-wt-feature-x) человеку говорит меньше, чем репозиторий и ветка.
+    assert session.name == _LABEL
+
+
+async def test_list_sessions_without_label_keeps_directory_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Сессии, поднятые прежней версией, ярлыка не имеют — они не должны
+    # ни пропасть из списка, ни остаться безымянными.
+    row = "rc-oms\t/repos/oms\t1700000000\thttps://x\t\t\t$18"
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, row)))
+
+    (session,) = await remote.list_sessions()
+
+    assert session.label == ""
+    assert session.name == "oms"
+
+
+async def test_resolve_matches_the_whole_label(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = "\n".join(
+        [
+            "session_01A\t/repos/oms\t1000\thttps://x\toms@main\t\t$19",
+            "session_01B\t/wt/oms-wt-x\t1001\thttps://y\toms@wt/x\t\t$20",
+        ]
+    )
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, rows)))
+
+    assert [s.tmux_name for s in await remote.resolve("oms@wt/x")] == ["session_01B"]
+
+
+async def test_resolve_by_repo_alone_lists_every_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `/rckill oms`, когда у репозитория три ветки, — не то, что можно решить
+    # за человека: resolve отвечает списком, как и на совпадение по каталогу.
+    rows = "\n".join(
+        [
+            "session_01A\t/repos/oms\t1000\thttps://x\toms@main\t\t$21",
+            "session_01B\t/wt/oms-wt-x\t1001\thttps://y\toms@wt/x\t\t$22",
+        ]
+    )
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, rows)))
+
+    assert [s.tmux_name for s in await remote.resolve("oms")] == ["session_01A", "session_01B"]
+
+
+async def test_find_enclosing_matches_a_subdirectory_of_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Агент внутри сессии почти никогда не стоит в корне worktree.
+    row = "session_01A\t/repos/oms\t1000\thttps://x\toms@main\t\t$23"
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, row)))
+
+    session = await remote.find_enclosing("/repos/oms/internal/http")
+
+    assert session is not None and session.label == "oms@main"
+
+
+async def test_find_enclosing_stops_at_the_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = "session_01A\t/repos/oms\t1000\thttps://x\toms@main\t\t$24"
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, row)))
+
+    assert await remote.find_enclosing("/elsewhere/deep") is None
+
+
+async def test_list_sessions_warns_about_an_unparsable_row(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Таб в ярлыке добавляет лишнее поле: строка не разбирается, сессия
+    # выпадает из списка — молчать об этом нельзя, иначе искать нечего.
+    row = "session_A\t/repos/oms\t1700000000\thttps://x\toms@a\tb\t\t$1"
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, row)))
+
+    with caplog.at_level(logging.WARNING, logger="clauderc.remote"):
+        assert await remote.list_sessions() == []
+
+    assert "list-sessions" in caplog.text
+    assert "oms@a" in caplog.text

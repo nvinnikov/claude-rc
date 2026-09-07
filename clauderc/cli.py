@@ -22,7 +22,11 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from clauderc import actions as actions  # тесты подменяют cli.actions.rename
+from clauderc import forward as forward  # тесты подменяют cli.forward.start/stop
+from clauderc import passport as passport  # тесты подменяют cli.passport.worktrees.inspect
 from clauderc import paths as paths  # тесты подменяют cli.paths.config_file — см. выше
+from clauderc import proxy as proxy  # тесты подменяют cli.proxy.exec_remote
 from clauderc import setup as setup  # тесты подменяют cli.setup.verify_token/catch_user_id
 from clauderc import sync as clauderc_sync  # _Commands.sync затенил бы модуль sync
 from clauderc import update as update_mod  # _Commands.update затенил бы модуль update
@@ -33,10 +37,12 @@ from clauderc.remote import (
     LaunchError,
     RemoteSession,
     TrustRequired,
+    attach_argv,
     attach_command,
     await_url,
     confirm_trust,
     find,
+    find_enclosing,
     kill_all,
     kill_tmux,
     launch,
@@ -61,8 +67,33 @@ def run() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    try:
+        host, rest = proxy.strip_host(raw)
+    except proxy.HostError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_ENVIRONMENT
+    host = host or os.environ.get(proxy.HOST_ENV) or None
+    command = proxy.command_of(rest)
+    if host and command != "forward":
+        if command in proxy.LOCAL_ONLY:
+            print(
+                f"{command} при --host не выполняется: {_LOCAL_ONLY_WHY[command]}", file=sys.stderr
+            )
+            return EXIT_ENVIRONMENT
+        relative = proxy.relative_paths(rest)
+        if relative:
+            print(
+                f"При --host путь должен быть абсолютным или от ~: {', '.join(relative)}",
+                file=sys.stderr,
+            )
+            return EXIT_ENVIRONMENT
+        proxy.exec_remote(host, rest)
+        return 0  # execvp не возвращается; сюда попадает только тест с подменой
+
     parser = _parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(rest)
+    args.host = host  # forward читает отсюда (задача 16)
     if args.command is None:
         parser.print_usage(sys.stderr)
         return EXIT_ENVIRONMENT
@@ -71,8 +102,18 @@ def main(argv: list[str] | None = None) -> int:
     return int(handler(args))
 
 
+_LOCAL_ONLY_WHY = {
+    "bot": "бот умер бы вместе с ssh-сессией — запусти его на той машине",
+    "update": "обновление гасит приложение той машины и должно идти из её Терминала",
+    # "forward" сюда не доходит: `main` пропускает его мимо этой ветки выше по
+    # коду (`command != "forward"`) и сам кладёт args.host для _Commands.forward.
+    "forward": "туннель строится с этой стороны",
+}
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="claude-rc", description="RC-сессии Claude Code")
+    parser.add_argument("--host", help="выполнить команду на этой машине по ssh")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("bot", help="запустить Telegram-бота на переднем плане")
@@ -80,10 +121,29 @@ def _parser() -> argparse.ArgumentParser:
 
     sessions = sub.add_parser("sessions", help="живые RC-сессии")
     sessions.add_argument("--json", action="store_true", dest="as_json")
+    sessions.add_argument(
+        "--no-probe",
+        action="store_false",
+        dest="probe",
+        help="не опрашивать состояние панели и порты (без capture-pane и lsof)",
+    )
+
+    whoami = sub.add_parser("whoami", help="чья это сессия: ярлык, id, ссылка, подсадка")
+    whoami.add_argument("path", nargs="?", default=".", help="каталог (по умолчанию текущий)")
+    whoami.add_argument("--json", action="store_true", dest="as_json")
 
     start = sub.add_parser("start", help="поднять сессию")
     start.add_argument("path", nargs="?", default=".", help="каталог (по умолчанию текущий)")
     start.add_argument("--branch", help="создать worktree под ветку")
+    start.add_argument(
+        "--name", help="имя сессии: ярлык repo@name и ветка wt/<name> для --new-worktree"
+    )
+    start.add_argument(
+        "--new-worktree",
+        action="store_true",
+        dest="new_worktree",
+        help="отдельный worktree; ветка — из --name, иначе по времени",
+    )
     start.add_argument("--resume", help="продолжить диалог: last или id")
     start.add_argument("--pull", action="store_true", help="подтянуть origin перед запуском")
     start.add_argument(
@@ -96,6 +156,51 @@ def _parser() -> argparse.ArgumentParser:
     stop = sub.add_parser("stop", help="погасить сессию")
     stop.add_argument("target", nargs="?", help="имя сессии или каталог")
     stop.add_argument("--all", action="store_true", dest="every")
+
+    rename_cmd = sub.add_parser(
+        "rename", help="переименовать сессию: ярлык в tmux и /rename в приложении"
+    )
+    rename_cmd.add_argument("target", help="ярлык, каталог или session_…")
+    rename_cmd.add_argument("name")
+
+    restart_cmd = sub.add_parser("restart", help="погасить и поднять заново с --resume")
+    restart_cmd.add_argument("target")
+    restart_cmd.add_argument("--mode", choices=PERMISSION_MODES, help="сменить режим прав")
+
+    send_cmd = sub.add_parser("send", help="набрать текст в панель сессии")
+    send_cmd.add_argument("target")
+    send_cmd.add_argument(
+        "text",
+        help="текст; начинающийся с «-» передавай после `--`: send oms -- -x",
+    )
+    send_cmd.add_argument(
+        "--no-enter",
+        action="store_false",
+        dest="enter",
+        help="без Enter — для ответа одной клавишей",
+    )
+    send_cmd.add_argument(
+        "--tail",
+        type=int,
+        default=0,
+        metavar="N",
+        help="через 3 с напечатать N последних строк панели",
+    )
+    send_cmd.epilog = "Пример: claude-rc send oms -- -x"
+
+    connect = sub.add_parser("connect", help="подсесть к сессии терминалом (tmux attach)")
+    connect.add_argument(
+        "target", nargs="?", help="ярлык, каталог или session_…; пусто — единственная живая"
+    )
+    connect.add_argument(
+        "--read-only", action="store_true", dest="read_only", help="смотреть, не вводя"
+    )
+    connect.add_argument("--cc", action="store_true", help="tmux -CC для iTerm2")
+    connect.add_argument(
+        "--url", action="store_true", dest="url_only", help="напечатать ссылку и выйти"
+    )
+    connect.add_argument("--start", action="store_true", help="нет сессии — поднять и подсесть")
+    connect.add_argument("--branch", help="вместе с --start: worktree под ветку")
 
     doctor = sub.add_parser("doctor", help="проверить окружение")
     doctor.add_argument("--json", action="store_true", dest="as_json")
@@ -115,7 +220,38 @@ def _parser() -> argparse.ArgumentParser:
     sync_cmd.add_argument("--branch", help="переключить на ветку перед подтягиванием")
     sync_cmd.add_argument("--no-fetch", action="store_false", dest="fetch", help="не ходить в сеть")
 
+    forward_cmd = sub.add_parser("forward", help="ssh-туннель к портам сессии на --host")
+    forward_cmd.add_argument("target")
+    forward_cmd.add_argument(
+        "ports", nargs="*", type=int, help="порты; пусто — те, что сессия слушает"
+    )
+    forward_cmd.add_argument("--stop", action="store_true")
+
     return parser
+
+
+def _worktree_config_error() -> int | None:
+    """Config.toml для --branch/--new-worktree — до `_start`, а не во время него.
+
+    `_start` дальше зовёт `load_config` напрямую — без этой проверки отсутствие
+    или порча конфига долетает наружу трейсбеком вместо внятного сообщения (тот
+    же контракт, что и в `_diagnose`). Общая для `start` и `connect --start`: обе
+    команды поднимают worktree через `_start` и ловят одну и ту же ловушку.
+    """
+    config_path = paths.config_file()
+    if not config_path.is_file():
+        print(
+            f"--branch нужен config.toml, а его нет: {config_path}\n"
+            "Скопируй config.example.toml и заполни (см. README).",
+            file=sys.stderr,
+        )
+        return EXIT_ENVIRONMENT
+    try:
+        load_config(config_path)
+    except (ValueError, KeyError, OSError) as exc:
+        print(f"--branch нужен рабочий config.toml: {config_path}: {exc}", file=sys.stderr)
+        return EXIT_ENVIRONMENT
+    return None
 
 
 class _Commands:
@@ -136,14 +272,41 @@ class _Commands:
     @staticmethod
     def sessions(args: argparse.Namespace) -> int:
         found = asyncio.run(list_sessions())
+        host = _host_name()
+        passports = asyncio.run(passport.collect(found, host=host, probe=args.probe))
         if args.as_json:
-            print(json.dumps({"sessions": [_as_dict(s) for s in found]}, ensure_ascii=False))
+            print(
+                json.dumps(
+                    {"sessions": [passport.as_dict(p) for p in passports]}, ensure_ascii=False
+                )
+            )
             return 0
-        if not found:
+        if not passports:
             print("Живых сессий нет.")
             return 0
-        for session in found:
-            print(f"{session.name}\t{session.cwd}\t{int(session.uptime_s())}s\t{session.url}")
+        print("\n\n".join(passport.as_text(p) for p in passports))
+        return 0
+
+    @staticmethod
+    def whoami(args: argparse.Namespace) -> int:
+        """Кто эта сессия — для того, кто внутри неё.
+
+        Ищется по каталогу, а не по имени: имя меняется у сессии под ногами, а
+        каталог — единственный надёжный ключ. Подходит и подкаталог: агент почти
+        никогда не стоит в корне worktree.
+        """
+        target = Path(args.path).expanduser()
+        session = asyncio.run(find_enclosing(str(target)))
+        if session is None:
+            print(f"В {target} не видно RC-сессии.", file=sys.stderr)
+            return EXIT_FAILED
+        host = _host_name()
+        tree = asyncio.run(worktrees.inspect(Path(session.cwd)))
+        p = passport.build(session, host=host, tree=tree)
+        if args.as_json:
+            print(json.dumps({"session": passport.as_dict(p)}, ensure_ascii=False))
+            return 0
+        print(passport.as_text(p))
         return 0
 
     @staticmethod
@@ -157,23 +320,10 @@ class _Commands:
         if args.resume == "":
             print("--resume не может быть пустой строкой.", file=sys.stderr)
             return EXIT_ENVIRONMENT
-        if args.branch:
-            # _start дальше зовёт load_config напрямую — без этой проверки
-            # отсутствие или порча конфига долетает наружу трейсбеком вместо
-            # внятного сообщения (тот же контракт, что и в _diagnose).
-            config_path = paths.config_file()
-            if not config_path.is_file():
-                print(
-                    f"--branch нужен config.toml, а его нет: {config_path}\n"
-                    "Скопируй config.example.toml и заполни (см. README).",
-                    file=sys.stderr,
-                )
-                return EXIT_ENVIRONMENT
-            try:
-                load_config(config_path)
-            except (ValueError, KeyError, OSError) as exc:
-                print(f"--branch нужен рабочий config.toml: {config_path}: {exc}", file=sys.stderr)
-                return EXIT_ENVIRONMENT
+        if args.branch or args.new_worktree:
+            error = _worktree_config_error()
+            if error is not None:
+                return error
         try:
             session = asyncio.run(
                 _start(
@@ -182,6 +332,8 @@ class _Commands:
                     args.resume,
                     pull=args.pull,
                     permission_mode=args.permission_mode,
+                    name=args.name,
+                    new_worktree=args.new_worktree,
                 )
             )
         except (LaunchError, WorktreeError) as exc:
@@ -203,11 +355,8 @@ class _Commands:
             return EXIT_ENVIRONMENT
         try:
             killed = asyncio.run(_stop(args.target))
-        except _StopAmbiguous as exc:
-            print("Таких сессий несколько — назови id:", file=sys.stderr)
-            for session in exc.sessions:
-                print(f"  {session.tmux_name}\t{session.cwd}", file=sys.stderr)
-            return EXIT_FAILED
+        except _Ambiguous as exc:
+            return _print_ambiguous(exc)
         except _StopFailed as exc:
             print(f"Нашёл, но не погасил: {exc}", file=sys.stderr)
             return EXIT_FAILED
@@ -216,6 +365,135 @@ class _Commands:
             return EXIT_FAILED
         print(f"Погашена: {killed}")
         return 0
+
+    @staticmethod
+    def rename(args: argparse.Namespace) -> int:
+        try:
+            session = asyncio.run(_one(args.target))
+        except _Ambiguous as exc:
+            return _print_ambiguous(exc)
+        if session is None:
+            print(f"Сессия не найдена: {args.target}", file=sys.stderr)
+            return EXIT_FAILED
+        try:
+            result = asyncio.run(actions.rename(session, args.name))
+        except actions.ActionError as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_FAILED
+        print(result.label)
+        if not result.app_renamed:
+            print(
+                "Приложение Claude имя не подхватило: у этой версии claude нет /rename.",
+                file=sys.stderr,
+            )
+        return 0
+
+    @staticmethod
+    def restart(args: argparse.Namespace) -> int:
+        try:
+            session = asyncio.run(_one(args.target))
+        except _Ambiguous as exc:
+            return _print_ambiguous(exc)
+        if session is None:
+            print(f"Сессия не найдена: {args.target}", file=sys.stderr)
+            return EXIT_FAILED
+
+        async def kill(tmux_name: str, cwd: str) -> bool:
+            # Watcher живёт только в боте: там гашение мимо него доехало бы до
+            # человека карточкой «сессия упала». В CLI отчитываться не перед
+            # кем, и kill_tmux напрямую здесь — правильный путь, а не обход.
+            return await kill_tmux(tmux_name)
+
+        try:
+            fresh = asyncio.run(actions.restart(session, kill=kill, mode=args.mode))
+        except actions.ActionError as exc:
+            # ActionError идёт только из проверки kill — сессия ещё жива,
+            # к перезапуску не приступали.
+            print(str(exc), file=sys.stderr)
+            return EXIT_FAILED
+        except LaunchError as exc:
+            # LaunchError — уже из launch: прежней сессии к этому моменту нет,
+            # и молчать об этом нельзя (тот же расчёт, что у бота в on_bypass).
+            print(str(exc), file=sys.stderr)
+            print("Прежняя сессия погашена, заново не поднялась.", file=sys.stderr)
+            return EXIT_FAILED
+        except TrustRequired as need:
+            print(f"Каталог снова ждёт доверия: {attach_command(need.tmux_name)}", file=sys.stderr)
+            return EXIT_ENVIRONMENT
+        print(passport.as_text(asyncio.run(_one_passport(fresh))))
+        return 0
+
+    @staticmethod
+    def send(args: argparse.Namespace) -> int:
+        try:
+            session = asyncio.run(_one(args.target))
+        except _Ambiguous as exc:
+            return _print_ambiguous(exc)
+        if session is None:
+            print(f"Сессия не найдена: {args.target}", file=sys.stderr)
+            return EXIT_FAILED
+        try:
+            if args.tail > 0:
+                print(
+                    asyncio.run(
+                        actions.send_and_tail(session, args.text, enter=args.enter, lines=args.tail)
+                    )
+                )
+            else:
+                asyncio.run(actions.send(session, args.text, enter=args.enter))
+        except actions.ActionError as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_FAILED
+        return 0
+
+    @staticmethod
+    def connect(args: argparse.Namespace) -> int:
+        try:
+            session = asyncio.run(_pick(args.target))
+        except _Ambiguous as exc:
+            if not args.target:
+                # Пустая цель — «нечем работать без уточнения», а не «ошиблись
+                # с уточнением»: код возврата отличается от явно неоднозначного.
+                print(
+                    "Живых сессий несколько — назови ярлык, каталог или session_…:", file=sys.stderr
+                )
+                for candidate in exc.sessions:
+                    print(f"  {candidate.tmux_name}\t{candidate.cwd}", file=sys.stderr)
+                return EXIT_ENVIRONMENT
+            return _print_ambiguous(exc)
+        if session is None:
+            if not args.start:
+                print("Живой сессии нет. Добавь --start, чтобы поднять.", file=sys.stderr)
+                return EXIT_FAILED
+            target = Path(args.target or ".").expanduser()
+            if not target.is_dir():
+                print(f"Каталог не найден: {target}", file=sys.stderr)
+                return EXIT_ENVIRONMENT
+            if args.branch:
+                error = _worktree_config_error()
+                if error is not None:
+                    return error
+            try:
+                session = asyncio.run(_start(target.resolve(), args.branch, None))
+            except (LaunchError, WorktreeError) as exc:
+                print(str(exc), file=sys.stderr)
+                return EXIT_FAILED
+            except _TrustDeclined as exc:
+                print(str(exc), file=sys.stderr)
+                return exc.exit_code
+        if args.url_only:
+            print(session.url or "ссылка неизвестна")
+            return 0
+        if not sys.stdin.isatty():
+            print(
+                "connect нужен терминал: без tty tmux ответит «open terminal failed».\n"
+                "Через ssh — `ssh -t`, или напрямую: " + attach_command(session.tmux_name),
+                file=sys.stderr,
+            )
+            return EXIT_ENVIRONMENT
+        argv = attach_argv(session.tmux_name, read_only=args.read_only, control=args.cc)
+        os.execvp(argv[0], argv)
+        return 0  # только под подменённым execvp
 
     @staticmethod
     def doctor(args: argparse.Namespace) -> int:
@@ -358,6 +636,56 @@ class _Commands:
         failed = counts[clauderc_sync.Outcome.failed]
         return EXIT_FAILED if failed else 0
 
+    @staticmethod
+    def forward(args: argparse.Namespace) -> int:
+        host: str | None = getattr(args, "host", None)
+        if not host:
+            print(
+                "forward работает только с --host: на одной машине пробрасывать нечего.",
+                file=sys.stderr,
+            )
+            return EXIT_ENVIRONMENT
+        if args.stop:
+            try:
+                stopped = forward.stop(host, args.ports or None)
+            except forward.ForwardError as exc:
+                print(str(exc), file=sys.stderr)
+                return EXIT_FAILED
+            if not stopped:
+                print(f"Туннелей к {host} нет.")
+                return 0
+            for f in stopped:
+                print(f"снят {f.host}:{f.port} (pid {f.pid})")
+            return 0
+        ports: list[int] | None = list(args.ports)
+        if not ports:
+            ports = _remote_ports(host, args.target)
+            if ports is None:
+                return EXIT_FAILED
+            if not ports:
+                print("Сессия ничего не слушает — назови порт явно.", file=sys.stderr)
+                return EXIT_FAILED
+        try:
+            started = forward.start(host, ports)
+        except forward.ForwardError as exc:
+            # Часть туннелей могла подняться до отказа — они работают, и
+            # промолчать о них значит выдать частичный успех за чистый провал:
+            # следующая попытка споткнётся о них же как о занятых портах.
+            _print_forwards(exc.started)
+            print(str(exc), file=sys.stderr)
+            print(
+                f"снять: claude-rc --host {host} forward {args.target} --stop",
+                file=sys.stderr,
+            )
+            return EXIT_FAILED
+        _print_forwards(started)
+        return 0
+
+
+def _print_forwards(forwards: list[forward.Forward]) -> None:
+    for f in forwards:
+        print(f"http://localhost:{f.port} → {f.host}:{f.port} (pid {f.pid})")
+
 
 class _TrustDeclined(RuntimeError):
     """Каталог требует подтверждения доверия, а подтвердить некому или отказались."""
@@ -371,12 +699,42 @@ class _StopFailed(RuntimeError):
     """Сессия нашлась, но tmux не смог её погасить — не путать с «не найдена»."""
 
 
-class _StopAmbiguous(RuntimeError):
+class _Ambiguous(Exception):
     """Под цель подошло несколько сессий: выбирать за человека нельзя."""
 
     def __init__(self, sessions: list[RemoteSession]) -> None:
-        super().__init__("под цель подошло несколько сессий")
+        super().__init__("ambiguous target")
         self.sessions = sessions
+
+
+async def _one(target: str) -> RemoteSession | None:
+    """Одна сессия под цель — резолвер, общий для `rename`, `send`, `restart`, `connect`."""
+    matches = await resolve(target)
+    if len(matches) > 1:
+        raise _Ambiguous(matches)
+    return matches[0] if matches else None
+
+
+async def _pick(target: str | None) -> RemoteSession | None:
+    """Цель для connect: явная — через resolve; пустая — единственная живая."""
+    if target:
+        return await _one(target)
+    sessions = await list_sessions()
+    if len(sessions) > 1:
+        raise _Ambiguous(sessions)
+    return sessions[0] if sessions else None
+
+
+async def _one_passport(session: RemoteSession) -> passport.Passport:
+    (p,) = await passport.collect([session], host=_host_name(), probe=False)
+    return p
+
+
+def _print_ambiguous(exc: _Ambiguous) -> int:
+    print("Таких сессий несколько — назови id:", file=sys.stderr)
+    for session in exc.sessions:
+        print(f"  {session.tmux_name}\t{session.cwd}", file=sys.stderr)
+    return EXIT_FAILED
 
 
 _MARK = {
@@ -394,21 +752,57 @@ _OUTCOME_LABEL = {
 }
 
 
+def _host_name() -> str:
+    """`host` из конфига, если он есть и читается; иначе пусто — локальные формы."""
+    config_path = paths.config_file()
+    if not config_path.is_file():
+        return ""
+    try:
+        return load_config(config_path).host
+    except (ValueError, KeyError, OSError):
+        return ""
+
+
+def _remote_ports(host: str, target: str) -> list[int] | None:
+    """Порты, которые слушает сессия `target` на `host` — из её же паспорта.
+
+    Возвращает `None` при неудаче (ssh, битый JSON, цель не нашлась/неоднозначна) —
+    сообщение об ошибке уже напечатано, `forward` дальше просто выходит с кодом.
+    """
+    code, out = proxy.run_remote(host, ["sessions", "--json"])
+    if code != 0:
+        print(f"ssh {host}: {out.strip()}", file=sys.stderr)
+        return None
+    try:
+        sessions = json.loads(out)["sessions"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        print(f"ssh {host}: непонятный ответ: {out.strip()}", file=sys.stderr)
+        return None
+    wanted = target.strip()
+    # Правило совпадения — то же, что у `remote.resolve` на той стороне: голое
+    # имя репозитория (`oms` при ярлыке `oms@wt/x`) человек набирает по
+    # привычке, и `forward` не должен отвечать «не найдена» там, где `send` и
+    # `stop` находят. Неоднозначность решается ниже — списком, а не выбором
+    # за человека.
+    hits = [
+        s
+        for s in sessions
+        if wanted in {s.get("label"), s.get("tmux_name"), s.get("cwd"), s.get("name")}
+        or str(s.get("label", "")).split("@", 1)[0] == wanted
+    ]
+    if len(hits) != 1:
+        print("Сессия не найдена или их несколько:", file=sys.stderr)
+        for s in sessions:
+            print(f"  {s.get('label')}\t{s.get('tmux_name')}\t{s.get('cwd')}", file=sys.stderr)
+        return None
+    return [int(p) for p in hits[0].get("listening", [])]
+
+
 def _current_version() -> str:
     try:
         return package_version("claude-rc")
     except PackageNotFoundError:
         return "unknown (пакет не установлен)"
-
-
-def _as_dict(session: RemoteSession) -> dict[str, Any]:
-    return {
-        "name": session.name,
-        "tmux_name": session.tmux_name,
-        "cwd": session.cwd,
-        "url": session.url,
-        "uptime_s": int(session.uptime_s()),
-    }
 
 
 async def _start(
@@ -418,6 +812,8 @@ async def _start(
     *,
     pull: bool = False,
     permission_mode: str | None = None,
+    name: str | None = None,
+    new_worktree: bool = False,
 ) -> RemoteSession:
     if pull:
         # До worktree, а не после: `git worktree add` ветвится от текущего HEAD,
@@ -430,12 +826,16 @@ async def _start(
             result = await clauderc_sync.sync_one(target)
             print(f"{_MARK[result.outcome]} {target.name}\t{result.branch}\t{result.detail}")
 
+    if new_worktree and not branch:
+        branch = worktrees.branch_for(name) if name else worktrees.generate_branch()
+
     cwd = target
     if branch:
         config = load_config(paths.config_file())
         cwd = await worktrees.ensure(target, branch, config.worktree_root)
     try:
-        return await launch(cwd.name, str(cwd), resume=resume, permission_mode=permission_mode)
+        label = await worktrees.label(cwd, name=name)
+        return await launch(label, str(cwd), resume=resume, permission_mode=permission_mode)
     except TrustRequired as need:
         return await _ask_trust(need)
 
@@ -655,6 +1055,7 @@ _EXTRA_KEYS = (
     "launch_timeout_s",
     "permission_mode",
     "pull_before_start",
+    "host",
 )
 
 
@@ -866,7 +1267,7 @@ async def _stop(target: str) -> str | None:
     if not matches:
         return None
     if len(matches) > 1:
-        raise _StopAmbiguous(matches)
+        raise _Ambiguous(matches)
     session = matches[0]
     if not await kill_tmux(session.tmux_name):
         raise _StopFailed(session.name)

@@ -1,10 +1,12 @@
 import asyncio
+import dataclasses
 import html
 import logging
 import os
 import time
 import uuid
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -21,7 +23,8 @@ from aiogram.types import (
     User,
 )
 
-from clauderc import browse, history, paths, worktrees
+from clauderc import actions, browse, history, passport, paths, worktrees
+from clauderc import state_probe as state_probe  # тесты подменяют bot.state_probe.probe
 from clauderc import sync as sync_mod
 from clauderc.browse import BrowseError
 from clauderc.config import Config, load_config
@@ -43,6 +46,10 @@ from clauderc.repos import discover, resolve
 from clauderc.state import State
 from clauderc.sync import Outcome, RepoStatus, SyncResult
 from clauderc.watch import Died, Watcher
+
+# MAX_SESSION_NAME_LEN — явный ре-экспорт: лимит живёт рядом с `clean_name`,
+# который его и применяет, но снаружи о нём спрашивают у бота.
+from clauderc.worktrees import MAX_SESSION_NAME_LEN as MAX_SESSION_NAME_LEN
 from clauderc.worktrees import Worktree, WorktreeError
 
 log = logging.getLogger("clauderc")
@@ -62,7 +69,9 @@ HELP = (
     "(<code>..</code>, <code>~</code>, относительный, абсолютный)\n\n"
     "<b>Запуск</b>\n"
     "<b>▶️ Start Claude RC</b> — сессия в текущем каталоге\n"
-    "<b>🌿 New worktree</b> — сессия в свежем worktree, ветка по времени; "
+    "<b>🔓 Start (bypass)</b> — то же самое, сразу с bypassPermissions\n"
+    "После — имя сессии: ответом на сообщение или <code>-</code>, чтобы обойтись веткой\n"
+    "<b>🌿 New worktree</b> — сессия в свежем worktree, ветка по времени или по имени; "
     "так работают параллельно с уже запущенной\n"
     "<code>/rc</code> &lt;репо&gt; [ветка] — то же по имени, без хождения\n\n"
     "<b>Синхронизация</b>\n"
@@ -70,9 +79,10 @@ HELP = (
     "каталоге: галочки, «Все»/«Никого», ветка перед подтягиванием, отчёт строкой "
     "на репозиторий\n\n"
     "<b>Что запущено</b>\n"
-    "<b>💬 Chats</b> (<code>/rc</code>) — живые сессии с кнопками "
-    "<b>Open in Claude</b> и <b>⏹ Stop</b>, а следом worktree, оставшиеся без сессии: "
-    "их можно поднять заново или удалить\n"
+    "<b>💬 Chats</b> (<code>/rc</code>) — живые сессии карточками: "
+    "<b>Open in Claude</b>, <b>⏹ Stop</b>, <b>🔓 Bypass</b> (переоткрыть с bypassPermissions), "
+    "<b>🔌 /mcp</b>, <b>📋 Tail</b> и <b>✏️ Rename</b>, а следом worktree, оставшиеся без "
+    "сессии: их можно поднять заново или удалить\n"
     "<code>/wt</code> — все worktree, включая занятые\n"
     "<code>/rckill</code> &lt;имя&gt; — погасить сессию (без имени — все)\n"
     "<code>/wtrm</code> &lt;имя&gt; [force] — удалить worktree\n\n"
@@ -111,11 +121,68 @@ def _live_message(query: CallbackQuery) -> Message | None:
     return query.message if isinstance(query.message, Message) else None
 
 
-def _open_keyboard(url: str) -> InlineKeyboardMarkup | None:
-    if not url:
-        return None
+BUSY_PANE_TEXT = (
+    "Панель не свободна: открыт вопрос, идёт работа или я не разобрал, что на ней. "
+    "Посмотри Tail, ответь в приложении и повтори."
+)
+
+
+async def _pane_is_busy(tmux_name: str) -> bool:
+    """Опасно ли сейчас печатать в панель. Пропускаем только заведомо свободную.
+
+    Кнопки, которые печатают в панель (`🔌 /mcp`, `✏️ Rename`), заканчиваются
+    отдельным Enter, а Enter подтверждает подсвеченный пункт открытого диалога —
+    и подсвеченным бывает «Yes, and don't ask again». Это та же грабля, что у
+    `confirm_trust`, только тут выбор делает не человек, а мы за него. Карточку
+    могли показать задолго до появления диалога, поэтому состояние спрашиваем
+    перед отправкой, а не берём из карточки. Tail только читает и не спрашивает.
+
+    Проверка закрыта по умолчанию: `state_probe` намеренно отдаёт `UNKNOWN`, а не
+    ложный `IDLE`, когда шаблон сломан обновлением claude, — и здесь `UNKNOWN`
+    обязан значить «не трогай». Иначе перерисованный диалог (каретка не `❯`,
+    вопрос не с `Do you want to`) не опознаётся, и Enter уходит именно туда, где
+    он подтверждает чужой выбор. `DEAD` пропускаем: об умершей сессии человеку
+    честнее услышать от `actions.send`, чем получить отказ про занятую панель.
+
+    Спрашиваем `classify_pane`, а не `probe`: порты к вопросу не относятся, а
+    их поиск обходит дерево процессов и задерживает отклик кнопки.
+    """
+    free = {state_probe.State.IDLE, state_probe.State.DEAD}
+    return await state_probe.classify_pane(tmux_name) not in free
+
+
+def _session_keyboard(token: str, url: str) -> InlineKeyboardMarkup:
+    """Пульт под карточкой сессии: одна карточка обслуживает все кнопки —
+    `token` не гасится нажатием (кроме Stop), поэтому Bypass/mcp/Tail/Rename
+    можно жать по очереди.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    if url:
+        rows.append([InlineKeyboardButton(text="Open in Claude", url=url)])
+    rows.append(
+        [
+            InlineKeyboardButton(text="⏹ Stop", callback_data=f"stop:{token}"),
+            InlineKeyboardButton(text="🔓 Bypass", callback_data=f"byp:{token}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(text="🔌 /mcp", callback_data=f"mcp:{token}"),
+            InlineKeyboardButton(text="📋 Tail", callback_data=f"tail:{token}"),
+            InlineKeyboardButton(text="✏️ Rename", callback_data=f"ren:{token}"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _trust_keyboard(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Open in Claude", url=url)]]
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Trust", callback_data=f"trust:{token}"),
+                InlineKeyboardButton(text="Cancel", callback_data=f"notrust:{token}"),
+            ]
+        ]
     )
 
 
@@ -129,12 +196,51 @@ def _resume_keyboard(items: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     )
 
 
-ResumeChoice = tuple[Path, str | None, str | None]
+@dataclass(frozen=True)
+class LaunchRequest:
+    """Параметры запуска сессии — то, что копится по шагам (ветка, потом имя)
+    до вызова `start_session`, вместо кортежа, который на четвёртом поле стал
+    бы нечитаемым.
+    """
+
+    target: Path
+    branch: str | None = None
+    resume: str | None = None
+    name: str | None = None
+    new_worktree: bool = False
+    mode: str | None = None
+
+
+def _name_prompt() -> tuple[str, ForceReply]:
+    return (
+        "Как назвать сессию? Пришли имя <b>ответом на это сообщение</b> "
+        "или <code>-</code>, чтобы обойтись веткой.",
+        ForceReply(force_reply=True, selective=True, input_field_placeholder="имя сессии или -"),
+    )
+
+
+def _apply_name(request: LaunchRequest, text: str) -> LaunchRequest:
+    """Пристраивает ответ на запрос имени к уже собранному `LaunchRequest`.
+
+    `-` или пустой ответ — без имени. Для нового worktree без явной ветки имя
+    превращается в ветку (`branch_for`), а без имени та же ветка получает
+    временную метку (`generate_branch`) — как до этого шага.
+
+    Чистка — общая с `worktrees.label` и `actions.rename`: ответ в Telegram
+    бывает и двухстрочным, а перевод строки в ярлыке ломает `list-sessions`.
+    """
+    name = worktrees.clean_name(text)
+    if name == "-":
+        name = ""
+    branch = request.branch
+    if request.new_worktree and not branch:
+        branch = worktrees.branch_for(name) if name else worktrees.generate_branch()
+    return dataclasses.replace(request, name=name or None, branch=branch)
 
 
 def _pop_resume_group(
-    pending: dict[str, tuple[str, ResumeChoice]], token: str
-) -> ResumeChoice | None:
+    pending: dict[str, tuple[str, LaunchRequest]], token: str
+) -> LaunchRequest | None:
     """Достаёт выбранный вариант и гасит остальные токены той же карточки.
 
     Варианты одной карточки независимы только с виду: выбор любого из них должен
@@ -157,13 +263,41 @@ def _died_text(died: Died) -> str:
     )
 
 
-def _uptime(seconds: float) -> str:
-    minutes = int(seconds // 60)
-    if minutes < 1:
-        return "только что"
-    if minutes < 60:
-        return f"{minutes} мин"
-    return f"{minutes // 60} ч {minutes % 60} мин"
+STALE_REPLY_TEXT = "Запрос устарел — нажми кнопку ещё раз."
+
+
+def _is_own_prompt(reply: Message, bot_id: int) -> bool:
+    """Ответ пришёл на сообщение самого бота — то есть на его ForceReply.
+
+    Заявки (`name_pending`, `rename_pending`, `branch_pending`) живут в памяти
+    процесса: ForceReply плюс `reply_to_message` — и есть наш способ связать
+    ответ с вопросом. После перезапуска бота заявок нет, а ForceReply в чате
+    остался, и молчание в ответ на честно написанное имя выглядит поломкой.
+    На своё сообщение без заявки отвечаем «устарел»; на чужое по-прежнему
+    молчим — оно не к нам.
+    """
+    return reply.from_user is not None and reply.from_user.id == bot_id
+
+
+def _error_card(prefix: str, exc: object) -> str:
+    """Заголовок и текст исключения в `<pre>`, отрезанные по-честному.
+
+    Отрез считает `pre_block` — по сырому тексту и по экранированной длине.
+    Срез уже собранной и экранированной строки уносит закрывающий тег или
+    половину «&lt;», и Telegram отвечает 400 на всё сообщение: человек не
+    получает ничего вместо укороченного.
+    """
+    return f"{prefix}\n{passport.pre_block(str(exc), 3500)}"
+
+
+def _bypass_failed_text(exc: str) -> str:
+    """Текст, когда Bypass успел погасить прежнюю сессию, но новая не поднялась.
+
+    Отдельно от «Сессия не погасла» (см. `on_bypass`): здесь прежней сессии уже
+    нет, и молчание об этом оставило бы человека с мёртвой карточкой без единой
+    подсказки, что делать дальше — отсюда и предложение Resume рядом с текстом.
+    """
+    return "⏹ Прежняя сессия погашена, но заново не поднялась.\n" + passport.pre_block(exc, 3500)
 
 
 def _label(path: Path, roots: tuple[Path, ...]) -> str:
@@ -176,18 +310,28 @@ def _label(path: Path, roots: tuple[Path, ...]) -> str:
     return str(path)
 
 
-def _link_line(session: RemoteSession) -> str:
-    return html.escape(session.url) if session.url else "ссылка неизвестна"
+def _session_card(p: passport.Passport) -> str:
+    """Единственный рендер карточки сессии в боте — тот же паспорт, что и у CLI."""
+    return passport.as_html(p)
 
 
-def _same_session(session: RemoteSession | None, created_at: int) -> RemoteSession | None:
+def _same_session(
+    session: RemoteSession | None, tmux_id: str, created_at: int
+) -> RemoteSession | None:
     """Та ли это сессия, что была на карточке, когда её показывали.
 
     Каталог — ключ сессии, но не её удостоверение: прежняя могла умереть, а в том
     же каталоге подняться новая. Устаревшая кнопка Stop тогда погасила бы чужую
-    работу. `session_created` переименование сохраняет, а перезапуск — нет.
+    работу. Сверяем пару: tmux-id (`$3`) и время создания. Порознь каждого мало.
+    `#{session_created}` — целые секунды, и перезапуск в ту же секунду выдал бы
+    себя за прежнюю сессию. `$N` уникален только на время жизни tmux-сервера, а
+    если гасимая была на нём единственной, сервер уходит вместе с ней и новый
+    раздаёт `$0` заново. Совпасть по обоим признакам разным сессиям нечему,
+    а переименование сохраняет оба.
     """
-    if session is None or session.created_at != created_at:
+    if session is None or not tmux_id:
+        return None
+    if session.tmux_id != tmux_id or session.created_at != created_at:
         return None
     return session
 
@@ -201,39 +345,6 @@ def _pull_line(result: SyncResult) -> str:
     if result.outcome is Outcome.skipped and result.branch == "?":
         return "⤵️ не git-репозиторий, тянуть нечего"
     return f"⤵️ {html.escape(result.branch)}: {html.escape(result.detail)}"
-
-
-def _attach_line(session: RemoteSession) -> str:
-    """Имя tmux-сессии — второй вход в неё, кроме ссылки.
-
-    Показывается всегда, а не только когда ссылку добыть не удалось: забрать имя
-    с телефона и надо, чтобы подсесть из терминала на другой машине. Дальше оно
-    подставляется в `tmux attach -d -t =<имя>` (см. README про алиас) — команду
-    целиком карточка не носит: `ssh` и хост у каждой машины свои, а меняется
-    здесь только имя. В Telegram <code> копируется одним тапом.
-    """
-    return f"🖥 <code>{html.escape(session.tmux_name)}</code>"
-
-
-def _fresh_text(session: RemoteSession) -> str:
-    return (
-        f"✅ Сессия <b>{html.escape(session.name)}</b> поднята\n"
-        f"<code>{html.escape(session.cwd)}</code>\n"
-        f"{_link_line(session)}\n"
-        f"{_attach_line(session)}"
-    )
-
-
-def _list_item(session: RemoteSession, tree: Worktree | None = None) -> str:
-    lines = [
-        f"▸ <b>{html.escape(session.name)}</b> · {_uptime(session.uptime_s())}",
-        f"<code>{html.escape(session.cwd)}</code>",
-    ]
-    if tree is not None:
-        lines.append(f"🌿 <code>{html.escape(tree.branch)}</code> · {_tree_state(tree)}")
-    lines.append(_link_line(session))
-    lines.append(_attach_line(session))
-    return "\n".join(lines)
 
 
 def _tree_state(tree: Worktree) -> str:
@@ -279,7 +390,10 @@ def _browse_card(cwd: Path) -> tuple[str, InlineKeyboardMarkup]:
     if pair:
         rows.append(pair)
 
-    launch_row = [InlineKeyboardButton(text="▶️ Start Claude RC", callback_data="nav:here")]
+    launch_row = [
+        InlineKeyboardButton(text="▶️ Start Claude RC", callback_data="nav:here"),
+        InlineKeyboardButton(text="🔓 Start (bypass)", callback_data="nav:bypass"),
+    ]
     # Вторая сессия в том же каталоге дралась бы за индекс и ветку — только через worktree.
     if browse.is_repo(cwd):
         launch_row.append(InlineKeyboardButton(text="🌿 New worktree", callback_data="nav:newwt"))
@@ -466,15 +580,16 @@ async def main() -> None:
     pending: dict[str, tuple[Path, str | None]] = {}
     # Сессии, которые ждут ответа на диалог доверия каталогу.
     trust_pending: dict[str, tuple[str, str]] = {}
-    # (каталог, время создания): каталог — ключ сессии, а время отличает ту самую
-    # сессию от новой, поднятой в том же каталоге после смерти прежней. Имя не годится:
+    # (каталог, tmux-id, время создания): каталог — ключ сессии, а пара
+    # `$N` + секунда отличает ту самую сессию от новой, поднятой в том же
+    # каталоге после смерти прежней (см. `_same_session`). Имя не годится:
     # `await_url` переименовывает сессию в её id, и запомненное имя перестаёт
-    # существовать. Переименование `session_created` сохраняет, перезапуск — нет.
-    stop_pending: dict[str, tuple[str, int]] = {}
+    # существовать; переименование же обоих признаков не меняет.
+    card_pending: dict[str, tuple[str, str, int]] = {}
     tree_pending: dict[str, Path] = {}
     # Значение — (id карточки, выбор): выбор любого варианта гасит остальные
     # токены той же карточки, чтобы два тапа не подняли две сессии в одном каталоге.
-    resume_pending: dict[str, tuple[str, ResumeChoice]] = {}
+    resume_pending: dict[str, tuple[str, LaunchRequest]] = {}
     # Выбор живёт в памяти и привязан к сообщению: восстанавливать наполовину
     # сделанный выбор после перезапуска опаснее, чем начать заново. Хранится
     # путями, а не индексами: индекс — позиция в листинге на момент отрисовки,
@@ -498,10 +613,33 @@ async def main() -> None:
     # карточки Sync. Ответ Telegram привязывает к запросу через reply_to_message,
     # так что случайное текстовое сообщение не подставится вместо имени ветки.
     branch_pending: dict[int, int] = {}
+    # Ключ — id сообщения с запросом имени сессии (ForceReply), значение — что
+    # поднимать. Как у ветки для Sync: ответ привязан через reply_to_message,
+    # и чужой текст в имя не попадёт.
+    name_pending: dict[int, LaunchRequest] = {}
+    # Ключ — id сообщения с запросом нового имени (ForceReply), значение — та же
+    # тройка, что и у card_pending: имя сессии меняется у неё под ногами,
+    # поэтому саму сессию добываем заново через _same_session.
+    rename_pending: dict[int, tuple[str, str, int]] = {}
 
-    async def start_session(
-        message: Message, target: Path, branch: str | None, resume: str | None = None
-    ) -> None:
+    async def offer_trust(message: Message, need: TrustRequired) -> None:
+        token = uuid.uuid4().hex[:8]
+        trust_pending[token] = (need.tmux_name, need.cwd)
+        await message.answer(
+            "🔐 Claude впервые видит этот каталог и ждёт подтверждения.\n"
+            f"<code>{html.escape(need.cwd)}</code>\n\n"
+            "Он получит право читать, менять и запускать здесь файлы.",
+            parse_mode="HTML",
+            reply_markup=_trust_keyboard(token),
+        )
+
+    async def ask_name(message: Message, request: LaunchRequest) -> None:
+        text, markup = _name_prompt()
+        prompt = await message.answer(text, parse_mode="HTML", reply_markup=markup)
+        name_pending[prompt.message_id] = request
+
+    async def start_session(message: Message, request: LaunchRequest) -> None:
+        target, branch, resume = request.target, request.branch, request.resume
         head = f"⏳ Поднимаю сессию в <code>{html.escape(str(target))}</code>"
         if branch:
             head += f"\nветка <code>{html.escape(branch)}</code>"
@@ -513,10 +651,19 @@ async def main() -> None:
         # отменяет (worktree будет свой), но тянуть репозиторий под ней нельзя.
         alive_here = await find(str(target))
         if alive_here is not None and branch is None:
+            # Полный пульт, а не одна ссылка: сессия та же самая, и Bypass,
+            # Tail и Rename нужны здесь ровно так же, как на карточке запуска.
+            token = uuid.uuid4().hex[:8]
+            card_pending[token] = (
+                os.path.realpath(alive_here.cwd),
+                alive_here.tmux_id,
+                alive_here.created_at,
+            )
             await notice.edit_text(
-                f"Уже поднята.\n{_list_item(alive_here)}",
+                f"Уже поднята.\n"
+                f"{_session_card(passport.build(alive_here, host=config.host, tree=None))}",
                 parse_mode="HTML",
-                reply_markup=_open_keyboard(alive_here.url),
+                reply_markup=_session_keyboard(token, alive_here.url),
             )
             return
 
@@ -544,27 +691,35 @@ async def main() -> None:
                 cwd = await worktrees.ensure(target, branch, config.worktree_root)
             except WorktreeError as exc:
                 await notice.edit_text(
-                    told(f"❌ Worktree не создан.\n<pre>{html.escape(str(exc))}</pre>")[:3800],
-                    parse_mode="HTML",
+                    told(_error_card("❌ Worktree не создан.", exc)), parse_mode="HTML"
                 )
                 return
 
         alive = await find(str(cwd))
         if alive is not None:
+            token = uuid.uuid4().hex[:8]
+            card_pending[token] = (
+                os.path.realpath(alive.cwd),
+                alive.tmux_id,
+                alive.created_at,
+            )
             await notice.edit_text(
-                told(f"Уже поднята.\n{_list_item(alive)}"),
+                told(
+                    f"Уже поднята.\n"
+                    f"{_session_card(passport.build(alive, host=config.host, tree=None))}"
+                ),
                 parse_mode="HTML",
-                reply_markup=_open_keyboard(alive.url),
+                reply_markup=_session_keyboard(token, alive.url),
             )
             return
 
         try:
             session = await launch(
-                cwd.name,
+                await worktrees.label(cwd, name=request.name),
                 str(cwd),
                 timeout_s=config.launch_timeout_s,
                 resume=resume,
-                permission_mode=config.permission_mode,
+                permission_mode=request.mode or config.permission_mode,
             )
         except TrustRequired as need:
             token = uuid.uuid4().hex[:8]
@@ -576,14 +731,7 @@ async def main() -> None:
                     "Он получит право читать, менять и запускать здесь файлы."
                 ),
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(text="Trust", callback_data=f"trust:{token}"),
-                            InlineKeyboardButton(text="Cancel", callback_data=f"notrust:{token}"),
-                        ]
-                    ]
-                ),
+                reply_markup=_trust_keyboard(token),
             )
             return
         except LaunchError as exc:
@@ -593,42 +741,53 @@ async def main() -> None:
                 # или исчезла между capture и list) — без метки watcher
                 # опросил бы её как упавшую следом за этим же сообщением.
                 watcher.expect_death(exc.tmux_name, str(cwd))
-            await notice.edit_text(
-                told(f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>")[:3800],
-                parse_mode="HTML",
-            )
+            await notice.edit_text(told(_error_card("❌ Не поднялось.", exc)), parse_mode="HTML")
             return
 
+        token = uuid.uuid4().hex[:8]
+        card_pending[token] = (
+            os.path.realpath(session.cwd),
+            session.tmux_id,
+            session.created_at,
+        )
         await notice.edit_text(
-            told(_fresh_text(session)),
+            told(
+                f"✅ Сессия поднята\n"
+                f"{_session_card(passport.build(session, host=config.host, tree=None))}"
+            ),
             parse_mode="HTML",
-            reply_markup=_open_keyboard(session.url),
+            reply_markup=_session_keyboard(token, session.url),
         )
 
-    async def offer_start(message: Message, target: Path, branch: str | None) -> None:
+    async def offer_start(
+        message: Message, target: Path, branch: str | None, *, mode: str | None = None
+    ) -> None:
         """Запуск с выбором диалога, если в каталоге уже есть история.
 
         Для новой ветки истории быть не может — там свежий worktree, и лишний
         шаг только мешал бы.
         """
         if branch is not None:
-            await start_session(message, target, branch)
+            await ask_name(message, LaunchRequest(target, branch=branch, mode=mode))
             return
 
         found = history.conversations(str(target))
         if not found:
-            await start_session(message, target, None)
+            await ask_name(message, LaunchRequest(target, mode=mode))
             return
 
         group = uuid.uuid4().hex[:8]
         items: list[tuple[str, str]] = []
         for label, resume in [("New session", None), ("Continue last", "last")]:
             token = uuid.uuid4().hex[:8]
-            resume_pending[token] = (group, (target, None, resume))
+            resume_pending[token] = (group, LaunchRequest(target, resume=resume, mode=mode))
             items.append((token, label))
         for conversation in found:
             token = uuid.uuid4().hex[:8]
-            resume_pending[token] = (group, (target, None, conversation.session_id))
+            resume_pending[token] = (
+                group,
+                LaunchRequest(target, resume=conversation.session_id, mode=mode),
+            )
             items.append((token, conversation.preview))
 
         await message.answer(
@@ -661,10 +820,11 @@ async def main() -> None:
             os.path.realpath(t.path): t for t in await worktrees.list_all(config.worktree_root)
         }
         occupied: set[str] = set()
+        passports = await passport.collect(sessions, host=config.host)
 
         # По сообщению на сессию: гасить надо конкретную, и кнопка должна быть рядом
         # со своей ссылкой, а не в общей простыне.
-        for session in sessions:
+        for session, p in zip(sessions, passports, strict=True):
             real = os.path.realpath(session.cwd)
             occupied.add(real)
             token = uuid.uuid4().hex[:8]
@@ -672,15 +832,15 @@ async def main() -> None:
             # за лимит выходит легко. Но держим именно путь, а не имя: имя сессии
             # меняется у неё под ногами — `await_url` переименовывает её в id, как
             # только появится ссылка, и запомненное имя перестало бы существовать.
-            stop_pending[token] = (real, session.created_at)
-            rows = []
-            if session.url:
-                rows.append([InlineKeyboardButton(text="Open in Claude", url=session.url)])
-            rows.append([InlineKeyboardButton(text="⏹ Stop", callback_data=f"stop:{token}")])
+            card_pending[token] = (real, session.tmux_id, session.created_at)
+            # Без внешнего отреза: карточка ограничена по построению — строки
+            # паспорта плюс хвост панели, который `pre_block` держит в 1500
+            # экранированных символов. А срез готовой строки уносил бы
+            # закрывающий тег и Telegram отвечал бы 400 на весь листинг.
             await message.answer(
-                _list_item(session, trees.get(real)),
+                _session_card(p),
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                reply_markup=_session_keyboard(token, session.url),
             )
 
         orphans = [tree for real, tree in trees.items() if real not in occupied]
@@ -1000,7 +1160,7 @@ async def main() -> None:
                 f"Таких сессий несколько — назови id:\n{listing}", parse_mode="HTML"
             )
             return
-        if await watcher.kill(matches[0].tmux_name, matches[0].cwd):
+        if await watcher.kill(matches[0].tmux_name, matches[0].cwd, matches[0].tmux_id):
             # Называем найденное, а не набранное: на `/rckill ~/code/oms` ответ
             # «Сессия ~/code/oms погашена» — про путь, а не про сессию.
             # Worktree намеренно остаётся: в нём может лежать несохранённая работа.
@@ -1055,14 +1215,12 @@ async def main() -> None:
         # Сессия держит этот каталог: не погасив её, оставим Claude в исчезнувшем cwd.
         session = await find(str(path))
         if session is not None:
-            await watcher.kill(session.tmux_name, session.cwd)
+            await watcher.kill(session.tmux_name, session.cwd, session.tmux_id)
 
         try:
             await worktrees.remove(config.worktree_root, name, force=force)
         except WorktreeError as exc:
-            await message.reply(
-                f"❌ Не удалился.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
-            )
+            await message.reply(_error_card("❌ Не удалился.", exc), parse_mode="HTML")
             return
 
         note = " Сессия погашена." if session is not None else ""
@@ -1082,6 +1240,8 @@ async def main() -> None:
             return
         await message.edit_reply_markup(reply_markup=None)
         # Ветка уже выкачена в этом каталоге — второй worktree заводить не нужно.
+        # offer_start сам решит: есть история — предложит Continue/диалоги,
+        # нет — сразу спросит имя (ask_name внутри «пустой истории» ветки).
         await offer_start(message, path, None)
 
     @dp.callback_query(F.data.startswith(("wtrm:", "wtrmf:")))
@@ -1127,13 +1287,11 @@ async def main() -> None:
         # Сессия могла подняться уже после показа карточки.
         session = await find(str(path))
         if session is not None:
-            await watcher.kill(session.tmux_name, session.cwd)
+            await watcher.kill(session.tmux_name, session.cwd, session.tmux_id)
         try:
             await worktrees.remove(config.worktree_root, path.name, force=forced)
         except WorktreeError as exc:
-            await message.edit_text(
-                f"❌ Не удалился.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
-            )
+            await message.edit_text(_error_card("❌ Не удалился.", exc), parse_mode="HTML")
             return
 
         note = " Сессия погашена." if session is not None else ""
@@ -1141,11 +1299,30 @@ async def main() -> None:
             f"🗑 Worktree <b>{html.escape(path.name)}</b> удалён.{note}", parse_mode="HTML"
         )
 
+    async def card_session(
+        query: CallbackQuery, prefix: str
+    ) -> tuple[RemoteSession | None, Message | None]:
+        """Сессия за кнопкой карточки, добытая заново по каталогу и времени создания.
+
+        `card_pending` не `pop`-ается здесь: одна карточка обслуживает несколько
+        нажатий (Bypass, /mcp, Tail, Rename) — только Stop гасит свой токен.
+        """
+        pending = card_pending.get((query.data or "").removeprefix(prefix))
+        message = _live_message(query)
+        if pending is None:
+            await query.answer("Карточка устарела")
+            return None, message
+        cwd, tmux_id, created_at = pending
+        session = _same_session(await find(cwd), tmux_id, created_at)
+        if session is None:
+            await query.answer("Сессия уже не жива")
+        return session, message
+
     @dp.callback_query(F.data.startswith("stop:"))
     async def on_stop(query: CallbackQuery) -> None:
         if not _is_authorized(query.from_user, config.allowed_user_id):
             return
-        pending = stop_pending.pop((query.data or "").removeprefix("stop:"), None)
+        pending = card_pending.pop((query.data or "").removeprefix("stop:"), None)
         message = _live_message(query)
         if pending is None:
             await query.answer("Список устарел")
@@ -1153,10 +1330,12 @@ async def main() -> None:
                 await message.edit_reply_markup(reply_markup=None)
             return
 
-        cwd, created_at = pending
+        cwd, tmux_id, created_at = pending
         # Имя берём заново: с момента показа карточки сессию могли переименовать.
-        session = _same_session(await find(cwd), created_at)
-        killed = session is not None and await watcher.kill(session.tmux_name, session.cwd)
+        session = _same_session(await find(cwd), tmux_id, created_at)
+        killed = session is not None and await watcher.kill(
+            session.tmux_name, session.cwd, session.tmux_id
+        )
         await query.answer("Погашена" if killed else "Уже не жива")
         if message is None:
             return
@@ -1167,6 +1346,118 @@ async def main() -> None:
             if killed
             else f"Сессия <b>{html.escape(name)}</b> уже не жива.",
             parse_mode="HTML",
+        )
+
+    @dp.callback_query(F.data.startswith("byp:"))
+    async def on_bypass(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        session, message = await card_session(query, "byp:")
+        if session is None or message is None:
+            return
+        await query.answer("Переоткрываю…")
+
+        async def kill_this(tmux_name: str, cwd: str) -> bool:
+            """Гасит именно тот экземпляр, что держит хендлер.
+
+            tmux-id подставляем замыканием, а не расширяем `Killer`:
+            `actions.restart` про Watcher ничего не знает и знать не должен.
+            Без экземпляра метка осталась бы «по каталогу» — а перезапуск
+            поднимает новую сессию в том же каталоге через миллисекунды, и
+            такая метка проглотила бы её первое настоящее падение.
+            """
+            return await watcher.kill(tmux_name, cwd, session.tmux_id)
+
+        try:
+            fresh = await actions.restart(
+                session,
+                kill=kill_this,
+                mode="bypassPermissions",
+                timeout_s=config.launch_timeout_s,
+            )
+        except actions.ActionError as exc:
+            # actions.restart поднимает ActionError только из проверки kill —
+            # сессия ещё жива, к перезапуску даже не приступали.
+            await message.answer(_error_card("❌", exc), parse_mode="HTML")
+            return
+        except LaunchError as exc:
+            # LaunchError идёт только из remote.launch — до этой точки прежняя
+            # сессия уже погашена, и молчать об этом нельзя.
+            log.warning("bypass relaunch failed for %s: %s", session.cwd, exc)
+            if exc.tmux_name:
+                watcher.expect_death(exc.tmux_name, session.cwd)
+            token = uuid.uuid4().hex[:8]
+            resume_pending[token] = (
+                token,
+                LaunchRequest(target=Path(session.cwd), resume="last"),
+            )
+            await message.answer(
+                _bypass_failed_text(str(exc)),
+                parse_mode="HTML",
+                reply_markup=_resume_keyboard([(token, "↻ Resume")]),
+            )
+            return
+        except TrustRequired as need:
+            await offer_trust(message, need)
+            return
+        token = uuid.uuid4().hex[:8]
+        card_pending[token] = (
+            os.path.realpath(fresh.cwd),
+            fresh.tmux_id,
+            fresh.created_at,
+        )
+        await message.answer(
+            "🔓 Переоткрыта с bypassPermissions\n"
+            + _session_card(passport.build(fresh, host=config.host, tree=None)),
+            parse_mode="HTML",
+            reply_markup=_session_keyboard(token, fresh.url),
+        )
+
+    @dp.callback_query(F.data.startswith(("mcp:", "tail:")))
+    async def on_peek(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        prefix = "mcp:" if (query.data or "").startswith("mcp:") else "tail:"
+        session, message = await card_session(query, prefix)
+        if session is None or message is None:
+            return
+        await query.answer()
+        if prefix == "mcp:" and await _pane_is_busy(session.tmux_name):
+            await message.answer(BUSY_PANE_TEXT)
+            return
+        try:
+            text = (
+                await actions.send_and_tail(session, "/mcp", lines=25)
+                if prefix == "mcp:"
+                else await actions.tail(session, lines=25)
+            )
+        except actions.ActionError as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}", parse_mode="HTML")
+            return
+        # Отрез — до экранирования и без тегов: 25 склеенных строк панели за
+        # 3800 переваливают легко, а срез готовой строки уносит закрывающий
+        # тег или половину «&lt;», и Telegram отвергает сообщение целиком.
+        await message.answer(passport.pre_block(text, 3500), parse_mode="HTML")
+
+    @dp.callback_query(F.data.startswith("ren:"))
+    async def on_rename(query: CallbackQuery) -> None:
+        if not _is_authorized(query.from_user, config.allowed_user_id):
+            return
+        session, message = await card_session(query, "ren:")
+        if session is None or message is None:
+            return
+        await query.answer()
+        prompt = await message.answer(
+            "Новое имя сессии — <b>ответом на это сообщение</b>.",
+            parse_mode="HTML",
+            reply_markup=ForceReply(
+                force_reply=True, selective=True, input_field_placeholder="имя сессии"
+            ),
+        )
+        rename_pending[prompt.message_id] = (
+            os.path.realpath(session.cwd),
+            session.tmux_id,
+            session.created_at,
         )
 
     @dp.callback_query(F.data.startswith("jump:"))
@@ -1201,8 +1492,12 @@ async def main() -> None:
             await offer_start(message, state.cwd, None)
             return
 
+        if action == "bypass":
+            await offer_start(message, state.cwd, None, mode="bypassPermissions")
+            return
+
         if action == "newwt":
-            await start_session(message, state.cwd, worktrees.generate_branch())
+            await ask_name(message, LaunchRequest(state.cwd, new_worktree=True))
             return
 
         if action == "up":
@@ -1258,13 +1553,20 @@ async def main() -> None:
                 # или исчезла между capture и list) — без метки watcher
                 # опросил бы её как упавшую следом за этим же сообщением.
                 watcher.expect_death(exc.tmux_name, cwd)
-            await message.answer(
-                f"❌ Не поднялось.\n<pre>{html.escape(str(exc))}</pre>"[:3800], parse_mode="HTML"
-            )
+            await message.answer(_error_card("❌ Не поднялось.", exc), parse_mode="HTML")
             return
 
+        token = uuid.uuid4().hex[:8]
+        card_pending[token] = (
+            os.path.realpath(session.cwd),
+            session.tmux_id,
+            session.created_at,
+        )
         await message.answer(
-            _fresh_text(session), parse_mode="HTML", reply_markup=_open_keyboard(session.url)
+            f"✅ Сессия поднята\n"
+            f"{_session_card(passport.build(session, host=config.host, tree=None))}",
+            parse_mode="HTML",
+            reply_markup=_session_keyboard(token, session.url),
         )
 
     @dp.callback_query(F.data.startswith("rc:"))
@@ -1296,8 +1598,10 @@ async def main() -> None:
             await message.answer("Выбор устарел, повтори запуск.")
             return
         await message.edit_reply_markup(reply_markup=None)
-        target, branch, resume = choice
-        await start_session(message, target, branch, resume)
+        if choice.resume is None:
+            await ask_name(message, choice)
+            return
+        await start_session(message, choice)
 
     @dp.callback_query(F.data.startswith("sync:"))
     async def on_sync(query: CallbackQuery) -> None:
@@ -1371,21 +1675,51 @@ async def main() -> None:
         await sync_card(message.chat.id, message.message_id, state.cwd)
 
     @dp.message(F.reply_to_message & F.text)
-    async def on_branch_reply(message: Message) -> None:
-        """Имя ветки для карточки Sync приходит ответом на её же запрос.
+    async def on_text_reply(message: Message) -> None:
+        """Имя сессии или ветки для Sync приходит ответом на свой же запрос.
 
         Ответ через Telegram `reply_to_message` — не произвольное следующее
-        сообщение: так две открытые карточки не путают ветки между собой, а
-        забытая заявка не подхватывает случайный текст, не имеющий к ней
-        отношения.
+        сообщение: так две открытые карточки не путают ветки (или запуски)
+        между собой, а забытая заявка не подхватывает случайный текст, не
+        имеющий к ней отношения.
         """
         if not _is_authorized(message.from_user, config.allowed_user_id):
             return
         reply = message.reply_to_message
         if reply is None:
             return
+
+        request = name_pending.pop(reply.message_id, None)
+        if request is not None:
+            await start_session(message, _apply_name(request, message.text or ""))
+            return
+
+        renaming = rename_pending.pop(reply.message_id, None)
+        if renaming is not None:
+            cwd, tmux_id, created_at = renaming
+            session = _same_session(await find(cwd), tmux_id, created_at)
+            if session is None:
+                await message.reply("Сессия уже не жива.")
+                return
+            if await _pane_is_busy(session.tmux_name):
+                await message.reply(BUSY_PANE_TEXT)
+                return
+            try:
+                result = await actions.rename(session, message.text or "")
+            except actions.ActionError as exc:
+                await message.reply(f"❌ {html.escape(str(exc))}", parse_mode="HTML")
+                return
+            note = "" if result.app_renamed else "\n⚠️ Приложение не переименовалось."
+            await message.reply(
+                f"✏️ Теперь <b>{html.escape(result.label)}</b>{note}", parse_mode="HTML"
+            )
+            return
+
         card_id = branch_pending.pop(reply.message_id, None)
         if card_id is None:
+            # bot.id aiogram достаёт из самого токена — ни сети, ни getMe.
+            if _is_own_prompt(reply, bot.id):
+                await message.reply(STALE_REPLY_TEXT)
             return
         text = (message.text or "").strip()
         # Без обрезки длинное имя уезжает в текст кнопки «Ветка: …», и Telegram
@@ -1399,7 +1733,7 @@ async def main() -> None:
         # оставшиеся падения того же опроса тогда пропадут без следа.
         try:
             token = uuid.uuid4().hex[:8]
-            resume_pending[token] = (token, (Path(died.cwd), None, "last"))
+            resume_pending[token] = (token, LaunchRequest(Path(died.cwd), resume="last"))
             await bot.send_message(
                 config.allowed_user_id,
                 _died_text(died),
@@ -1413,11 +1747,20 @@ async def main() -> None:
     # здесь (бота заблокировали, сеть недоступна) не должна срывать поллинг.
     try:
         for session in await list_sessions():
+            # Пульт тот же, что в /rc: текст карточки после рестарта бота
+            # совпадает с обычной, и карточка без Stop/Bypass/Tail читалась бы
+            # сбоем, а не замыслом. Токен свежий — прежние умерли с процессом.
+            token = uuid.uuid4().hex[:8]
+            card_pending[token] = (
+                os.path.realpath(session.cwd),
+                session.tmux_id,
+                session.created_at,
+            )
             await bot.send_message(
                 config.allowed_user_id,
-                _list_item(session),
+                _session_card(passport.build(session, host=config.host, tree=None)),
                 parse_mode="HTML",
-                reply_markup=_open_keyboard(session.url),
+                reply_markup=_session_keyboard(token, session.url),
             )
     except Exception:
         log.warning("failed to send startup session list", exc_info=True)

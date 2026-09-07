@@ -67,12 +67,14 @@ def test_render_config_appends_extra_fields_with_toml_types(tmp_path: Path) -> N
             "worktree_root": "~/.claude-rc/worktrees",
             "scan_depth": 5,
             "launch_timeout_s": 45.0,
+            "host": "m1",
         },
     )
     parsed = tomllib.loads(text)
     assert parsed["worktree_root"] == "~/.claude-rc/worktrees"
     assert parsed["scan_depth"] == 5
     assert parsed["launch_timeout_s"] == 45.0
+    assert parsed["host"] == "m1"
 
 
 def test_render_config_without_extra_matches_plain_call(tmp_path: Path) -> None:

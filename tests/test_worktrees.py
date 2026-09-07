@@ -286,3 +286,63 @@ async def test_generated_branch_makes_usable_worktree(repo: Path, tmp_path: Path
     info = await worktrees.inspect(path)
     assert info is not None and info.branch == branch
     assert path.name.startswith("demo-wt-")
+
+
+async def test_label_names_repo_and_branch(repo: Path) -> None:
+    assert await worktrees.label(repo) == "demo@main"
+
+
+async def test_label_of_worktree_keeps_parent_repo_name(repo: Path, tmp_path: Path) -> None:
+    # Каталог worktree зовётся demo-wt-feature-x, но человеку важны репозиторий
+    # и ветка, а не слаг каталога.
+    path = await worktrees.ensure(repo, "wt/feature-x", tmp_path / "wt")
+
+    assert await worktrees.label(path) == "demo@wt/feature-x"
+
+
+async def test_label_falls_back_to_directory_name_outside_git(tmp_path: Path) -> None:
+    plain = tmp_path / "notes"
+    plain.mkdir()
+
+    assert await worktrees.label(plain) == "notes"
+
+
+def test_branch_for_slugs_the_name() -> None:
+    assert worktrees.branch_for("MCP fix!") == "wt/mcp-fix"
+    assert worktrees.branch_for("...") == "wt/wt"
+
+
+async def test_label_prefers_the_given_name(repo: Path) -> None:
+    assert (await worktrees.label(repo, name="mcp-fix")).endswith("@mcp-fix")
+    assert "@" in await worktrees.label(repo)
+
+
+async def test_label_uses_name_for_non_git_dir(tmp_path: Path) -> None:
+    assert await worktrees.label(tmp_path, name="x") == f"{tmp_path.name}@x"
+    assert await worktrees.label(tmp_path) == tmp_path.name
+
+
+def test_clean_name_collapses_whitespace() -> None:
+    # Табы и переводы строк в ярлыке рвут строку `list-sessions`, где поля
+    # разделены табом, — сессия исчезла бы из всех списков разом.
+    assert worktrees.clean_name("  x   y ") == "x y"
+    assert worktrees.clean_name("a\tb\nc") == "a b c"
+    assert worktrees.clean_name("   ") == ""
+
+
+def test_clean_name_cuts_to_the_limit() -> None:
+    long = "x" * (worktrees.MAX_SESSION_NAME_LEN + 10)
+    assert worktrees.clean_name(long) == "x" * worktrees.MAX_SESSION_NAME_LEN
+    # Обрез не должен оставить имя с хвостовым пробелом.
+    assert not worktrees.clean_name("x" * (worktrees.MAX_SESSION_NAME_LEN - 1) + "  y").endswith(
+        " "
+    )
+
+
+async def test_label_cleans_the_given_name(repo: Path) -> None:
+    assert await worktrees.label(repo, name="  x   y ") == "demo@x y"
+
+
+async def test_label_ignores_a_blank_name(repo: Path) -> None:
+    # Пустое после чистки имя — это «имени не дали»: ярлык падает на ветку.
+    assert await worktrees.label(repo, name=" \t ") == "demo@main"

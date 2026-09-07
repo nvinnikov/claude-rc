@@ -179,6 +179,11 @@ else to read it from.
 | Module | Responsibility |
 |---|---|
 | `clauderc/remote.py` | everything tmux: start a session, harvest the link, kill it |
+| `clauderc/passport.py` | one session structure, rendered to HTML, text and JSON |
+| `clauderc/state_probe.py` | state from the pane (idle/working/needs_input/dead/unknown), listening ports |
+| `clauderc/actions.py` | acting on a session: `send`, `tail`, `rename`, `restart` |
+| `clauderc/proxy.py` | `--host`: run a command on another machine over ssh |
+| `clauderc/forward.py` | ssh tunnels to a session's listening ports |
 | `clauderc/worktrees.py` | git worktree per branch: create, inspect, remove |
 | `clauderc/browse.py` | directory tree navigation (`cd`/`ls`) |
 | `clauderc/repos.py` | walking `rc_roots` looking for git repositories |
@@ -210,15 +215,21 @@ Two ways to pick where a session goes up: walk there, or call it by name.
 ```
 
 `/pwd` sends a card: the current path and buttons for the subdirectories (git repositories
-marked with `●`), plus `⬆️ ..` and `▶️ Start Claude RC`. On a phone that beats typing paths:
-you tap through the tree and launch without entering anything. The current directory survives
-a bot restart.
+marked with `●`), plus `⬆️ ..`, `▶️ Start Claude RC` and `🔓 Start (bypass)` — the same
+launch, straight into `bypassPermissions`. On a phone that beats typing paths: you tap
+through the tree and launch without entering anything. The current directory survives a bot
+restart.
 
 `/cd` understands relative paths, absolute paths, `..` and `~`.
 
+Either start button asks one more thing first: a name for the session, as a reply to the
+bot's message, or `-` to skip it and fall back to the branch. The name becomes the label
+`repo@name`.
+
 Inside a git repository a `🌿 New worktree` button appears — it starts a session in a fresh
-worktree on a branch named like `wt/20260730-131502`. That's how you work in parallel with an
-already-running session when the branch name doesn't matter.
+worktree on a branch named like `wt/20260730-131502`, or `wt/<name>` if you named the session.
+That's how you work in parallel with an already-running session when the branch name doesn't
+matter.
 
 `📚 Projects` (`/repos`) — a flat list of every git repository as buttons: a tap takes you
 straight into the directory, no tree-walking. Identical names (two clones of one repository)
@@ -229,6 +240,13 @@ A persistent keyboard sits under the input field: `📁 PWD`, `💬 Chats`, `�
 
 If a session is already alive in a directory you get its link back rather than a second
 session — sessions are keyed by working directory, not by name.
+
+A session is called **one and the same thing everywhere**: `repo@branch` — `oms@main` for a
+repository, `oms@wt/feature-x` for a worktree. That label is what the bot card shows, what
+the Claude app shows both in the session list and in the prompt box (it is passed as
+`--remote-control` *and* `-n`), and what the tmux session is named until the link arrives.
+Without it each surface invented its own name — the app an auto-generated one, the card the
+directory name, tmux a slug — and matching them up by eye was on you.
 
 Every session card carries **two ways in**, and they share one identifier: the link, which
 opens the session in the Claude app, and the same `session_…` id (`🖥`), which opens it in a
@@ -251,10 +269,10 @@ whoever is working right now. The Claude app is unaffected: it talks to the sess
 API, not through tmux. `=` means an exact match, so a target can't land on a session whose
 name merely starts the same way.
 
-Because ids identify sessions and directory names no longer have to, cards, `/rckill` and
-`claude-rc stop` show and take the directory name as a label. Where a label matches more than
-one session — three clones of one repository — nothing is killed: you get the ids back and
-pick.
+Because ids identify sessions and names no longer have to, cards, `/rckill` and
+`claude-rc stop` show and take the `repo@branch` label. The bare repository name works too —
+`/rckill oms` when `oms@main` and `oms@wt/x` are both up. Where a target matches more than one
+session, nothing is killed: you get the ids back and pick.
 
 ### Repository sync
 
@@ -298,8 +316,10 @@ different sessions.
 
 `💬 Chats` shows both halves of the picture.
 
-First the live sessions — one message each, with `Open in Claude` and `⏹ Stop` buttons. If
-a session runs in a worktree, the card shows the branch and its state.
+First the live sessions — one message each, with `Open in Claude`, `⏹ Stop`, `🔓 Bypass`
+(kill and relaunch with `bypassPermissions`), `🔌 /mcp` (send `/mcp` and show the pane's
+answer), `📋 Tail` (the pane's last lines) and `✏️ Rename` buttons. If a session runs in a
+worktree, the card shows the branch and its state.
 
 Then the worktrees left **without** a session. That's the unfinished work: each gets
 `▶️ Start` (bring a session back up in the same directory) and `🗑 Remove`. There is
@@ -416,9 +436,9 @@ It asks three things:
 It writes `~/.config/claude-rc/config.toml` with mode `600` (and the directory `700`) —
 that file holds a live token; a repeat run narrows the permissions even if the file used to
 be wider. A repeat `claude-rc setup` pre-fills the previous values as hints and changes only
-what you answer — an empty answer keeps the old value. Six technical fields the wizard
+what you answer — an empty answer keeps the old value. Seven technical fields the wizard
 never asks about (`worktree_root`, `state_path`, `scan_depth`, `launch_timeout_s`,
-`permission_mode`, `pull_before_start`) are carried over verbatim on rewrite; anything else outside that list (including human
+`permission_mode`, `pull_before_start`, `host`) are carried over verbatim on rewrite; anything else outside that list (including human
 comments) is not preserved.
 
 Then open the ClaudeRC app or run `claude-rc bot`.
@@ -439,6 +459,10 @@ Then open the ClaudeRC app or run `claude-rc bot`.
    - `permission_mode` — optional: what a session starts with, so it doesn't stop and
      ask at every step while you're holding a phone
    - `pull_before_start` — optional: fetch origin before a session starts
+   - `host` — optional: how this machine is reached over ssh from your other ones (an
+     alias from `~/.ssh/config`). Only needed once there's a second machine: with it the
+     session passport prints a ready `ssh <host> -t 'tmux attach …'` and the
+     `claude-rc --host <host>` prefix
 3. `chmod 600 config.toml`
 
 The config is looked up in order: the path in `$CLAUDE_RC_CONFIG` if set; otherwise
@@ -477,14 +501,41 @@ uv tool install .
 | Command | Action |
 |---|---|
 | `claude-rc version` | version |
-| `claude-rc sessions [--json]` | live RC sessions |
-| `claude-rc start [path] [--branch b] [--resume last\|id] [--pull] [--permission-mode m]` | start a session (default: current directory) |
+| `claude-rc sessions [--json] [--no-probe]` | live RC sessions, with state and listening ports |
+| `claude-rc whoami [path] [--json]` | which session owns this directory: label, id, link, attach command |
+| `claude-rc start [path] [--branch b] [--name n] [--new-worktree] [--resume last\|id] [--pull] [--permission-mode m]` | start a session (default: current directory); `--name` sets the label `repo@n` and, with `--new-worktree` and no explicit `--branch`, the branch `wt/<n>` |
+| `claude-rc rename <target> <name>` | relabel in tmux and `/rename` in the app |
+| `claude-rc send <target> <text> [--no-enter] [--tail N]` | type into the session pane |
+| `claude-rc restart <target> [--mode m]` | kill and relaunch with `--resume`, optionally with another permission mode |
+| `claude-rc connect [target] [--read-only] [--cc] [--url] [--start] [--branch b]` | attach a terminal to the session's tmux pane |
 | `claude-rc stop <name\|path>` / `claude-rc stop --all` | kill a session |
 | `claude-rc doctor [--json]` | check tmux, claude and the config |
 | `claude-rc setup` | first-run wizard — token, user_id, directories |
 | `claude-rc update [--check] [--json]` | update the tool the same way it was installed |
 | `claude-rc sync [paths…] [--branch b] [--no-fetch]` | fast-forward repositories from origin |
 | `claude-rc bot` | run the Telegram bot in the foreground — same as `make run` |
+| `claude-rc --host m1 forward <target> [ports…] [--stop]` | ssh tunnels to the ports the session listens on |
+| `claude-rc --host m1 <command>` | run the same command on another machine over ssh (`bot`, `update`, `forward` excluded; paths must be absolute) |
+
+### For a steering agent
+
+One machine is the whole product; add `host = "m1"` to its config when you have a second
+one — the session passport then prints `ssh m1 -t 'tmux attach …'` and
+`claude-rc --host m1 …` forms. The host is whatever ssh takes, `user@m1` included. A Claude session that manages other sessions (on the same
+machine or another) needs exactly one call to see everything:
+
+```bash
+claude-rc --host m1 sessions --json      # label, url, branch, state, last pane lines, listening ports
+claude-rc --host m1 send oms@fix '/mcp' --tail 20
+claude-rc --host m1 restart oms@fix --mode bypassPermissions
+claude-rc --host m1 forward oms@fix       # then open http://localhost:<port>
+```
+
+`whoami` is for the agent *inside* a session; a steering agent is not inside one and should
+use `sessions --json`. `state` is what the pane shows (`idle`, `working`, `needs_input`,
+`dead`, `unknown`), never what claude knows — read `last_lines` when in doubt. `--no-probe` skips
+the pane capture and port lookup for a faster listing when state isn't needed. Text for
+`send` that starts with `-` goes after `--`: `claude-rc send oms -- -x`.
 
 The trust dialog for an unfamiliar directory is asked straight on stdin: there's a human at
 the terminal, and their answer *is* the decision about access to that directory — no
@@ -527,6 +578,17 @@ are walked in parallel.
 The non-obvious constraints this project is built around — the ones that cost debugging time
 and shaped the code:
 
+- **One label per session, across every surface.** `repo@branch` goes into
+  `--remote-control` (the name in the Claude app), `-n` (prompt box, `/resume` picker,
+  terminal title), the tmux session name and the bot card at once. Left to themselves the
+  surfaces disagree: without `-n` the app makes up its own title, and the worktree directory
+  is a slug (`oms-wt-feature-x`) that says less than the branch it came from. The label is
+  stored in the tmux user option `@rc_label`, set at `new-session` rather than after the
+  link, so a session that died before printing one is still named in the report of its death.
+- **`claude-rc whoami` is how an agent on the machine finds itself.** It matches by
+  directory *and its parents*: an agent almost never stands in the root of the worktree, and
+  an exact `find(cwd)` would miss it from a subdirectory. `--json` gives the whole mapping —
+  label, `session_…` id, link, ready-made attach command — in one call.
 - **A session's key is its working directory, not its name.** Repository names in a tree
   aren't unique (two clones of one repo), and name lookup handed back a link to a session in
   someone else's directory. `find(cwd)` compares `realpath`; the tmux session name survives
@@ -551,8 +613,11 @@ and shaped the code:
   the fact. Two things follow. `list_sessions` recognises its own by the `rc-` prefix *or* a
   set `@rc_url`: the prefix alone would lose renamed sessions, the option alone would lose
   ones that died before printing a link. And the `Watcher` doesn't call a vanished name a
-  death while a session with the same working directory is alive — otherwise every launch
-  would report a crash.
+  death while the same instance is alive — otherwise every launch would report a crash.
+  The instance is the tmux id (`#{session_id}`, `$3`) *paired with* the creation time and
+  directory: neither alone identifies it. `#{session_created}` is whole seconds and
+  `restart` kills and relaunches inside one of them; `$N` is unique only for the tmux
+  server's lifetime, and a server that exits with its last session hands out `$0` again.
 - **`CLAUDE_CODE_*` is scrubbed inside the pane.** The tmux server may have been started
   from within Claude Code; an inherited `CLAUDE_CODE_CHILD_SESSION` starts the session with
   "Transcript saving is off" — that is, with no history.
@@ -564,6 +629,11 @@ and shaped the code:
   changed. When the highlighted option turned out to be the decline, Claude exited, the tmux
   session ended with it, and the human got "the session ended without a link" in reply to
   their own "I trust it" tap. The dialog prints the number itself, so that's what we use.
+- **Buttons that type into the pane ask for its state first.** `🔌 /mcp` and `✏️ Rename` end
+  with a separate `Enter`, and `Enter` confirms whichever option an open dialog highlights —
+  up to "Yes, and don't ask again". The card may have been drawn long before the dialog
+  appeared, so `state_probe.probe` runs right before sending and a `needs_input` pane gets a
+  refusal instead of an answer given on the human's behalf. `📋 Tail` only reads and doesn't ask.
 - **A dead session is reported with the last pane we saw, not the failed `capture-pane`.**
   Once the session is gone tmux prints `can't find session`, and that used to reach the human
   instead of what was on screen before it died — the only clue as to why.
@@ -576,9 +646,16 @@ and shaped the code:
   `-Users-n--x`. And the slug is ambiguous by construction, so `history` confirms the match
   against the `cwd` field inside the file.
 - **Sessions are never killed behind the `Watcher`'s back.** The watcher treats any
-  disappearance it didn't mark as expected as a crash — a direct `remote.kill_tmux` from a
-  handler would hand the user a "session crashed" card right after they pressed Stop
-  themselves.
+  disappearance it didn't expect as a crash — a direct `remote.kill_tmux` from a handler
+  would hand the user a "session crashed" card right after they pressed Stop themselves.
+- **A killed session is struck from the snapshot, not tagged with a mark.** The poller calls
+  a disappearance from its snapshot a death, so removing the session from that snapshot is
+  the exact way to say "this death was expected". Any mark kept beside the snapshot outlives
+  the session while its replacement appears instantly, and nothing tells the two apart:
+  the name changes underfoot, `#{session_created}` is whole seconds, and `#{session_id}`
+  restarts from `$0` when the session being killed was the last one on the server and the
+  server went with it. A mark by name survives for one thing only — the race where `poll`
+  asked tmux for its list before the kill and sorted the answer into a snapshot after it.
 - **An app launched at login gets a bare `PATH`.** The bot it spawns as a child would find
   neither `tmux` nor `claude` without an explicit `PATH` — `CLILocator.childEnvironment`
   exists for exactly that.
@@ -595,6 +672,60 @@ and shaped the code:
   success pending a human's confirmation in System Settings. Mistaking it for a failure and
   adding a hand-rolled LaunchAgent on top gives you two autostart mechanisms and a doubled
   bot.
+- **The passport is the single render.** `clauderc/passport.py` builds one `Passport`
+  structure from a `RemoteSession`, git and the config, and one function renders it to HTML
+  for the bot, text for `whoami`/`sessions`, and JSON for a steering agent — three surfaces
+  reading one source instead of three copies of the same wording drifting apart.
+- **State is an observation, and `unknown` is the honest fallback.** There's no event stream
+  from tmux and no status API from claude; `state_probe.probe` gets everything from
+  pattern-matching one `capture-pane`. `idle` and `needs_input` come from known pane shapes —
+  an empty input frame, a numbered dialog with its highlighted item (the caret is required:
+  without it any answer containing a numbered list read as a question), a trust prompt — and
+  whatever matches none of them
+  is `unknown`, never a guess: a claude update that changes the TUI has to surface as
+  "we don't know," not as a wrong `idle`.
+- **`@rc_mode` and the `auto` default.** `launch` records the permission mode a session
+  started with in the tmux user option `@rc_mode`, next to `@rc_label`, so `restart` without
+  `--mode` reopens with the same one. The default changed from `manual` to `auto` for the
+  same reason as [What a session starts with](#what-a-session-starts-with): a session that
+  stops to ask on every step is one you have to be at a keyboard for.
+- **`send-keys -l`.** `actions.send` passes the user's text to `tmux send-keys` with `-l`
+  (literal) before a separate `Enter` keystroke — without it, names like `Up` or `C-c` typed
+  by a human would be read as key names instead of text. The text goes to `send-keys` as an
+  argument, not through a shell, so no quoting is needed.
+- **`restart` goes through the bot's `Watcher`.** Killing the old session any other way hands
+  the human a "session crashed" card right after they pressed the button that restarted it —
+  the `Watcher` has to be told the death is expected, the same rule `stop` already follows.
+- **`forward` is the one client-side command.** Everything else `--host` touches runs on the
+  far machine; `forward`'s ssh tunnel has to listen where the browser opening
+  `http://localhost:<port>` will run, i.e. here — the one deliberate exception to
+  "`--host` = run it there," and it's called out above rather than left to be discovered.
+- **A partial `forward` is not a failure.** Tunnels that came up before another port's ssh
+  died keep running — a neighbour's failure is not theirs — so staying quiet about them would
+  report a partial success as a clean failure. `ForwardError` carries them in `started`, the
+  CLI prints them before the error text and points at `--stop`; otherwise the retry after
+  fixing ssh hits "port already in use" on the caller's own leftover tunnel.
+- **A relative path is refused under `--host`.** The command runs as a plain local
+  `claude-rc` on the far machine with no idea what directory this one meant; a
+  non-interactive ssh starts in `$HOME`, so `.` or `../foo` would resolve against that
+  instead, and it's rejected rather than guessed at. The check knows each command's rule by
+  name: for `start`/`whoami`/`sync` every positional is a path, for
+  `connect`/`stop`/`restart`/`rename`/`send` only the first one and only if it looks like a
+  path (`send`'s second positional is free text, `rename`'s is the new name). Leaving out a
+  command that takes a directory as its target means killing or renaming a session in the
+  far machine's `$HOME` instead of the one that was meant.
+- **Non-interactive ssh doesn't read `.zshrc`, so the `PATH` fix is explicit.** `ssh host cmd`
+  (unlike `ssh -t host`) skips the login-shell rc files that put `~/.local/bin` on `PATH` —
+  exactly where `uv tool install` puts `claude-rc`. `proxy.remote_argv` prepends that
+  directory itself rather than trusting the remote shell's own setup.
+- **`--host` with no value is an error, not a silent local run.** A forgotten argument —
+  `claude-rc stop --all --host` — must not fall through to killing sessions here on the
+  assumption that "no host given" means "this machine"; the flag requires a value, so the
+  mistake surfaces immediately instead of taking out the wrong machine's sessions.
+- **One machine is the whole product; `host` only matters once there's a second one.**
+  Nothing above needs a new config key to work solo — the bot, the CLI, a steering session,
+  an agent inside a session. Setting `host` only changes what the passport prints (`ssh
+  <host> -t ...`, `claude-rc --host <host> ...`); leaving it unset costs nothing.
 
 ## Permissions and trade-offs
 

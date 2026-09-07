@@ -16,6 +16,12 @@ from pathlib import Path
 _SLUG = re.compile(r"[^A-Za-z0-9_-]+")
 _ERROR_TAIL = 400
 
+# Длиннее не влезает ни в рамку ввода claude, ни в подпись кнопки Telegram,
+# а карточку с переросшей подписью Telegram отвергает целиком.
+MAX_SESSION_NAME_LEN = 40
+
+_WHITESPACE = re.compile(r"\s+")
+
 # Локальные вызовы (status, rev-parse) укладываются в миллисекунды — даже на
 # большом репозитории это разовая операция с диском. Сетевые (fetch, pull) на
 # разумном канале отрабатывают за секунды, редко за десятки секунд; 30с — щедрый
@@ -58,6 +64,19 @@ class Worktree:
         return reasons
 
 
+def clean_name(name: str) -> str:
+    """Имя сессии, годное для ярлыка: пробельные символы схлопнуты, длина обрезана.
+
+    Ярлык уходит в `@rc_label`, а `list-sessions -F` разделяет поля табом:
+    таб или перевод строки внутри имени разорвал бы строку, `list_sessions`
+    отбросила бы её как нечитаемую — и сессия пропала бы из `/rc`, `resolve`,
+    `find`, а Watcher счёл бы её мёртвой и следующий `start` в том же каталоге
+    поднял бы вторую. Чистим в единственной точке, где имя человека становится
+    ярлыком, а не на каждой поверхности отдельно.
+    """
+    return _WHITESPACE.sub(" ", name).strip()[:MAX_SESSION_NAME_LEN].strip()
+
+
 def slug(text: str) -> str:
     return _SLUG.sub("-", text).strip("-").lower() or "wt"
 
@@ -68,6 +87,11 @@ def generate_branch(now: float | None = None) -> str:
     Секунды в метке нужны, чтобы два нажатия подряд не пришли в один worktree.
     """
     return "wt/" + time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+
+
+def branch_for(name: str) -> str:
+    """Ветка для параллельной сессии, названной человеком: `wt/<slug>`."""
+    return "wt/" + slug(name)
 
 
 async def _git(cwd: Path, *args: str, timeout_s: float | None = None) -> tuple[int, str]:
@@ -176,3 +200,21 @@ async def remove(root: Path, name: str, *, force: bool = False) -> Worktree:
     if code != 0:
         raise WorktreeError(out.strip()[-_ERROR_TAIL:])
     return info
+
+
+async def label(path: Path, *, name: str | None = None) -> str:
+    """Ярлык сессии: репозиторий и имя (если дали) или ветка одной строкой.
+
+    Один ярлык на все поверхности — имя в приложении Claude, карточка бота,
+    имя tmux-сессии до переименования. Имя каталога worktree для этого не
+    годится: `demo-wt-feature-x` — слаг, а человек ищет сессию по репозиторию
+    и ветке. Не git-каталог ярлыку не мешает: там имя каталога и есть всё,
+    что о нём известно. `name` — то, что человек дал сессии сам (`start --name`);
+    оно понятнее ветки, особенно сгенерированной по времени (`generate_branch`).
+    """
+    info = await inspect(path)
+    repo = info.repo if info is not None else path.name
+    cleaned = clean_name(name or "")
+    if cleaned:
+        return f"{repo}@{cleaned}"
+    return f"{info.repo}@{info.branch}" if info is not None else path.name

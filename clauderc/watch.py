@@ -39,75 +39,115 @@ class Watcher:
     def __init__(self, *, poll_s: float = POLL_S) -> None:
         self._poll_s = poll_s
         self._known: dict[str, RemoteSession] | None = None
-        self._expected: set[str] = set()
-        # Метка по каталогу рядом с меткой по имени: имя меняется у сессии под
-        # ногами (`await_url` даёт ей id Claude), и снятая поллером под старым
-        # именем сессия не совпала бы с меткой, поставленной под новым, — то
-        # есть намеренное гашение доехало бы карточкой «сессия завершилась».
-        self._expected_paths: set[str] = set()
+        # Имя → tmux-id того экземпляра, чью смерть ждём (None — экземпляр
+        # неизвестен). Без экземпляра метка липнет к имени, а имя переживает
+        # сессию: `--resume` возвращает перезапущенной тот же `session_…`,
+        # и метка от прежней проглотила бы первое настоящее падение новой.
+        self._expected: dict[str, str | None] = {}
 
-    def expect_death(self, tmux_name: str, cwd: str | None = None) -> None:
+    def _forget(self, cwd: str | None, tmux_id: str | None) -> None:
+        """Вычёркивает погашенную сессию из базового снимка.
+
+        Поллер считает смертью исчезновение из снимка — значит убрать сессию из
+        снимка и есть точный способ сказать «эта смерть ожидаемая». Метка рядом
+        со снимком (по имени, по каталогу, по id) всегда хуже: она переживает
+        сессию, а сессия на её месте появляется мгновенно. `restart` гасит и
+        поднимает в одном каталоге, и различить их нечем — `#{session_created}`
+        идёт целыми секундами, а `#{session_id}` начинает нумерацию заново, если
+        гасимая была на сервере единственной и сервер ушёл вместе с ней. Из
+        снимка же вычеркнута именно погашенная: поднятой в нём ещё нет, и её
+        собственная смерть дойдёт до человека как положено.
+
+        Ключ — tmux-id, когда он известен, иначе каталог (сессия в нём одна).
+        """
+        if self._known is None or (cwd is None and tmux_id is None):
+            return
+        self._known = {
+            name: s
+            for name, s in self._known.items()
+            if not (s.tmux_id == tmux_id if tmux_id else same_path(s.cwd, cwd or ""))
+        }
+
+    def expect_death(
+        self, tmux_name: str, cwd: str | None = None, tmux_id: str | None = None
+    ) -> None:
         """Помечает смерть ожидаемой, не гася сессию: её уже погасил кто-то другой."""
-        self._expected.add(tmux_name)
-        if cwd is not None:
-            self._expected_paths.add(cwd)
+        self._expected[tmux_name] = tmux_id or None
+        self._forget(cwd, tmux_id or None)
 
-    async def kill(self, tmux_name: str, cwd: str | None = None) -> bool:
+    async def kill(
+        self, tmux_name: str, cwd: str | None = None, tmux_id: str | None = None
+    ) -> bool:
         """Гасит сессию, пометив смерть ожидаемой.
 
-        `cwd` стоит передавать всегда, когда он известен: имя сессии меняется
-        под ногами, и метка только по нему не совпадёт с тем, что поллер снял
-        под прежним именем. Все вызывающие сессию уже держат — спрашивать tmux
-        второй раз незачем.
+        `cwd` и `tmux_id` стоит передавать всегда, когда они известны: имя
+        сессии меняется под ногами, и метка по имени не совпадёт с тем, что
+        поллер снял под прежним. Все вызывающие сессию уже держат — спрашивать
+        tmux второй раз незачем.
+
+        Из снимка вычёркиваем только после удачного гашения: `_forget` на живой
+        сессии стёр бы из базы то, чему ещё предстоит умереть, и настоящее
+        падение прошло бы молча. Метка (имя вместе с экземпляром) остаётся
+        страховкой на гонку — `poll` мог запросить `list-sessions` до гашения, а
+        разложить ответ по снимку уже после, и тогда погашенная сессия попадёт в
+        снимок живой.
         """
-        self.expect_death(tmux_name, cwd)
+        self._expected[tmux_name] = tmux_id or None
         killed = await kill_tmux(tmux_name)
         if not killed:
             # Гашение не удалось — сессия жива, а метка на живой сессии переживёт
             # её и проглотит настоящее падение. Одноразовость важнее лишней карточки.
-            self._expected.discard(tmux_name)
-            if cwd is not None:
-                self._expected_paths.discard(cwd)
-        return killed
+            self._expected.pop(tmux_name, None)
+            return False
+        self._forget(cwd, tmux_id or None)
+        return True
 
     async def kill_all(self) -> int:
         killed = 0
         for session in await list_sessions():
-            killed += await self.kill(session.tmux_name, session.cwd)
+            killed += await self.kill(session.tmux_name, session.cwd, session.tmux_id)
         return killed
 
     async def poll(self, on_died: OnDied) -> None:
         current = {s.tmux_name: s for s in await list_sessions()}
         previous, self._known = self._known, current
 
-        # Метки живут только пока жива сессия: иначе неудавшееся гашение оставило бы
-        # вечное «не сообщать», и настоящее падение прошло бы молча.
-        expected_gone = self._expected - set(current)
-        self._expected &= set(current)
-        # Тот же расчёт для меток по каталогу: живой каталог метку не тратит.
-        paths_gone = {
-            path
-            for path in self._expected_paths
-            if not any(same_path(alive.cwd, path) for alive in current.values())
-        }
-        self._expected_paths -= paths_gone
+        # Метка живёт, только пока под её именем стоит тот самый экземпляр.
+        # Имени мало: `actions.restart` поднимает сессию через `--resume`, та
+        # печатает ту же ссылку, и `await_url` переименовывает её обратно в тот
+        # же `session_…` — имя снова в снимке, и метка от прежней осталась бы
+        # навсегда, проглотив первое настоящее падение перезапущенной. Метка без
+        # экземпляра (tmux-id неизвестен) живёт по-старому, по одному имени.
+        expected_gone: set[str] = set()
+        remaining: dict[str, str | None] = {}
+        for tmux_name, tmux_id in self._expected.items():
+            alive = current.get(tmux_name)
+            if alive is None:
+                expected_gone.add(tmux_name)
+                continue
+            if tmux_id is not None and alive.tmux_id != tmux_id:
+                continue  # под именем уже другой экземпляр — метка своё отслужила
+            remaining[tmux_name] = tmux_id
+        self._expected = remaining
 
-        if previous is None:
-            return  # первый снимок базовый: что бы в нём ни было, падений ещё не видели
-
-        for tmux_name, session in previous.items():
+        # previous is None — первый снимок базовый: что бы в нём ни было,
+        # падений ещё не видели.
+        for tmux_name, session in (previous or {}).items():
             if tmux_name in current or tmux_name in expected_gone:
                 continue
-            if any(same_path(session.cwd, path) for path in paths_gone):
-                continue  # погасили намеренно, пусть и под другим именем
-            # Имя пропало, но сессия в том же каталоге и той же давности жива —
-            # значит её переименовали, а не потеряли: `await_url` даёт ей id
-            # сессии Claude, как только тот появится. Одного каталога мало:
-            # упавшую сессию могли тут же поднять заново, и настоящая смерть
-            # прошла бы молча. `session_created` переименование сохраняет,
-            # а перезапуск — нет.
-            if any(
-                same_path(alive.cwd, session.cwd) and alive.created_at == session.created_at
+            # Имя пропало, но тот же экземпляр жив — значит сессию
+            # переименовали, а не потеряли: `await_url` даёт ей id сессии
+            # Claude, как только тот появится. Переименование сохраняет всё
+            # три признака разом, а совпасть по всем трём у разных сессий
+            # нечему: `$N` уникален, пока жив tmux-сервер, а после его
+            # перезапуска нумерация идёт заново — тогда сессию с тем же `$0`
+            # разводит каталог или секунда создания. Одного `$N` мало ровно
+            # поэтому; одного времени создания мало потому, что оно в целых
+            # секундах и `restart` укладывается в одну.
+            if session.tmux_id and any(
+                alive.tmux_id == session.tmux_id
+                and same_path(alive.cwd, session.cwd)
+                and alive.created_at == session.created_at
                 for alive in current.values()
             ):
                 continue
