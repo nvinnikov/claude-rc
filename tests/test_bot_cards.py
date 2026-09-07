@@ -1,7 +1,9 @@
+import datetime
 import re
 import time
 from pathlib import Path
 
+from aiogram.types import Chat, Message, User
 from clauderc import bot as bot_module
 from clauderc import passport
 from clauderc.bot import (
@@ -12,6 +14,7 @@ from clauderc.bot import (
     _chunk_report,
     _died_text,
     _has_repos,
+    _is_own_prompt,
     _name_prompt,
     _pop_resume_group,
     _pull_line,
@@ -384,3 +387,28 @@ def test_browse_card_offers_bypass_start(tmp_path: Path) -> None:
     _, keyboard = _browse_card(tmp_path)
     data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
     assert "nav:here" in data and "nav:bypass" in data
+
+
+def _reply_from(user_id: int) -> Message:
+    return Message(
+        message_id=1,
+        date=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+        chat=Chat(id=1, type="private"),
+        from_user=User(id=user_id, is_bot=user_id == 42, first_name="x"),
+        text="Как назвать сессию?",
+    )
+
+
+def test_reply_to_our_own_prompt_is_recognised() -> None:
+    # Заявки живут в памяти: после перезапуска бота ForceReply в чате остаётся,
+    # а ждущего его нет — и молчание в ответ выглядит поломкой.
+    assert _is_own_prompt(_reply_from(42), 42) is True
+
+
+def test_reply_to_someone_else_is_not_our_business() -> None:
+    assert _is_own_prompt(_reply_from(7), 42) is False
+
+
+def test_reply_without_author_is_not_ours() -> None:
+    orphan = _reply_from(42).model_copy(update={"from_user": None})
+    assert _is_own_prompt(orphan, 42) is False

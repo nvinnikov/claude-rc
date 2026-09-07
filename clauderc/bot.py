@@ -240,6 +240,22 @@ def _died_text(died: Died) -> str:
     )
 
 
+STALE_REPLY_TEXT = "Запрос устарел — нажми кнопку ещё раз."
+
+
+def _is_own_prompt(reply: Message, bot_id: int) -> bool:
+    """Ответ пришёл на сообщение самого бота — то есть на его ForceReply.
+
+    Заявки (`name_pending`, `rename_pending`, `branch_pending`) живут в памяти
+    процесса: ForceReply плюс `reply_to_message` — и есть наш способ связать
+    ответ с вопросом. После перезапуска бота заявок нет, а ForceReply в чате
+    остался, и молчание в ответ на честно написанное имя выглядит поломкой.
+    На своё сообщение без заявки отвечаем «устарел»; на чужое по-прежнему
+    молчим — оно не к нам.
+    """
+    return reply.from_user is not None and reply.from_user.id == bot_id
+
+
 def _bypass_failed_text(exc: str) -> str:
     """Текст, когда Bypass успел погасить прежнюю сессию, но новая не поднялась.
 
@@ -1625,6 +1641,9 @@ async def main() -> None:
 
         card_id = branch_pending.pop(reply.message_id, None)
         if card_id is None:
+            # bot.id aiogram достаёт из самого токена — ни сети, ни getMe.
+            if _is_own_prompt(reply, bot.id):
+                await message.reply(STALE_REPLY_TEXT)
             return
         text = (message.text or "").strip()
         # Без обрезки длинное имя уезжает в текст кнопки «Ветка: …», и Telegram
