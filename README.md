@@ -609,9 +609,11 @@ and shaped the code:
   the fact. Two things follow. `list_sessions` recognises its own by the `rc-` prefix *or* a
   set `@rc_url`: the prefix alone would lose renamed sessions, the option alone would lose
   ones that died before printing a link. And the `Watcher` doesn't call a vanished name a
-  death while a session with the same tmux id (`#{session_id}`, `$3`) is alive — otherwise
-  every launch would report a crash. The tmux id, not the creation time: `#{session_created}`
-  is whole seconds, and `restart` kills and relaunches inside one of them.
+  death while the same instance is alive — otherwise every launch would report a crash.
+  The instance is the tmux id (`#{session_id}`, `$3`) *paired with* the creation time and
+  directory: neither alone identifies it. `#{session_created}` is whole seconds and
+  `restart` kills and relaunches inside one of them; `$N` is unique only for the tmux
+  server's lifetime, and a server that exits with its last session hands out `$0` again.
 - **`CLAUDE_CODE_*` is scrubbed inside the pane.** The tmux server may have been started
   from within Claude Code; an inherited `CLAUDE_CODE_CHILD_SESSION` starts the session with
   "Transcript saving is off" — that is, with no history.

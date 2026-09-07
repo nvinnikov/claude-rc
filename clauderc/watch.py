@@ -119,12 +119,18 @@ class Watcher:
                 continue
             # Имя пропало, но тот же экземпляр жив — значит сессию
             # переименовали, а не потеряли: `await_url` даёт ей id сессии
-            # Claude, как только тот появится. Сверяем tmux-id, а не время
-            # создания: `#{session_created}` — целые секунды, и перезапуск в ту
-            # же секунду выглядел бы переименованием, то есть настоящая смерть
-            # прошла бы молча. Переименование `$N` сохраняет, перезапуск — нет.
+            # Claude, как только тот появится. Переименование сохраняет всё
+            # три признака разом, а совпасть по всем трём у разных сессий
+            # нечему: `$N` уникален, пока жив tmux-сервер, а после его
+            # перезапуска нумерация идёт заново — тогда сессию с тем же `$0`
+            # разводит каталог или секунда создания. Одного `$N` мало ровно
+            # поэтому; одного времени создания мало потому, что оно в целых
+            # секундах и `restart` укладывается в одну.
             if session.tmux_id and any(
-                alive.tmux_id == session.tmux_id for alive in current.values()
+                alive.tmux_id == session.tmux_id
+                and same_path(alive.cwd, session.cwd)
+                and alive.created_at == session.created_at
+                for alive in current.values()
             ):
                 continue
             await on_died(Died(name=session.name, tmux_name=tmux_name, cwd=session.cwd))

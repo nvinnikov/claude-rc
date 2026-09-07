@@ -296,9 +296,10 @@ async def test_send_and_restart_against_real_tmux(
         assert fresh.label == label
         assert fresh.mode == remote.DEFAULT_PERMISSION_MODE
         assert fresh.cwd == session.cwd
-        # Ради чего всё и затевалось: перезапуск укладывается в ту же секунду,
-        # и `created_at` его не различает — различает только `#{session_id}`.
-        assert fresh.created_at - session.created_at <= 1
+        # Ради чего всё и затевалось: `created_at` идёт целыми секундами и
+        # перезапуск различает как повезёт (сравнивать его здесь значило бы
+        # гонять тест на секундомере — это делают тесты Watcher на готовых
+        # снимках), а `#{session_id}` различает всегда, пока жив сервер.
         assert fresh.tmux_id != session.tmux_id
         assert re.fullmatch(r"\$\d+", fresh.tmux_id), fresh.tmux_id
     finally:

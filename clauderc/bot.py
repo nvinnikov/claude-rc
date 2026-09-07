@@ -281,16 +281,23 @@ def _session_card(p: passport.Passport) -> str:
     return passport.as_html(p)
 
 
-def _same_session(session: RemoteSession | None, tmux_id: str) -> RemoteSession | None:
+def _same_session(
+    session: RemoteSession | None, tmux_id: str, created_at: int
+) -> RemoteSession | None:
     """Та ли это сессия, что была на карточке, когда её показывали.
 
     Каталог — ключ сессии, но не её удостоверение: прежняя могла умереть, а в том
     же каталоге подняться новая. Устаревшая кнопка Stop тогда погасила бы чужую
-    работу. Сверяем tmux-id (`$3`), а не время создания: `#{session_created}` —
-    целые секунды, и перезапуск в ту же секунду выдал бы себя за прежнюю сессию.
-    Переименование `$N` сохраняет, перезапуск — нет.
+    работу. Сверяем пару: tmux-id (`$3`) и время создания. Порознь каждого мало.
+    `#{session_created}` — целые секунды, и перезапуск в ту же секунду выдал бы
+    себя за прежнюю сессию. `$N` уникален только на время жизни tmux-сервера, а
+    если гасимая была на нём единственной, сервер уходит вместе с ней и новый
+    раздаёт `$0` заново. Совпасть по обоим признакам разным сессиям нечему,
+    а переименование сохраняет оба.
     """
-    if session is None or not tmux_id or session.tmux_id != tmux_id:
+    if session is None or not tmux_id:
+        return None
+    if session.tmux_id != tmux_id or session.created_at != created_at:
         return None
     return session
 
@@ -539,12 +546,12 @@ async def main() -> None:
     pending: dict[str, tuple[Path, str | None]] = {}
     # Сессии, которые ждут ответа на диалог доверия каталогу.
     trust_pending: dict[str, tuple[str, str]] = {}
-    # (каталог, tmux-id): каталог — ключ сессии, а `$N` отличает ту самую сессию
-    # от новой, поднятой в том же каталоге после смерти прежней. Имя не годится:
+    # (каталог, tmux-id, время создания): каталог — ключ сессии, а пара
+    # `$N` + секунда отличает ту самую сессию от новой, поднятой в том же
+    # каталоге после смерти прежней (см. `_same_session`). Имя не годится:
     # `await_url` переименовывает сессию в её id, и запомненное имя перестаёт
-    # существовать. Время создания не годится тоже: оно в целых секундах, и
-    # перезапуск укладывается в одну. Переименование `$N` сохраняет, перезапуск — нет.
-    card_pending: dict[str, tuple[str, str]] = {}
+    # существовать; переименование же обоих признаков не меняет.
+    card_pending: dict[str, tuple[str, str, int]] = {}
     tree_pending: dict[str, Path] = {}
     # Значение — (id карточки, выбор): выбор любого варианта гасит остальные
     # токены той же карточки, чтобы два тапа не подняли две сессии в одном каталоге.
@@ -577,9 +584,9 @@ async def main() -> None:
     # и чужой текст в имя не попадёт.
     name_pending: dict[int, LaunchRequest] = {}
     # Ключ — id сообщения с запросом нового имени (ForceReply), значение — та же
-    # пара (каталог, tmux-id), что и у card_pending: имя сессии меняется у неё
-    # под ногами, поэтому саму сессию добываем заново через _same_session.
-    rename_pending: dict[int, tuple[str, str]] = {}
+    # тройка, что и у card_pending: имя сессии меняется у неё под ногами,
+    # поэтому саму сессию добываем заново через _same_session.
+    rename_pending: dict[int, tuple[str, str, int]] = {}
 
     async def offer_trust(message: Message, need: TrustRequired) -> None:
         token = uuid.uuid4().hex[:8]
@@ -613,7 +620,11 @@ async def main() -> None:
             # Полный пульт, а не одна ссылка: сессия та же самая, и Bypass,
             # Tail и Rename нужны здесь ровно так же, как на карточке запуска.
             token = uuid.uuid4().hex[:8]
-            card_pending[token] = (os.path.realpath(alive_here.cwd), alive_here.tmux_id)
+            card_pending[token] = (
+                os.path.realpath(alive_here.cwd),
+                alive_here.tmux_id,
+                alive_here.created_at,
+            )
             await notice.edit_text(
                 f"Уже поднята.\n"
                 f"{_session_card(passport.build(alive_here, host=config.host, tree=None))}",
@@ -654,7 +665,11 @@ async def main() -> None:
         alive = await find(str(cwd))
         if alive is not None:
             token = uuid.uuid4().hex[:8]
-            card_pending[token] = (os.path.realpath(alive.cwd), alive.tmux_id)
+            card_pending[token] = (
+                os.path.realpath(alive.cwd),
+                alive.tmux_id,
+                alive.created_at,
+            )
             await notice.edit_text(
                 told(
                     f"Уже поднята.\n"
@@ -700,7 +715,11 @@ async def main() -> None:
             return
 
         token = uuid.uuid4().hex[:8]
-        card_pending[token] = (os.path.realpath(session.cwd), session.tmux_id)
+        card_pending[token] = (
+            os.path.realpath(session.cwd),
+            session.tmux_id,
+            session.created_at,
+        )
         await notice.edit_text(
             told(
                 f"✅ Сессия поднята\n"
@@ -783,7 +802,7 @@ async def main() -> None:
             # за лимит выходит легко. Но держим именно путь, а не имя: имя сессии
             # меняется у неё под ногами — `await_url` переименовывает её в id, как
             # только появится ссылка, и запомненное имя перестало бы существовать.
-            card_pending[token] = (real, session.tmux_id)
+            card_pending[token] = (real, session.tmux_id, session.created_at)
             # Без внешнего отреза: карточка ограничена по построению — строки
             # паспорта плюс хвост панели, который `pre_block` держит в 1500
             # экранированных символов. А срез готовой строки уносил бы
@@ -1267,8 +1286,8 @@ async def main() -> None:
         if pending is None:
             await query.answer("Карточка устарела")
             return None, message
-        cwd, tmux_id = pending
-        session = _same_session(await find(cwd), tmux_id)
+        cwd, tmux_id, created_at = pending
+        session = _same_session(await find(cwd), tmux_id, created_at)
         if session is None:
             await query.answer("Сессия уже не жива")
         return session, message
@@ -1285,9 +1304,9 @@ async def main() -> None:
                 await message.edit_reply_markup(reply_markup=None)
             return
 
-        cwd, tmux_id = pending
+        cwd, tmux_id, created_at = pending
         # Имя берём заново: с момента показа карточки сессию могли переименовать.
-        session = _same_session(await find(cwd), tmux_id)
+        session = _same_session(await find(cwd), tmux_id, created_at)
         killed = session is not None and await watcher.kill(
             session.tmux_name, session.cwd, session.tmux_id
         )
@@ -1356,7 +1375,11 @@ async def main() -> None:
             await offer_trust(message, need)
             return
         token = uuid.uuid4().hex[:8]
-        card_pending[token] = (os.path.realpath(fresh.cwd), fresh.tmux_id)
+        card_pending[token] = (
+            os.path.realpath(fresh.cwd),
+            fresh.tmux_id,
+            fresh.created_at,
+        )
         await message.answer(
             "🔓 Переоткрыта с bypassPermissions\n"
             + _session_card(passport.build(fresh, host=config.host, tree=None)),
@@ -1402,7 +1425,11 @@ async def main() -> None:
                 force_reply=True, selective=True, input_field_placeholder="имя сессии"
             ),
         )
-        rename_pending[prompt.message_id] = (os.path.realpath(session.cwd), session.tmux_id)
+        rename_pending[prompt.message_id] = (
+            os.path.realpath(session.cwd),
+            session.tmux_id,
+            session.created_at,
+        )
 
     @dp.callback_query(F.data.startswith("jump:"))
     async def on_jump(query: CallbackQuery) -> None:
@@ -1636,8 +1663,8 @@ async def main() -> None:
 
         renaming = rename_pending.pop(reply.message_id, None)
         if renaming is not None:
-            cwd, tmux_id = renaming
-            session = _same_session(await find(cwd), tmux_id)
+            cwd, tmux_id, created_at = renaming
+            session = _same_session(await find(cwd), tmux_id, created_at)
             if session is None:
                 await message.reply("Сессия уже не жива.")
                 return

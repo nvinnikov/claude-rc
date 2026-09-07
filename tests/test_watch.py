@@ -489,3 +489,52 @@ async def test_kill_does_not_erase_a_session_in_another_directory(
     await watcher.poll(on_died)
 
     assert [d.tmux_name for d in seen] == ["rc-b"]
+
+
+async def test_repeated_tmux_id_elsewhere_is_not_mistaken_for_a_rename(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`$N` уникален только на время жизни tmux-сервера.
+
+    Умерла последняя сессия — сервер ушёл вместе с ней, и новый раздаёт `$0`
+    заново, уже в другом каталоге. По одному id смерть первой выглядела бы
+    переименованием второй и до человека не доехала бы.
+    """
+    gone = RemoteSession(
+        name="a",
+        tmux_name="rc-a",
+        cwd="/repos/a",
+        url="https://x",
+        created_at=1000,
+        tmux_id="$0",
+    )
+    other = RemoteSession(
+        name="b",
+        tmux_name="rc-b",
+        cwd="/repos/b",
+        url="https://y",
+        created_at=2000,
+        tmux_id="$0",
+    )
+    _sessions(monkeypatch, [gone], [other])
+    (died,) = await _collect(Watcher(), 2)
+
+    assert died == Died(name="a", tmux_name="rc-a", cwd="/repos/a")
+
+
+async def test_rename_keeps_all_three_marks_of_the_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Настоящее переименование: id, каталог и время создания те же, ново только имя.
+    old = _session("oms", "/repos/oms", "$3")
+    renamed = RemoteSession(
+        name="oms@x",
+        tmux_name="session_01ABC",
+        cwd="/repos/oms",
+        url="https://x",
+        created_at=old.created_at,
+        tmux_id="$3",
+    )
+    _sessions(monkeypatch, [old], [renamed])
+
+    assert await _collect(Watcher(), 2) == []

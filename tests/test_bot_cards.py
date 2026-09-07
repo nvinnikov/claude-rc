@@ -334,18 +334,24 @@ def test_session_card_is_the_passport_html() -> None:
 
 def test_same_session_recognises_the_session_from_the_card() -> None:
     session = _session()
-    assert _same_session(session, session.tmux_id) is session
+    assert _same_session(session, session.tmux_id, session.created_at) is session
+
+
+def test_same_session_survives_a_rename() -> None:
+    # `await_url` переименовывает сессию в её id — оба признака это сохраняют.
+    session = _session()
+    renamed = dataclasses.replace(session, tmux_name="session_01ABC", name="oms@x")
+    assert _same_session(renamed, session.tmux_id, session.created_at) is renamed
 
 
 def test_same_session_rejects_a_relaunch_in_the_same_directory() -> None:
     """Устаревшая кнопка Stop не имеет права погасить чужую работу.
 
     Каталог — ключ сессии, но не удостоверение: прежняя могла умереть, а в том
-    же каталоге подняться новая. Время создания их не различает — оно в целых
-    секундах, а `restart` укладывается в одну; `$N` не переиспользуется.
+    же каталоге подняться новая.
     """
     session = _session()
-    assert _same_session(session, "$2") is None
+    assert _same_session(session, "$2", session.created_at) is None
 
 
 def test_same_session_rejects_a_relaunch_in_the_very_same_second() -> None:
@@ -353,11 +359,21 @@ def test_same_session_rejects_a_relaunch_in_the_very_same_second() -> None:
     session = _session()
     fresh = dataclasses.replace(session, tmux_id="$7")
     assert fresh.created_at == session.created_at
-    assert _same_session(fresh, session.tmux_id) is None
+    assert _same_session(fresh, session.tmux_id, session.created_at) is None
+
+
+def test_same_session_rejects_a_repeated_tmux_id_after_a_server_restart() -> None:
+    # `$N` уникален только на время жизни tmux-сервера: погасив последнюю
+    # сессию, мы уносим сервер, и новый раздаёт `$0` заново. Разводит их
+    # время создания — сессия поднята уже позже.
+    session = _session()
+    fresh = dataclasses.replace(session, created_at=session.created_at + 30)
+    assert fresh.tmux_id == session.tmux_id
+    assert _same_session(fresh, session.tmux_id, session.created_at) is None
 
 
 def test_same_session_handles_a_directory_with_no_session() -> None:
-    assert _same_session(None, "$1") is None
+    assert _same_session(None, "$1", 1000) is None
 
 
 def test_pull_line_reports_what_the_pull_did() -> None:
