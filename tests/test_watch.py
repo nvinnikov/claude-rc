@@ -353,11 +353,13 @@ async def test_restart_does_not_swallow_the_next_death(
     )
     # Время создания у перезапуска то же: `#{session_created}` — целые секунды,
     # а гашение с запуском в одну укладываются. Различает экземпляры только `$N`.
+    # Имя тоже то же: `restart` идёт через `--resume`, claude печатает ту же
+    # ссылку, и `await_url` возвращает сессии прежний `session_…`.
     fresh = RemoteSession(
         name="oms",
-        tmux_name="rc-oms",
+        tmux_name="session_01A",
         cwd="/repos/oms",
-        url="",
+        url="https://x",
         created_at=1000,
         tmux_id="$2",
     )
@@ -380,7 +382,54 @@ async def test_restart_does_not_swallow_the_next_death(
     assert seen == []
     await watcher.poll(on_died)  # падение новой — отчёт
 
-    assert [d.tmux_name for d in seen] == ["rc-oms"]
+    assert [d.tmux_name for d in seen] == ["session_01A"]
+
+
+async def test_resume_returning_the_same_name_still_reports_the_next_death(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Метка по одному имени переживала бы перезапуск и глушила падение навсегда.
+
+    `--resume` возвращает перезапущенной сессии тот же `session_…`, поэтому имя
+    из метки снова стоит в снимке — вычистить метку «по отсутствию имени»
+    нечему. Отличается только экземпляр, по нему метка и снимается.
+    """
+
+    async def fake_kill(tmux_name: str) -> bool:
+        return True
+
+    monkeypatch.setattr(watch, "kill_tmux", fake_kill)
+    old = RemoteSession(
+        name="oms",
+        tmux_name="session_01A",
+        cwd="/repos/oms",
+        url="https://x",
+        created_at=1000,
+        tmux_id="$1",
+    )
+    fresh = RemoteSession(
+        name="oms",
+        tmux_name="session_01A",
+        cwd="/repos/oms",
+        url="https://x",
+        created_at=1001,
+        tmux_id="$2",
+    )
+    _sessions(monkeypatch, [old], [fresh], [])
+
+    watcher = Watcher()
+    seen: list[Died] = []
+
+    async def on_died(died: Died) -> None:
+        seen.append(died)
+
+    await watcher.poll(on_died)
+    assert await watcher.kill(old.tmux_name, old.cwd, old.tmux_id) is True
+    await watcher.poll(on_died)  # то же имя, другой экземпляр — молчим
+    assert seen == []
+    await watcher.poll(on_died)
+
+    assert seen == [Died(name="oms", tmux_name="session_01A", cwd="/repos/oms")]
 
 
 async def test_kill_with_instance_still_silences_a_plain_death(

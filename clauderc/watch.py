@@ -39,7 +39,11 @@ class Watcher:
     def __init__(self, *, poll_s: float = POLL_S) -> None:
         self._poll_s = poll_s
         self._known: dict[str, RemoteSession] | None = None
-        self._expected: set[str] = set()
+        # Имя → tmux-id того экземпляра, чью смерть ждём (None — экземпляр
+        # неизвестен). Без экземпляра метка липнет к имени, а имя переживает
+        # сессию: `--resume` возвращает перезапущенной тот же `session_…`,
+        # и метка от прежней проглотила бы первое настоящее падение новой.
+        self._expected: dict[str, str | None] = {}
 
     def _forget(self, cwd: str | None, tmux_id: str | None) -> None:
         """Вычёркивает погашенную сессию из базового снимка.
@@ -68,7 +72,7 @@ class Watcher:
         self, tmux_name: str, cwd: str | None = None, tmux_id: str | None = None
     ) -> None:
         """Помечает смерть ожидаемой, не гася сессию: её уже погасил кто-то другой."""
-        self._expected.add(tmux_name)
+        self._expected[tmux_name] = tmux_id or None
         self._forget(cwd, tmux_id or None)
 
     async def kill(
@@ -83,16 +87,17 @@ class Watcher:
 
         Из снимка вычёркиваем только после удачного гашения: `_forget` на живой
         сессии стёр бы из базы то, чему ещё предстоит умереть, и настоящее
-        падение прошло бы молча. Метка по имени остаётся страховкой на гонку —
-        `poll` мог запросить `list-sessions` до гашения, а разложить ответ по
-        снимку уже после, и тогда погашенная сессия попадёт в снимок живой.
+        падение прошло бы молча. Метка (имя вместе с экземпляром) остаётся
+        страховкой на гонку — `poll` мог запросить `list-sessions` до гашения, а
+        разложить ответ по снимку уже после, и тогда погашенная сессия попадёт в
+        снимок живой.
         """
-        self._expected.add(tmux_name)
+        self._expected[tmux_name] = tmux_id or None
         killed = await kill_tmux(tmux_name)
         if not killed:
             # Гашение не удалось — сессия жива, а метка на живой сессии переживёт
             # её и проглотит настоящее падение. Одноразовость важнее лишней карточки.
-            self._expected.discard(tmux_name)
+            self._expected.pop(tmux_name, None)
             return False
         self._forget(cwd, tmux_id or None)
         return True
@@ -107,10 +112,23 @@ class Watcher:
         current = {s.tmux_name: s for s in await list_sessions()}
         previous, self._known = self._known, current
 
-        # Метка по имени живёт, только пока жива сессия: иначе неудавшееся гашение
-        # оставило бы вечное «не сообщать», и настоящее падение прошло бы молча.
-        expected_gone = self._expected - set(current)
-        self._expected &= set(current)
+        # Метка живёт, только пока под её именем стоит тот самый экземпляр.
+        # Имени мало: `actions.restart` поднимает сессию через `--resume`, та
+        # печатает ту же ссылку, и `await_url` переименовывает её обратно в тот
+        # же `session_…` — имя снова в снимке, и метка от прежней осталась бы
+        # навсегда, проглотив первое настоящее падение перезапущенной. Метка без
+        # экземпляра (tmux-id неизвестен) живёт по-старому, по одному имени.
+        expected_gone: set[str] = set()
+        remaining: dict[str, str | None] = {}
+        for tmux_name, tmux_id in self._expected.items():
+            alive = current.get(tmux_name)
+            if alive is None:
+                expected_gone.add(tmux_name)
+                continue
+            if tmux_id is not None and alive.tmux_id != tmux_id:
+                continue  # под именем уже другой экземпляр — метка своё отслужила
+            remaining[tmux_name] = tmux_id
+        self._expected = remaining
 
         # previous is None — первый снимок базовый: что бы в нём ни было,
         # падений ещё не видели.
