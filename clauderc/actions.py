@@ -18,9 +18,11 @@ from clauderc.worktrees import clean_name
 LABEL_OPTION = "@rc_label"
 _UNKNOWN_COMMAND = re.compile(r"Unknown (?:slash )?command", re.IGNORECASE)
 
-# (tmux_name, cwd) -> погашена ли; в боте — Watcher.kill, в CLI — обёртка над
-# remote.kill_tmux. Гашение чужое: сам restart сессию не трогает, чтобы
-# намеренная смерть не доехала до человека карточкой «сессия упала».
+# (tmux_name, cwd) -> погашена ли; в боте — замыкание над Watcher.kill, в CLI —
+# обёртка над remote.kill_tmux. Гашение чужое: сам restart сессию не трогает,
+# чтобы намеренная смерть не доехала до человека карточкой «сессия упала».
+# Экземпляр сессии (`created_at`) в сигнатуру не входит: он нужен только метке
+# Watcher, а `restart` о ней не знает — бот подставляет его замыканием.
 Killer = Callable[[str, str], Awaitable[bool]]
 _SESSION_PREFIX = "session_"
 

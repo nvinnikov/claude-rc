@@ -287,3 +287,70 @@ async def test_kill_after_a_rename_is_still_silent(monkeypatch: pytest.MonkeyPat
     await watcher.poll(on_died)
 
     assert seen == []
+
+
+async def test_restart_mark_does_not_swallow_the_next_death(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Метка гашения привязана к экземпляру, а не к каталогу.
+
+    `actions.restart` гасит сессию и поднимает новую в том же каталоге через
+    миллисекунды. Метка «по каталогу» пережила бы перезапуск (каталог-то жив) и
+    проглотила бы первое настоящее падение уже перезапущенной сессии.
+    """
+
+    async def fake_kill(tmux_name: str) -> bool:
+        return True
+
+    monkeypatch.setattr(watch, "kill_tmux", fake_kill)
+    old = RemoteSession(
+        name="oms", tmux_name="session_01A", cwd="/repos/oms", url="https://x", created_at=1000
+    )
+    fresh = RemoteSession(name="oms", tmux_name="rc-oms", cwd="/repos/oms", url="", created_at=2000)
+    _sessions(
+        monkeypatch,
+        [old],  # базовый
+        [fresh],  # погасили и тут же подняли заново
+        [],  # новая сессия упала сама
+    )
+
+    watcher = Watcher()
+    seen: list[Died] = []
+
+    async def on_died(died: Died) -> None:
+        seen.append(died)
+
+    await watcher.poll(on_died)
+    assert await watcher.kill(old.tmux_name, old.cwd, old.created_at) is True
+    await watcher.poll(on_died)  # смерть прежней — ожидаемая, молчим
+    assert seen == []
+    await watcher.poll(on_died)  # падение новой — отчёт
+
+    assert [d.tmux_name for d in seen] == ["rc-oms"]
+
+
+async def test_kill_with_instance_still_silences_a_plain_death(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Обычное гашение без перезапуска: метка с экземпляром работает как прежняя.
+    async def fake_kill(tmux_name: str) -> bool:
+        return True
+
+    monkeypatch.setattr(watch, "kill_tmux", fake_kill)
+    renamed = RemoteSession(
+        name="oms", tmux_name="session_01ABC", cwd="/repos/oms", url="https://x", created_at=0
+    )
+    _sessions(monkeypatch, [_session("oms", "/repos/oms")], [renamed], [])
+
+    watcher = Watcher()
+    seen: list[Died] = []
+
+    async def on_died(died: Died) -> None:
+        seen.append(died)
+
+    await watcher.poll(on_died)  # запомнили rc-oms
+    await watcher.kill("session_01ABC", "/repos/oms", 0)
+    await watcher.poll(on_died)
+    await watcher.poll(on_died)
+
+    assert seen == []

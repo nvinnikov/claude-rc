@@ -25,6 +25,17 @@ POLL_S = 15.0
 
 OnDied = Callable[["Died"], Awaitable[None]]
 
+# Метка ожидаемой смерти: каталог сессии и время её создания. Каталог — потому
+# что имя меняется у сессии под ногами (`await_url` даёт ей id Claude), и
+# снятая поллером под прежним именем сессия не совпала бы с меткой,
+# поставленной под новым. Время создания — потому что каталога мало: `restart`
+# поднимает в том же каталоге новую сессию через миллисекунды, и метка «по
+# каталогу» пережила бы её и проглотила первое настоящее падение уже
+# перезапущенной. `None` вместо времени — «экземпляр неизвестен» (сессия не
+# дожила до ссылки, спросить её `created_at` не у кого): такая метка работает
+# по каталогу, как раньше.
+Mark = tuple[str, int | None]
+
 
 @dataclass(frozen=True)
 class Died:
@@ -40,41 +51,54 @@ class Watcher:
         self._poll_s = poll_s
         self._known: dict[str, RemoteSession] | None = None
         self._expected: set[str] = set()
-        # Метка по каталогу рядом с меткой по имени: имя меняется у сессии под
-        # ногами (`await_url` даёт ей id Claude), и снятая поллером под старым
-        # именем сессия не совпала бы с меткой, поставленной под новым, — то
-        # есть намеренное гашение доехало бы карточкой «сессия завершилась».
-        self._expected_paths: set[str] = set()
+        self._marks: set[Mark] = set()
 
-    def expect_death(self, tmux_name: str, cwd: str | None = None) -> None:
+    def expect_death(
+        self, tmux_name: str, cwd: str | None = None, created_at: int | None = None
+    ) -> None:
         """Помечает смерть ожидаемой, не гася сессию: её уже погасил кто-то другой."""
         self._expected.add(tmux_name)
         if cwd is not None:
-            self._expected_paths.add(cwd)
+            self._marks.add((cwd, created_at))
 
-    async def kill(self, tmux_name: str, cwd: str | None = None) -> bool:
+    async def kill(
+        self, tmux_name: str, cwd: str | None = None, created_at: int | None = None
+    ) -> bool:
         """Гасит сессию, пометив смерть ожидаемой.
 
-        `cwd` стоит передавать всегда, когда он известен: имя сессии меняется
-        под ногами, и метка только по нему не совпадёт с тем, что поллер снял
-        под прежним именем. Все вызывающие сессию уже держат — спрашивать tmux
-        второй раз незачем.
+        `cwd` и `created_at` стоит передавать всегда, когда они известны: имя
+        сессии меняется под ногами, а один каталог не отличает погашенную
+        сессию от поднятой на её месте (см. `Mark`). Все вызывающие сессию уже
+        держат — спрашивать tmux второй раз незачем.
         """
-        self.expect_death(tmux_name, cwd)
+        self.expect_death(tmux_name, cwd, created_at)
         killed = await kill_tmux(tmux_name)
         if not killed:
             # Гашение не удалось — сессия жива, а метка на живой сессии переживёт
             # её и проглотит настоящее падение. Одноразовость важнее лишней карточки.
             self._expected.discard(tmux_name)
             if cwd is not None:
-                self._expected_paths.discard(cwd)
+                self._marks.discard((cwd, created_at))
         return killed
 
     async def kill_all(self) -> int:
         killed = 0
         for session in await list_sessions():
-            killed += await self.kill(session.tmux_name, session.cwd)
+            killed += await self.kill(session.tmux_name, session.cwd, session.created_at)
         return killed
+
+    @staticmethod
+    def _matches(mark: Mark, session: RemoteSession) -> bool:
+        path, instance = mark
+        return same_path(path, session.cwd) and instance in (None, session.created_at)
+
+    def _take_mark(self, session: RemoteSession) -> bool:
+        """Снимает метку, если она про эту сессию. Метка одноразовая."""
+        found = next((m for m in self._marks if self._matches(m, session)), None)
+        if found is None:
+            return False
+        self._marks.discard(found)
+        return True
 
     async def poll(self, on_died: OnDied) -> None:
         current = {s.tmux_name: s for s in await list_sessions()}
@@ -84,22 +108,12 @@ class Watcher:
         # вечное «не сообщать», и настоящее падение прошло бы молча.
         expected_gone = self._expected - set(current)
         self._expected &= set(current)
-        # Тот же расчёт для меток по каталогу: живой каталог метку не тратит.
-        paths_gone = {
-            path
-            for path in self._expected_paths
-            if not any(same_path(alive.cwd, path) for alive in current.values())
-        }
-        self._expected_paths -= paths_gone
 
-        if previous is None:
-            return  # первый снимок базовый: что бы в нём ни было, падений ещё не видели
-
-        for tmux_name, session in previous.items():
-            if tmux_name in current or tmux_name in expected_gone:
+        # previous is None — первый снимок базовый: что бы в нём ни было,
+        # падений ещё не видели.
+        for tmux_name, session in (previous or {}).items():
+            if tmux_name in current:
                 continue
-            if any(same_path(session.cwd, path) for path in paths_gone):
-                continue  # погасили намеренно, пусть и под другим именем
             # Имя пропало, но сессия в том же каталоге и той же давности жива —
             # значит её переименовали, а не потеряли: `await_url` даёт ей id
             # сессии Claude, как только тот появится. Одного каталога мало:
@@ -111,7 +125,18 @@ class Watcher:
                 for alive in current.values()
             ):
                 continue
+            if tmux_name in expected_gone or self._take_mark(session):
+                continue  # погасили намеренно, пусть и под другим именем
             await on_died(Died(name=session.name, tmux_name=tmux_name, cwd=session.cwd))
+
+        # Тот же расчёт одноразовости, что у меток по имени, но после разбора
+        # снимка: метка, погасившая отчёт, уже снята выше, а из оставшихся
+        # выживают только те, чей экземпляр ещё жив.
+        self._marks = {
+            mark
+            for mark in self._marks
+            if any(self._matches(mark, alive) for alive in current.values())
+        }
 
     async def run(self, on_died: OnDied) -> None:
         while True:

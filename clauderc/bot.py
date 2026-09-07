@@ -1084,7 +1084,7 @@ async def main() -> None:
                 f"Таких сессий несколько — назови id:\n{listing}", parse_mode="HTML"
             )
             return
-        if await watcher.kill(matches[0].tmux_name, matches[0].cwd):
+        if await watcher.kill(matches[0].tmux_name, matches[0].cwd, matches[0].created_at):
             # Называем найденное, а не набранное: на `/rckill ~/code/oms` ответ
             # «Сессия ~/code/oms погашена» — про путь, а не про сессию.
             # Worktree намеренно остаётся: в нём может лежать несохранённая работа.
@@ -1139,7 +1139,7 @@ async def main() -> None:
         # Сессия держит этот каталог: не погасив её, оставим Claude в исчезнувшем cwd.
         session = await find(str(path))
         if session is not None:
-            await watcher.kill(session.tmux_name, session.cwd)
+            await watcher.kill(session.tmux_name, session.cwd, session.created_at)
 
         try:
             await worktrees.remove(config.worktree_root, name, force=force)
@@ -1213,7 +1213,7 @@ async def main() -> None:
         # Сессия могла подняться уже после показа карточки.
         session = await find(str(path))
         if session is not None:
-            await watcher.kill(session.tmux_name, session.cwd)
+            await watcher.kill(session.tmux_name, session.cwd, session.created_at)
         try:
             await worktrees.remove(config.worktree_root, path.name, force=forced)
         except WorktreeError as exc:
@@ -1261,7 +1261,9 @@ async def main() -> None:
         cwd, created_at = pending
         # Имя берём заново: с момента показа карточки сессию могли переименовать.
         session = _same_session(await find(cwd), created_at)
-        killed = session is not None and await watcher.kill(session.tmux_name, session.cwd)
+        killed = session is not None and await watcher.kill(
+            session.tmux_name, session.cwd, session.created_at
+        )
         await query.answer("Погашена" if killed else "Уже не жива")
         if message is None:
             return
@@ -1282,10 +1284,22 @@ async def main() -> None:
         if session is None or message is None:
             return
         await query.answer("Переоткрываю…")
+
+        async def kill_this(tmux_name: str, cwd: str) -> bool:
+            """Гасит именно тот экземпляр, что держит хендлер.
+
+            `created_at` подставляем замыканием, а не расширяем `Killer`:
+            `actions.restart` про Watcher ничего не знает и знать не должен.
+            Без экземпляра метка осталась бы «по каталогу» — а перезапуск
+            поднимает новую сессию в том же каталоге через миллисекунды, и
+            такая метка проглотила бы её первое настоящее падение.
+            """
+            return await watcher.kill(tmux_name, cwd, session.created_at)
+
         try:
             fresh = await actions.restart(
                 session,
-                kill=watcher.kill,
+                kill=kill_this,
                 mode="bypassPermissions",
                 timeout_s=config.launch_timeout_s,
             )
