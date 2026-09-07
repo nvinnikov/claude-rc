@@ -4,6 +4,10 @@ from pathlib import Path
 import pytest
 from clauderc import forward
 
+# Настоящий `_is_ssh`: автофикстура ниже подменяет модульный атрибут, и тесты
+# самой проверки должны звать оригинал, а не заглушку.
+_real_is_ssh = forward._is_ssh
+
 
 @pytest.fixture
 def pid_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -15,6 +19,12 @@ def pid_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def _no_settle_delay(monkeypatch: pytest.MonkeyPatch) -> None:
     """`start()` спит `_SETTLE_S` перед `poll()` — тестам ждать незачем."""
     monkeypatch.setattr(forward.time, "sleep", lambda seconds: None)
+
+
+@pytest.fixture(autouse=True)
+def _pid_is_ssh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """По умолчанию pid из файла считаем настоящим ssh: `ps` в тестах не зовём."""
+    monkeypatch.setattr(forward, "_is_ssh", lambda pid: True)
 
 
 class _FakeProc:
@@ -152,3 +162,45 @@ def test_start_still_refuses_a_host_that_looks_like_an_ssh_option(pid_dir: Path)
     # уедет в argv ssh как опция.
     with pytest.raises(forward.ForwardError, match="хоста"):
         forward.start("-oProxyCommand=x@m1", [3000])
+
+
+def test_stop_does_not_kill_a_reused_pid(monkeypatch: pytest.MonkeyPatch, pid_dir: Path) -> None:
+    # ssh умер сам, а его pid занял чужой процесс: SIGTERM ушёл бы не туда.
+    # Туннеля нет, значит и файл — протухшая запись, её убираем.
+    (pid_dir / "m1-3000.pid").write_text("4242")
+    killed: list[int] = []
+    monkeypatch.setattr(forward, "_is_ssh", lambda pid: False)
+    monkeypatch.setattr(forward.os, "kill", lambda pid, sig: killed.append(pid))
+
+    assert forward.stop("m1") == []
+    assert killed == []
+    assert not (pid_dir / "m1-3000.pid").exists()
+
+
+def test_is_ssh_reads_the_command_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeCompleted:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    seen: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kw: object) -> FakeCompleted:
+        seen.append(argv)
+        return FakeCompleted(reply["out"])
+
+    reply = {"out": "/usr/bin/ssh\n"}
+    monkeypatch.setattr(forward.subprocess, "run", fake_run)
+    assert _real_is_ssh(4242) is True
+    assert seen == [["ps", "-p", "4242", "-o", "comm="]]
+
+    reply["out"] = "postgres\n"
+    assert _real_is_ssh(4242) is False
+
+
+def test_is_ssh_is_false_when_ps_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Без ответа ps уверенности, что это ssh, нет — значит не гасим.
+    def fake_run(argv: list[str], **kw: object) -> None:
+        raise OSError("ps нет")
+
+    monkeypatch.setattr(forward.subprocess, "run", fake_run)
+    assert _real_is_ssh(4242) is False

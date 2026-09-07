@@ -44,6 +44,28 @@ def _check_host(host: str) -> None:
         raise ForwardError(f"недопустимое имя хоста: {host}")
 
 
+def _is_ssh(pid: int) -> bool:
+    """Тот ли это процесс, чей pid мы записали.
+
+    ssh мог умереть сам (оборвалась сеть), pid-файл при этом остаётся, а pid
+    к следующему `--stop` занимает кто угодно. `ProcessLookupError` такой случай
+    не ловит — процесс-то есть. Спрашиваем имя команды и снимаем только ssh;
+    всё остальное значит, что туннеля давно нет, а файл протух.
+    """
+    try:
+        done = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # ps нет или не ответил — уверенности, что это ssh, нет тем более.
+        return False
+    return os.path.basename(done.stdout.strip()) == "ssh"
+
+
 def pid_dir() -> Path:
     return Path(os.environ.get(PID_DIR_ENV) or _DEFAULT_DIR).expanduser()
 
@@ -112,6 +134,11 @@ def stop(host: str, ports: list[int] | None = None) -> list[Forward]:
     denied: list[int] = []
     for f in active():
         if f.host != host or (ports is not None and f.port not in ports):
+            continue
+        if not _is_ssh(f.pid):
+            # pid занят не ssh: туннеля нет, а SIGTERM ушёл бы чужому процессу.
+            # Файл убираем — он и есть протухшая запись.
+            _pid_file(f.host, f.port).unlink(missing_ok=True)
             continue
         try:
             os.kill(f.pid, signal.SIGTERM)
