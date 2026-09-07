@@ -756,10 +756,16 @@ def _remote_ports(host: str, target: str) -> list[int] | None:
         print(f"ssh {host}: непонятный ответ: {out.strip()}", file=sys.stderr)
         return None
     wanted = target.strip()
+    # Правило совпадения — то же, что у `remote.resolve` на той стороне: голое
+    # имя репозитория (`oms` при ярлыке `oms@wt/x`) человек набирает по
+    # привычке, и `forward` не должен отвечать «не найдена» там, где `send` и
+    # `stop` находят. Неоднозначность решается ниже — списком, а не выбором
+    # за человека.
     hits = [
         s
         for s in sessions
         if wanted in {s.get("label"), s.get("tmux_name"), s.get("cwd"), s.get("name")}
+        or str(s.get("label", "")).split("@", 1)[0] == wanted
     ]
     if len(hits) != 1:
         print("Сессия не найдена или их несколько:", file=sys.stderr)

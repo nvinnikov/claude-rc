@@ -2632,6 +2632,8 @@ def test_forward_stop(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFix
 def test_forward_ambiguous_target_lists_matches(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # Голое имя репозитория подходит обеим сессиям — как и в `remote.resolve`.
+    # Выбирать за человека, к какой из них строить туннель, нельзя.
     payload = json.dumps(
         {
             "sessions": [
@@ -2697,3 +2699,34 @@ def test_forward_stop_nothing_active(
     monkeypatch.setattr(cli.forward, "stop", fake_stop)
     assert cli.main(["--host", "m1", "forward", "oms", "--stop"]) == 0
     assert "Туннелей к m1 нет." in capsys.readouterr().out
+
+
+def test_forward_accepts_a_bare_repo_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `remote.resolve` голое имя репозитория принимает; forward отвечал на него
+    # «не найдена» и расходился с `send`/`stop` на тех же данных.
+    payload = json.dumps(
+        {
+            "sessions": [
+                {
+                    "label": "oms@wt/x",
+                    "cwd": "/r/oms",
+                    "tmux_name": "session_A",
+                    "listening": [3000],
+                }
+            ]
+        }
+    )
+
+    def fake_run_remote(host: str, args: list[str], **kw: object) -> tuple[int, str]:
+        return 0, payload
+
+    monkeypatch.setattr(cli.proxy, "run_remote", fake_run_remote)
+    seen: dict[str, Any] = {}
+
+    def fake_start(host: str, ports: list[int]) -> list[cli.forward.Forward]:
+        seen.update(ports=ports)
+        return []
+
+    monkeypatch.setattr(cli.forward, "start", fake_start)
+    assert cli.main(["--host", "m1", "forward", "oms"]) == 0
+    assert seen["ports"] == [3000]
