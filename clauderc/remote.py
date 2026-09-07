@@ -197,6 +197,11 @@ async def list_sessions() -> list[RemoteSession]:
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) != 6:
+            # Молча пропущенная строка — исчезнувшая сессия: её не найдёт ни
+            # `find`, ни `resolve`, а Watcher отчитается о смерти. Ярлык чистим
+            # (`worktrees.clean_name`), так что это уже не должно случаться —
+            # но если случилось, в логе должно остаться, из-за чего.
+            log.warning("list-sessions: строка с %d полями вместо 6: %r", len(parts), line)
             continue
         tmux_name, path, created, url, label, mode = parts
         # Наши сессии — либо ещё не переименованные (префикс), либо уже

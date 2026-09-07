@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import subprocess
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
@@ -831,3 +832,18 @@ async def test_find_enclosing_stops_at_the_root(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, row)))
 
     assert await remote.find_enclosing("/elsewhere/deep") is None
+
+
+async def test_list_sessions_warns_about_an_unparsable_row(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Таб в ярлыке добавляет седьмое поле: строка не разбирается, сессия
+    # выпадает из списка — молчать об этом нельзя, иначе искать нечего.
+    row = "session_A\t/repos/oms\t1700000000\thttps://x\toms@a\tb\t"
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, row)))
+
+    with caplog.at_level(logging.WARNING, logger="clauderc.remote"):
+        assert await remote.list_sessions() == []
+
+    assert "list-sessions" in caplog.text
+    assert "oms@a" in caplog.text

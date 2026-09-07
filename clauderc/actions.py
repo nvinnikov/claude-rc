@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from clauderc import remote as remote  # тесты подменяют actions.remote.launch
 from clauderc.remote import RemoteSession
+from clauderc.worktrees import clean_name
 
 LABEL_OPTION = "@rc_label"
 _UNKNOWN_COMMAND = re.compile(r"Unknown (?:slash )?command", re.IGNORECASE)
@@ -85,15 +86,20 @@ def _repo_of(session: RemoteSession) -> str:
 async def rename(session: RemoteSession, name: str, *, settle_s: float = 1.5) -> RenameResult:
     """Новый ярлык `repo@name`: в tmux всегда, в приложении — если claude знает /rename.
 
-    Ветку и каталог не трогает: они git, а не название.
+    Ветку и каталог не трогает: они git, а не название. Имя проходит через
+    `clean_name`: таб или перевод строки в нём разорвал бы строку
+    `list-sessions`, и сессия исчезла бы из всех списков (см. clean_name).
     """
-    label = f"{_repo_of(session)}@{name.strip()}"
+    cleaned = clean_name(name)
+    if not cleaned:
+        raise ActionError("пустое имя")
+    label = f"{_repo_of(session)}@{cleaned}"
     code, out = await remote._run(
         "set-option", "-t", _pane(session), LABEL_OPTION, label, check=False
     )
     if code != 0:
         raise ActionError(out.strip() or f"set-option: код {code}")
-    await send(session, f"/rename {name.strip()}")
+    await send(session, f"/rename {cleaned}")
     await asyncio.sleep(settle_s)
     recent = await tail(session, lines=8)
     return RenameResult(label=label, app_renamed=_UNKNOWN_COMMAND.search(recent) is None)

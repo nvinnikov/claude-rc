@@ -320,3 +320,29 @@ async def test_label_prefers_the_given_name(repo: Path) -> None:
 async def test_label_uses_name_for_non_git_dir(tmp_path: Path) -> None:
     assert await worktrees.label(tmp_path, name="x") == f"{tmp_path.name}@x"
     assert await worktrees.label(tmp_path) == tmp_path.name
+
+
+def test_clean_name_collapses_whitespace() -> None:
+    # Табы и переводы строк в ярлыке рвут строку `list-sessions`, где поля
+    # разделены табом, — сессия исчезла бы из всех списков разом.
+    assert worktrees.clean_name("  x   y ") == "x y"
+    assert worktrees.clean_name("a\tb\nc") == "a b c"
+    assert worktrees.clean_name("   ") == ""
+
+
+def test_clean_name_cuts_to_the_limit() -> None:
+    long = "x" * (worktrees.MAX_SESSION_NAME_LEN + 10)
+    assert worktrees.clean_name(long) == "x" * worktrees.MAX_SESSION_NAME_LEN
+    # Обрез не должен оставить имя с хвостовым пробелом.
+    assert not worktrees.clean_name("x" * (worktrees.MAX_SESSION_NAME_LEN - 1) + "  y").endswith(
+        " "
+    )
+
+
+async def test_label_cleans_the_given_name(repo: Path) -> None:
+    assert await worktrees.label(repo, name="  x   y ") == "demo@x y"
+
+
+async def test_label_ignores_a_blank_name(repo: Path) -> None:
+    # Пустое после чистки имя — это «имени не дали»: ярлык падает на ветку.
+    assert await worktrees.label(repo, name=" \t ") == "demo@main"

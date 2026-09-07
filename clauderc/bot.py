@@ -45,6 +45,10 @@ from clauderc.repos import discover, resolve
 from clauderc.state import State
 from clauderc.sync import Outcome, RepoStatus, SyncResult
 from clauderc.watch import Died, Watcher
+
+# MAX_SESSION_NAME_LEN — явный ре-экспорт: лимит живёт рядом с `clean_name`,
+# который его и применяет, но снаружи о нём спрашивают у бота.
+from clauderc.worktrees import MAX_SESSION_NAME_LEN as MAX_SESSION_NAME_LEN
 from clauderc.worktrees import Worktree, WorktreeError
 
 log = logging.getLogger("clauderc")
@@ -184,9 +188,6 @@ class LaunchRequest:
     mode: str | None = None
 
 
-MAX_SESSION_NAME_LEN = 40
-
-
 def _name_prompt() -> tuple[str, ForceReply]:
     return (
         "Как назвать сессию? Пришли имя <b>ответом на это сообщение</b> "
@@ -201,8 +202,11 @@ def _apply_name(request: LaunchRequest, text: str) -> LaunchRequest:
     `-` или пустой ответ — без имени. Для нового worktree без явной ветки имя
     превращается в ветку (`branch_for`), а без имени та же ветка получает
     временную метку (`generate_branch`) — как до этого шага.
+
+    Чистка — общая с `worktrees.label` и `actions.rename`: ответ в Telegram
+    бывает и двухстрочным, а перевод строки в ярлыке ломает `list-sessions`.
     """
-    name = text.strip()[:MAX_SESSION_NAME_LEN]
+    name = worktrees.clean_name(text)
     if name == "-":
         name = ""
     branch = request.branch

@@ -16,6 +16,12 @@ from pathlib import Path
 _SLUG = re.compile(r"[^A-Za-z0-9_-]+")
 _ERROR_TAIL = 400
 
+# Длиннее не влезает ни в рамку ввода claude, ни в подпись кнопки Telegram,
+# а карточку с переросшей подписью Telegram отвергает целиком.
+MAX_SESSION_NAME_LEN = 40
+
+_WHITESPACE = re.compile(r"\s+")
+
 # Локальные вызовы (status, rev-parse) укладываются в миллисекунды — даже на
 # большом репозитории это разовая операция с диском. Сетевые (fetch, pull) на
 # разумном канале отрабатывают за секунды, редко за десятки секунд; 30с — щедрый
@@ -56,6 +62,19 @@ class Worktree:
         if self.unpushed:
             reasons.append(f"{self.unpushed} коммит(ов) нет ни на одном remote")
         return reasons
+
+
+def clean_name(name: str) -> str:
+    """Имя сессии, годное для ярлыка: пробельные символы схлопнуты, длина обрезана.
+
+    Ярлык уходит в `@rc_label`, а `list-sessions -F` разделяет поля табом:
+    таб или перевод строки внутри имени разорвал бы строку, `list_sessions`
+    отбросила бы её как нечитаемую — и сессия пропала бы из `/rc`, `resolve`,
+    `find`, а Watcher счёл бы её мёртвой и следующий `start` в том же каталоге
+    поднял бы вторую. Чистим в единственной точке, где имя человека становится
+    ярлыком, а не на каждой поверхности отдельно.
+    """
+    return _WHITESPACE.sub(" ", name).strip()[:MAX_SESSION_NAME_LEN].strip()
 
 
 def slug(text: str) -> str:
@@ -195,6 +214,7 @@ async def label(path: Path, *, name: str | None = None) -> str:
     """
     info = await inspect(path)
     repo = info.repo if info is not None else path.name
-    if name:
-        return f"{repo}@{name}"
+    cleaned = clean_name(name or "")
+    if cleaned:
+        return f"{repo}@{cleaned}"
     return f"{info.repo}@{info.branch}" if info is not None else path.name

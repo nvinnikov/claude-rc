@@ -201,3 +201,26 @@ async def test_restart_refuses_when_kill_fails() -> None:
 
     with pytest.raises(actions.ActionError, match="не погас"):
         await actions.restart(_session(), kill=kill)
+
+
+async def test_rename_cleans_whitespace_in_the_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Двухстрочный ответ в Telegram — обычное дело, а таб в @rc_label разорвал
+    # бы строку `list-sessions` и сессия пропала бы из всех списков.
+    calls: list[tuple[str, ...]] = []
+
+    def handler(*a: str) -> tuple[int, str]:
+        calls.append(a)
+        return 0, ""
+
+    monkeypatch.setattr(remote, "_run", _stub(handler))
+    result = await actions.rename(_session(), "a\tb\nc", settle_s=0)
+
+    assert result.label == "oms@a b c"
+    assert ("set-option", "-t", "=session_01ABC:", "@rc_label", "oms@a b c") in calls
+    assert ("send-keys", "-t", "=session_01ABC:", "-l", "/rename a b c") in calls
+
+
+async def test_rename_refuses_a_blank_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(remote, "_run", _stub(lambda *a: (0, "")))
+    with pytest.raises(actions.ActionError, match="пустое имя"):
+        await actions.rename(_session(), "   ", settle_s=0)
