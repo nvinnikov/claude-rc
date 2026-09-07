@@ -132,3 +132,15 @@ def test_relative_paths_lets_a_connect_label_through() -> None:
     assert proxy.relative_paths(["connect", "session_01A", "--read-only"]) == []
     # Без --start пустая цель — «единственная живая сессия», а не каталог.
     assert proxy.relative_paths(["connect"]) == []
+
+
+def test_relative_paths_keeps_worktree_labels_out_of_connect() -> None:
+    # Канонический ярлык worktree-сессии несёт слэш от имени ветки — но это
+    # ярлык, а не путь, и его резолвит та сторона.
+    assert proxy.relative_paths(["connect", "oms@wt/feature-x", "--read-only"]) == []
+    # Заданная цель не подменяется точкой, даже если её отфильтровали:
+    # `connect oms@x --start` — «подсядь, а если сессии нет, подними».
+    assert proxy.relative_paths(["connect", "oms@x", "--start"]) == []
+    # Пустая цель с --start по-прежнему означает каталог этой машины.
+    assert proxy.relative_paths(["connect", "--start"]) == ["."]
+    assert proxy.relative_paths(["connect", "./x", "--start"]) == ["./x"]

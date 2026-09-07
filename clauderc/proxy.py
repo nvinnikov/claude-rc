@@ -67,10 +67,11 @@ def _looks_like_path(arg: str) -> bool:
 
     У `connect` позиционный аргумент — цель в широком смысле: `oms@x`,
     `session_01A` или каталог. Отличаем каталог по разделителю или по явным
-    `.`/`..`: ярлык и id сессии их не содержат, а «./x» и «../x» человек пишет
-    именно как путь.
+    `.`/`..`. Но одного разделителя мало: канонический ярлык worktree-сессии —
+    `oms@wt/feature-x`, слэш в нём от имени ветки. `@` в ярлыке есть всегда, а в
+    пути (`code/oms`, `./x`) — нет, поэтому он и решает.
     """
-    return os.sep in arg or arg in (".", "..")
+    return "@" not in arg and (os.sep in arg or arg in (".", ".."))
 
 
 def relative_paths(argv: list[str]) -> list[str]:
@@ -95,8 +96,11 @@ def relative_paths(argv: list[str]) -> list[str]:
         # Цель, не похожая на путь, — ярлык или session_…: её резолвит та
         # сторона, и относительной она не бывает. Пустая цель означает каталог
         # только вместе с `--start`; иначе это «единственная живая сессия».
+        # Пустоту считаем до фильтрации: отфильтрованный ярлык — это заданная
+        # цель, а не отсутствующая, и подменять его точкой нельзя.
+        had_target = bool(positionals)
         positionals = [p for p in positionals if _looks_like_path(p)]
-        if not positionals and "--start" in options:
+        if not had_target and "--start" in options:
             positionals = ["."]
     elif not positionals and command != "sync":
         positionals = ["."]
