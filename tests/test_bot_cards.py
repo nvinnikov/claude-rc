@@ -446,28 +446,34 @@ def test_reply_without_author_is_not_ours() -> None:
     assert _is_own_prompt(orphan, 42) is False
 
 
-async def test_pane_asks_blocks_when_a_dialog_is_open(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Кнопки, печатающие в панель, заканчиваются Enter — а Enter подтверждает
-    # подсвеченный пункт открытого диалога, вплоть до «Yes, and don't ask again».
+@pytest.mark.parametrize(
+    ("state", "busy"),
+    [
+        # Свободная рамка ввода — единственное, что пропускается.
+        (state_probe.State.IDLE, False),
+        # Enter подтвердил бы подсвеченный пункт, вплоть до «Yes, and don't ask again».
+        (state_probe.State.NEEDS_INPUT, True),
+        (state_probe.State.WORKING, True),
+        # Шаблон, сломанный обновлением claude, даёт UNKNOWN — и это ровно тот
+        # случай, ради которого проверка закрыта по умолчанию: неопознанный
+        # диалог выглядит так же, как неопознанное что угодно ещё.
+        (state_probe.State.UNKNOWN, True),
+        # Про умершую сессию человеку честнее услышать от actions.send.
+        (state_probe.State.DEAD, False),
+    ],
+)
+async def test_pane_is_busy_passes_only_a_free_pane(
+    monkeypatch: pytest.MonkeyPatch, state: state_probe.State, busy: bool
+) -> None:
     async def fake_classify(tmux_name: str) -> state_probe.State:
         assert tmux_name == "session_01A"
-        return state_probe.State.NEEDS_INPUT
+        return state
 
     monkeypatch.setattr(bot_module.state_probe, "classify_pane", fake_classify)
-    assert await bot_module._pane_asks("session_01A") is True
+    assert await bot_module._pane_is_busy("session_01A") is busy
 
 
-async def test_pane_asks_lets_a_free_session_through(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Всё, кроме открытого вопроса, — не повод отказывать: неизвестное состояние
-    # (сломанный обновлением claude шаблон) не должно запирать кнопки навсегда.
-    async def fake_classify(tmux_name: str) -> state_probe.State:
-        return state_probe.State.UNKNOWN
-
-    monkeypatch.setattr(bot_module.state_probe, "classify_pane", fake_classify)
-    assert await bot_module._pane_asks("session_01A") is False
-
-
-async def test_pane_asks_does_not_look_for_ports(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_pane_is_busy_does_not_look_for_ports(monkeypatch: pytest.MonkeyPatch) -> None:
     # Порты к вопросу «открыт ли диалог» не относятся, а их поиск обходит дерево
     # процессов через pgrep и lsof — это секунды на отклик кнопки.
     async def boom(tmux_name: str) -> tuple[int, ...]:
@@ -478,7 +484,7 @@ async def test_pane_asks_does_not_look_for_ports(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(bot_module.state_probe, "listening_ports", boom)
     monkeypatch.setattr(remote, "_run", run)
-    assert await bot_module._pane_asks("session_01A") is False
+    assert await bot_module._pane_is_busy("session_01A") is False
 
 
 def test_error_card_survives_a_message_full_of_angle_brackets() -> None:

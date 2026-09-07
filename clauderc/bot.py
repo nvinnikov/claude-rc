@@ -121,11 +121,14 @@ def _live_message(query: CallbackQuery) -> Message | None:
     return query.message if isinstance(query.message, Message) else None
 
 
-BUSY_PANE_TEXT = "В панели открыт вопрос — ответь на него в приложении, потом повтори."
+BUSY_PANE_TEXT = (
+    "Панель не свободна: открыт вопрос, идёт работа или я не разобрал, что на ней. "
+    "Посмотри Tail, ответь в приложении и повтори."
+)
 
 
-async def _pane_asks(tmux_name: str) -> bool:
-    """Ждёт ли панель ответа на открытый диалог.
+async def _pane_is_busy(tmux_name: str) -> bool:
+    """Опасно ли сейчас печатать в панель. Пропускаем только заведомо свободную.
 
     Кнопки, которые печатают в панель (`🔌 /mcp`, `✏️ Rename`), заканчиваются
     отдельным Enter, а Enter подтверждает подсвеченный пункт открытого диалога —
@@ -134,10 +137,18 @@ async def _pane_asks(tmux_name: str) -> bool:
     могли показать задолго до появления диалога, поэтому состояние спрашиваем
     перед отправкой, а не берём из карточки. Tail только читает и не спрашивает.
 
+    Проверка закрыта по умолчанию: `state_probe` намеренно отдаёт `UNKNOWN`, а не
+    ложный `IDLE`, когда шаблон сломан обновлением claude, — и здесь `UNKNOWN`
+    обязан значить «не трогай». Иначе перерисованный диалог (каретка не `❯`,
+    вопрос не с `Do you want to`) не опознаётся, и Enter уходит именно туда, где
+    он подтверждает чужой выбор. `DEAD` пропускаем: об умершей сессии человеку
+    честнее услышать от `actions.send`, чем получить отказ про занятую панель.
+
     Спрашиваем `classify_pane`, а не `probe`: порты к вопросу не относятся, а
     их поиск обходит дерево процессов и задерживает отклик кнопки.
     """
-    return await state_probe.classify_pane(tmux_name) is state_probe.State.NEEDS_INPUT
+    free = {state_probe.State.IDLE, state_probe.State.DEAD}
+    return await state_probe.classify_pane(tmux_name) not in free
 
 
 def _session_keyboard(token: str, url: str) -> InlineKeyboardMarkup:
@@ -1411,7 +1422,7 @@ async def main() -> None:
         if session is None or message is None:
             return
         await query.answer()
-        if prefix == "mcp:" and await _pane_asks(session.tmux_name):
+        if prefix == "mcp:" and await _pane_is_busy(session.tmux_name):
             await message.answer(BUSY_PANE_TEXT)
             return
         try:
@@ -1690,7 +1701,7 @@ async def main() -> None:
             if session is None:
                 await message.reply("Сессия уже не жива.")
                 return
-            if await _pane_asks(session.tmux_name):
+            if await _pane_is_busy(session.tmux_name):
                 await message.reply(BUSY_PANE_TEXT)
                 return
             try:
