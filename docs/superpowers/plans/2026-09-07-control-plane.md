@@ -2955,3 +2955,30 @@ Design notes. CLAUDE.md: новые модули и грабли."
 **Отклонение от спеки, зафиксированное осознанно.** Спека кладёт ожидание текста (имя, rename) в `state.py`, чтобы пережить рестарт бота. План использует существующий в репозитории механизм `ForceReply` + `reply_to_message` (как у ветки для Sync): он решает главную проблему — чужой текст не попадает в имя — а после рестарта бота человек просто нажимает кнопку ещё раз. Файл состояния для этого не нужен.
 
 **Согласованность имён.** `passport.build/collect/as_dict/as_text/as_html/state_line`, `actions.send/tail/send_and_tail/rename/restart/ActionError/RenameResult/Killer`, `state_probe.State/SessionState/classify/probe/listening_ports/_exec/_parse_lsof`, `proxy.strip_host/command_of/relative_paths/remote_argv/exec_remote/run_remote/HOST_ENV/LOCAL_ONLY/TTY_COMMANDS/PATH_COMMANDS`, `forward.Forward/ForwardError/start/stop/active/port_busy/pid_dir/PID_DIR_ENV`, `cli._one/_pick/_Ambiguous/_print_ambiguous/_host_name/_one_passport/_remote_ports`, `bot.LaunchRequest/_apply_name/_name_prompt/_session_card/_session_keyboard/card_pending/rename_pending/name_pending`, `remote.DEFAULT_PERMISSION_MODE/_MODE_OPTION/RemoteSession.mode/attach_argv(read_only, control)`, `worktrees.branch_for/label(name=)` — используются одинаково во всех задачах.
+
+## Приложение: отложенные замечания ревью (после реализации)
+
+Ветка `feat/control-plane`, 38 коммитов. Всё ниже — minor, оставлено на потом; ничего из этого не блокирует слияние. Формулировки — из леджера выполнения.
+
+- **Task 2.** passport._uptime дублирует bot._uptime — Task 3 обязан убрать копию в боте
+- **Task 4.** worktrees.label использует truthiness `if name:` — пустое --name молча даёт repo@branch (по брифу, безвредно)
+- **Task 6.** _repo_of при cwd="/" и пустом name даёт "@name" — крайний случай
+- **Task 7.** LOCAL_ONLY содержит "forward", ветка недостижима до Task 16
+- **Task 8.** второй паттерн _IDLE (`│ > │`) не покрыт ни одной фикстурой — мёртвая ветка
+- **Task 8.** паттерн нумерованного списка в _NEEDS_INPUT (`^\s*❯?\s*\d+[.)]\s+\S`) даст ложный needs_input на idle-панели с нумерованным списком в ответе; рекомендация финальному ревью — требовать `❯` перед номером (в настоящих диалогах подсвеченный пункт его несёт) или ограничить окно последними 3 строками
+- **Task 9.** _descendants назван BFS, а queue.pop() — LIFO; на корректность не влияет
+- **Task 10.** whoami «probe=False» держится на том, что он не зовёт collect — тест-инвариант отсутствует
+- **Task 10.** отрез экранированного хвоста по фиксированной позиции может разорвать сущность на границе (теоретически)
+- **Task 11.** ветка `if mode else ""` в _permission_flag мертва — launch всегда передаёт непустой режим
+- **Task 14.** двойной тап по Bypass не блокируется (второй restart упадёт на kill — самозалечивается)
+- **Task 14.** [:3800] после закрытого </pre> может разрезать тег — паттерн унаследован из start_session
+- **Task 14.** card_pending/rename_pending растут без вытеснения, как прежний stop_pending
+- **Task 15.** -CC с -L socket не покрыт тестом; --branch без --start молча игнорируется
+- **Task 16.** pid из файла может быть переиспользован чужим процессом — проверка cmdline не делается (модель доверия одного оператора); TOCTOU между port_busy и bind ssh
+- **Task 16.** _HOST_RE отвергает user@host, хотя proxy его пропускает — расширить регэксп `^([A-Za-z0-9_.-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*$`
+- **Task 16.** test_forward_ambiguous_target_lists_matches на деле даёт 0 совпадений, а не 2 — поправить данные теста (одинаковый label у двух сессий)
+- **Task 16.** при PermissionError в stop() уже снятые туннели не печатаются
+- **Task 17.** Design notes в README.md — выжимка 10 из 15 новых «Грабель», сознательная выборка
+Final Ruling: в волну правок входят Critical 1–2, Important 3–6 и дешёвые Minor 7, 11, 12, 15; остальные minor — fix later.
+- **Волна правок.** строгая регулярка хоста (часть до @ тоже с буквы/цифры) принята — защищает ssh argv в forward.start; остальные `<pre>` с текстом ошибок ограничены _TAIL_CHARS=400 в remote._failure — fix later.
+- **Финальное ревью, fix later.** name-keyed mark `_expected` имеет тот же дефект при гашении сессии под именем rc-<slug> и перезапуске под ним же — закроется тем же session_id; _remote_ports без expanduser/precedence tmux_name; пять `<pre>{exc}</pre>[:3800]` на коротких текстах ошибок; README строки 517/450 длиннее ширины переноса.
