@@ -57,6 +57,23 @@ class Passport:
     listening: tuple[int, ...] = field(default_factory=tuple)
 
 
+def pre_block(text: str, limit: int) -> str:
+    """Текст в `<pre>` для Telegram: сначала отрез, потом экранирование.
+
+    Порядок обратный очевидному, и он единственный правильный. Отрез после
+    экранирования (или отрез уже собранной строки с тегами) попадает в середину
+    «&lt;» или срезает закрывающий тег — Telegram отвечает 400, и человек не
+    получает ничего вместо укороченного хвоста.
+
+    Оставляем конец, а не начало: в панели последние строки и есть новость,
+    а срезанное начало отмечаем многоточием.
+    """
+    cut = text[-limit:] if len(text) > limit else text
+    if len(cut) < len(text):
+        cut = "…" + cut
+    return f"<pre>{html.escape(cut)}</pre>"
+
+
 def attach_line(tmux_name: str, host: str) -> str:
     """Команда подсадки: локальная, а при `host` — обёрнутая в ssh.
 
@@ -198,10 +215,5 @@ def as_html(p: Passport) -> str:
     ]
     text = "\n".join(line for line in lines if line)
     if p.last_lines:
-        # Режем уже экранированную строку: отрез до escape мог бы попасть в
-        # середину «&lt;» и отдать в Telegram битую HTML-сущность.
-        tail = e("\n".join(p.last_lines))
-        if len(tail) > _PRE_MAX_CHARS:
-            tail = tail[:_PRE_MAX_CHARS] + "…"
-        text += "\n<pre>" + tail + "</pre>"
+        text += "\n" + pre_block("\n".join(p.last_lines), _PRE_MAX_CHARS)
     return text

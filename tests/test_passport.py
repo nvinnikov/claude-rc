@@ -1,4 +1,5 @@
 import dataclasses
+import html
 import json
 from pathlib import Path
 
@@ -109,7 +110,9 @@ def test_as_html_caps_the_pane_tail() -> None:
     base = passport.build(_session(), host="", tree=None)
     html_text = passport.as_html(dataclasses.replace(base, last_lines=("x" * 5000,)))
     assert len(html_text) < 3000
-    assert html_text.rstrip().endswith("…</pre>")
+    # Многоточие впереди: срезано начало, а новость в панели — последние строки.
+    assert "<pre>…x" in html_text
+    assert html_text.rstrip().endswith("</pre>")
 
 
 def test_as_html_keeps_a_short_tail_intact() -> None:
@@ -172,3 +175,21 @@ def test_state_line_words() -> None:
     ]:
         assert word in passport.state_line(dataclasses.replace(base, state=state))
     assert passport.state_line(base) == ""
+
+
+def test_pre_block_cuts_before_escaping() -> None:
+    # Отрез после экранирования разрубает «&lt;» пополам, отрез готовой строки
+    # уносит закрывающий тег — в обоих случаях Telegram отвечает 400.
+    raw = ("x" * 9 + "<") * 500
+    out = passport.pre_block(raw, 100)
+
+    assert out.startswith("<pre>") and out.endswith("</pre>")
+    inner = out.removeprefix("<pre>").removesuffix("</pre>")
+    assert "<" not in inner
+    assert "&lt" in inner and "&l;" not in inner
+    # В блок ушло не больше лимита сырых символов (плюс многоточие).
+    assert len(html.unescape(inner)) == 101
+
+
+def test_pre_block_keeps_short_text_whole() -> None:
+    assert passport.pre_block("short tail", 100) == "<pre>short tail</pre>"

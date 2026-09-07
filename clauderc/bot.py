@@ -247,9 +247,7 @@ def _bypass_failed_text(exc: str) -> str:
     нет, и молчание об этом оставило бы человека с мёртвой карточкой без единой
     подсказки, что делать дальше — отсюда и предложение Resume рядом с текстом.
     """
-    return f"⏹ Прежняя сессия погашена, но заново не поднялась.\n<pre>{html.escape(exc)}</pre>"[
-        :3800
-    ]
+    return "⏹ Прежняя сессия погашена, но заново не поднялась.\n" + passport.pre_block(exc, 3500)
 
 
 def _label(path: Path, roots: tuple[Path, ...]) -> str:
@@ -1355,7 +1353,10 @@ async def main() -> None:
         except actions.ActionError as exc:
             await message.answer(f"❌ {html.escape(str(exc))}", parse_mode="HTML")
             return
-        await message.answer(f"<pre>{html.escape(text)}</pre>"[:3800], parse_mode="HTML")
+        # Отрез — до экранирования и без тегов: 25 склеенных строк панели за
+        # 3800 переваливают легко, а срез готовой строки уносит закрывающий
+        # тег или половину «&lt;», и Telegram отвергает сообщение целиком.
+        await message.answer(passport.pre_block(text, 3500), parse_mode="HTML")
 
     @dp.callback_query(F.data.startswith("ren:"))
     async def on_rename(query: CallbackQuery) -> None:
