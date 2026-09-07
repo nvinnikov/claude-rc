@@ -609,8 +609,9 @@ and shaped the code:
   the fact. Two things follow. `list_sessions` recognises its own by the `rc-` prefix *or* a
   set `@rc_url`: the prefix alone would lose renamed sessions, the option alone would lose
   ones that died before printing a link. And the `Watcher` doesn't call a vanished name a
-  death while a session with the same working directory is alive — otherwise every launch
-  would report a crash.
+  death while a session with the same tmux id (`#{session_id}`, `$3`) is alive — otherwise
+  every launch would report a crash. The tmux id, not the creation time: `#{session_created}`
+  is whole seconds, and `restart` kills and relaunches inside one of them.
 - **`CLAUDE_CODE_*` is scrubbed inside the pane.** The tmux server may have been started
   from within Claude Code; an inherited `CLAUDE_CODE_CHILD_SESSION` starts the session with
   "Transcript saving is off" — that is, with no history.
@@ -634,9 +635,16 @@ and shaped the code:
   `-Users-n--x`. And the slug is ambiguous by construction, so `history` confirms the match
   against the `cwd` field inside the file.
 - **Sessions are never killed behind the `Watcher`'s back.** The watcher treats any
-  disappearance it didn't mark as expected as a crash — a direct `remote.kill_tmux` from a
-  handler would hand the user a "session crashed" card right after they pressed Stop
-  themselves.
+  disappearance it didn't expect as a crash — a direct `remote.kill_tmux` from a handler
+  would hand the user a "session crashed" card right after they pressed Stop themselves.
+- **A killed session is struck from the snapshot, not tagged with a mark.** The poller calls
+  a disappearance from its snapshot a death, so removing the session from that snapshot is
+  the exact way to say "this death was expected". Any mark kept beside the snapshot outlives
+  the session while its replacement appears instantly, and nothing tells the two apart:
+  the name changes underfoot, `#{session_created}` is whole seconds, and `#{session_id}`
+  restarts from `$0` when the session being killed was the last one on the server and the
+  server went with it. A mark by name survives for one thing only — the race where `poll`
+  asked tmux for its list before the kill and sorted the answer into a snapshot after it.
 - **An app launched at login gets a bare `PATH`.** The bot it spawns as a child would find
   neither `tmux` nor `claude` without an explicit `PATH` — `CLILocator.childEnvironment`
   exists for exactly that.

@@ -281,14 +281,16 @@ def _session_card(p: passport.Passport) -> str:
     return passport.as_html(p)
 
 
-def _same_session(session: RemoteSession | None, created_at: int) -> RemoteSession | None:
+def _same_session(session: RemoteSession | None, tmux_id: str) -> RemoteSession | None:
     """Та ли это сессия, что была на карточке, когда её показывали.
 
     Каталог — ключ сессии, но не её удостоверение: прежняя могла умереть, а в том
     же каталоге подняться новая. Устаревшая кнопка Stop тогда погасила бы чужую
-    работу. `session_created` переименование сохраняет, а перезапуск — нет.
+    работу. Сверяем tmux-id (`$3`), а не время создания: `#{session_created}` —
+    целые секунды, и перезапуск в ту же секунду выдал бы себя за прежнюю сессию.
+    Переименование `$N` сохраняет, перезапуск — нет.
     """
-    if session is None or session.created_at != created_at:
+    if session is None or not tmux_id or session.tmux_id != tmux_id:
         return None
     return session
 
@@ -537,11 +539,12 @@ async def main() -> None:
     pending: dict[str, tuple[Path, str | None]] = {}
     # Сессии, которые ждут ответа на диалог доверия каталогу.
     trust_pending: dict[str, tuple[str, str]] = {}
-    # (каталог, время создания): каталог — ключ сессии, а время отличает ту самую
-    # сессию от новой, поднятой в том же каталоге после смерти прежней. Имя не годится:
+    # (каталог, tmux-id): каталог — ключ сессии, а `$N` отличает ту самую сессию
+    # от новой, поднятой в том же каталоге после смерти прежней. Имя не годится:
     # `await_url` переименовывает сессию в её id, и запомненное имя перестаёт
-    # существовать. Переименование `session_created` сохраняет, перезапуск — нет.
-    card_pending: dict[str, tuple[str, int]] = {}
+    # существовать. Время создания не годится тоже: оно в целых секундах, и
+    # перезапуск укладывается в одну. Переименование `$N` сохраняет, перезапуск — нет.
+    card_pending: dict[str, tuple[str, str]] = {}
     tree_pending: dict[str, Path] = {}
     # Значение — (id карточки, выбор): выбор любого варианта гасит остальные
     # токены той же карточки, чтобы два тапа не подняли две сессии в одном каталоге.
@@ -574,9 +577,9 @@ async def main() -> None:
     # и чужой текст в имя не попадёт.
     name_pending: dict[int, LaunchRequest] = {}
     # Ключ — id сообщения с запросом нового имени (ForceReply), значение — та же
-    # пара (каталог, время создания), что и у card_pending: имя сессии меняется
-    # у неё под ногами, поэтому саму сессию добываем заново через _same_session.
-    rename_pending: dict[int, tuple[str, int]] = {}
+    # пара (каталог, tmux-id), что и у card_pending: имя сессии меняется у неё
+    # под ногами, поэтому саму сессию добываем заново через _same_session.
+    rename_pending: dict[int, tuple[str, str]] = {}
 
     async def offer_trust(message: Message, need: TrustRequired) -> None:
         token = uuid.uuid4().hex[:8]
@@ -610,7 +613,7 @@ async def main() -> None:
             # Полный пульт, а не одна ссылка: сессия та же самая, и Bypass,
             # Tail и Rename нужны здесь ровно так же, как на карточке запуска.
             token = uuid.uuid4().hex[:8]
-            card_pending[token] = (os.path.realpath(alive_here.cwd), alive_here.created_at)
+            card_pending[token] = (os.path.realpath(alive_here.cwd), alive_here.tmux_id)
             await notice.edit_text(
                 f"Уже поднята.\n"
                 f"{_session_card(passport.build(alive_here, host=config.host, tree=None))}",
@@ -651,7 +654,7 @@ async def main() -> None:
         alive = await find(str(cwd))
         if alive is not None:
             token = uuid.uuid4().hex[:8]
-            card_pending[token] = (os.path.realpath(alive.cwd), alive.created_at)
+            card_pending[token] = (os.path.realpath(alive.cwd), alive.tmux_id)
             await notice.edit_text(
                 told(
                     f"Уже поднята.\n"
@@ -697,7 +700,7 @@ async def main() -> None:
             return
 
         token = uuid.uuid4().hex[:8]
-        card_pending[token] = (os.path.realpath(session.cwd), session.created_at)
+        card_pending[token] = (os.path.realpath(session.cwd), session.tmux_id)
         await notice.edit_text(
             told(
                 f"✅ Сессия поднята\n"
@@ -780,7 +783,7 @@ async def main() -> None:
             # за лимит выходит легко. Но держим именно путь, а не имя: имя сессии
             # меняется у неё под ногами — `await_url` переименовывает её в id, как
             # только появится ссылка, и запомненное имя перестало бы существовать.
-            card_pending[token] = (real, session.created_at)
+            card_pending[token] = (real, session.tmux_id)
             await message.answer(
                 _session_card(p)[:3800],
                 parse_mode="HTML",
@@ -1104,7 +1107,7 @@ async def main() -> None:
                 f"Таких сессий несколько — назови id:\n{listing}", parse_mode="HTML"
             )
             return
-        if await watcher.kill(matches[0].tmux_name, matches[0].cwd, matches[0].created_at):
+        if await watcher.kill(matches[0].tmux_name, matches[0].cwd, matches[0].tmux_id):
             # Называем найденное, а не набранное: на `/rckill ~/code/oms` ответ
             # «Сессия ~/code/oms погашена» — про путь, а не про сессию.
             # Worktree намеренно остаётся: в нём может лежать несохранённая работа.
@@ -1159,7 +1162,7 @@ async def main() -> None:
         # Сессия держит этот каталог: не погасив её, оставим Claude в исчезнувшем cwd.
         session = await find(str(path))
         if session is not None:
-            await watcher.kill(session.tmux_name, session.cwd, session.created_at)
+            await watcher.kill(session.tmux_name, session.cwd, session.tmux_id)
 
         try:
             await worktrees.remove(config.worktree_root, name, force=force)
@@ -1233,7 +1236,7 @@ async def main() -> None:
         # Сессия могла подняться уже после показа карточки.
         session = await find(str(path))
         if session is not None:
-            await watcher.kill(session.tmux_name, session.cwd, session.created_at)
+            await watcher.kill(session.tmux_name, session.cwd, session.tmux_id)
         try:
             await worktrees.remove(config.worktree_root, path.name, force=forced)
         except WorktreeError as exc:
@@ -1260,8 +1263,8 @@ async def main() -> None:
         if pending is None:
             await query.answer("Карточка устарела")
             return None, message
-        cwd, created_at = pending
-        session = _same_session(await find(cwd), created_at)
+        cwd, tmux_id = pending
+        session = _same_session(await find(cwd), tmux_id)
         if session is None:
             await query.answer("Сессия уже не жива")
         return session, message
@@ -1278,11 +1281,11 @@ async def main() -> None:
                 await message.edit_reply_markup(reply_markup=None)
             return
 
-        cwd, created_at = pending
+        cwd, tmux_id = pending
         # Имя берём заново: с момента показа карточки сессию могли переименовать.
-        session = _same_session(await find(cwd), created_at)
+        session = _same_session(await find(cwd), tmux_id)
         killed = session is not None and await watcher.kill(
-            session.tmux_name, session.cwd, session.created_at
+            session.tmux_name, session.cwd, session.tmux_id
         )
         await query.answer("Погашена" if killed else "Уже не жива")
         if message is None:
@@ -1308,13 +1311,13 @@ async def main() -> None:
         async def kill_this(tmux_name: str, cwd: str) -> bool:
             """Гасит именно тот экземпляр, что держит хендлер.
 
-            `created_at` подставляем замыканием, а не расширяем `Killer`:
+            tmux-id подставляем замыканием, а не расширяем `Killer`:
             `actions.restart` про Watcher ничего не знает и знать не должен.
             Без экземпляра метка осталась бы «по каталогу» — а перезапуск
             поднимает новую сессию в том же каталоге через миллисекунды, и
             такая метка проглотила бы её первое настоящее падение.
             """
-            return await watcher.kill(tmux_name, cwd, session.created_at)
+            return await watcher.kill(tmux_name, cwd, session.tmux_id)
 
         try:
             fresh = await actions.restart(
@@ -1349,7 +1352,7 @@ async def main() -> None:
             await offer_trust(message, need)
             return
         token = uuid.uuid4().hex[:8]
-        card_pending[token] = (os.path.realpath(fresh.cwd), fresh.created_at)
+        card_pending[token] = (os.path.realpath(fresh.cwd), fresh.tmux_id)
         await message.answer(
             "🔓 Переоткрыта с bypassPermissions\n"
             + _session_card(passport.build(fresh, host=config.host, tree=None)),
@@ -1395,7 +1398,7 @@ async def main() -> None:
                 force_reply=True, selective=True, input_field_placeholder="имя сессии"
             ),
         )
-        rename_pending[prompt.message_id] = (os.path.realpath(session.cwd), session.created_at)
+        rename_pending[prompt.message_id] = (os.path.realpath(session.cwd), session.tmux_id)
 
     @dp.callback_query(F.data.startswith("jump:"))
     async def on_jump(query: CallbackQuery) -> None:
@@ -1629,8 +1632,8 @@ async def main() -> None:
 
         renaming = rename_pending.pop(reply.message_id, None)
         if renaming is not None:
-            cwd, created_at = renaming
-            session = _same_session(await find(cwd), created_at)
+            cwd, tmux_id = renaming
+            session = _same_session(await find(cwd), tmux_id)
             if session is None:
                 await message.reply("Сессия уже не жива.")
                 return

@@ -80,9 +80,16 @@ DEFAULT_PERMISSION_MODE = "auto"
 # Режим хранится рядом с ярлыком: `restart` должен поднимать сессию с прежним
 # режимом, а раньше он нигде не сохранялся — узнать его после запуска было неоткуда.
 _MODE_OPTION = "@rc_mode"
+# `#{session_id}` — собственный id tmux (`$3`): уникален на всё время жизни
+# сервера, не переиспользуется и переименование переживает. Единственное, чем
+# экземпляр сессии отличается от поднятого на её месте: `#{session_created}` —
+# целые секунды, и гашение с запуском в одну секунду (это и есть `restart`)
+# даёт одинаковое время.
 _FORMAT = (
-    "#{session_name}\t#{session_path}\t#{session_created}\t#{@rc_url}\t#{@rc_label}\t#{@rc_mode}"
+    "#{session_name}\t#{session_path}\t#{session_created}"
+    "\t#{@rc_url}\t#{@rc_label}\t#{@rc_mode}\t#{session_id}"
 )
+_FIELDS = 7
 
 # CLAUDE_CODE_* чистим уже внутри панели: tmux-сервер мог быть поднят из-под
 # Claude Code, и унаследованный CLAUDE_CODE_CHILD_SESSION выключит сохранение
@@ -149,9 +156,14 @@ class RemoteSession:
     tmux_name: str
     cwd: str
     url: str
-    created_at: int  # unix-время создания tmux-сессии
+    created_at: int  # unix-время создания tmux-сессии, целые секунды
     label: str = ""  # ярлык repo@branch; пуст у сессий прежней версии
     mode: str = ""  # режим прав, с которым поднята сессия; пуст у сессий прежней версии
+    # id самой tmux-сессии (`$3`) — не путать с id сессии Claude (`session_…`),
+    # который живёт в `tmux_name` после переименования и в `passport.session_id`.
+    # Это удостоверение экземпляра: имя меняется, время создания повторяется у
+    # перезапуска в ту же секунду, а `$N` не повторяется, пока жив tmux-сервер.
+    tmux_id: str = ""
 
     def uptime_s(self) -> float:
         return max(0.0, time.time() - self.created_at)
@@ -196,14 +208,16 @@ async def list_sessions() -> list[RemoteSession]:
     sessions: list[RemoteSession] = []
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) != 6:
+        if len(parts) != _FIELDS:
             # Молча пропущенная строка — исчезнувшая сессия: её не найдёт ни
             # `find`, ни `resolve`, а Watcher отчитается о смерти. Ярлык чистим
             # (`worktrees.clean_name`), так что это уже не должно случаться —
             # но если случилось, в логе должно остаться, из-за чего.
-            log.warning("list-sessions: строка с %d полями вместо 6: %r", len(parts), line)
+            log.warning(
+                "list-sessions: строка с %d полями вместо %d: %r", len(parts), _FIELDS, line
+            )
             continue
-        tmux_name, path, created, url, label, mode = parts
+        tmux_name, path, created, url, label, mode, tmux_id = parts
         # Наши сессии — либо ещё не переименованные (префикс), либо уже
         # названные id сессии Claude (тогда имя ни о чём не говорит, но
         # `@rc_url` выставлен). Одного признака мало: по префиксу не видно
@@ -219,6 +233,7 @@ async def list_sessions() -> list[RemoteSession]:
                 created_at=int(created) if created.isdigit() else 0,
                 label=label,
                 mode=mode,
+                tmux_id=tmux_id,
             )
         )
     return sorted(sessions, key=lambda s: s.name)

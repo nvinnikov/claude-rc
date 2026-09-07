@@ -1,3 +1,4 @@
+import dataclasses
 import datetime
 import re
 import time
@@ -311,6 +312,7 @@ def _session(url: str = "https://claude.ai/code/session_01ABC") -> RemoteSession
         cwd="/Users/n/code/oms",
         url=url,
         created_at=int(time.time()) - 60,
+        tmux_id="$1",
     )
 
 
@@ -332,22 +334,30 @@ def test_session_card_is_the_passport_html() -> None:
 
 def test_same_session_recognises_the_session_from_the_card() -> None:
     session = _session()
-    assert _same_session(session, session.created_at) is session
+    assert _same_session(session, session.tmux_id) is session
 
 
 def test_same_session_rejects_a_relaunch_in_the_same_directory() -> None:
     """Устаревшая кнопка Stop не имеет права погасить чужую работу.
 
     Каталог — ключ сессии, но не удостоверение: прежняя могла умереть, а в том
-    же каталоге подняться новая. Переименование `session_created` сохраняет,
-    перезапуск — нет.
+    же каталоге подняться новая. Время создания их не различает — оно в целых
+    секундах, а `restart` укладывается в одну; `$N` не переиспользуется.
     """
     session = _session()
-    assert _same_session(session, session.created_at - 1) is None
+    assert _same_session(session, "$2") is None
+
+
+def test_same_session_rejects_a_relaunch_in_the_very_same_second() -> None:
+    # Ровно случай `restart`: время создания то же, экземпляр другой.
+    session = _session()
+    fresh = dataclasses.replace(session, tmux_id="$7")
+    assert fresh.created_at == session.created_at
+    assert _same_session(fresh, session.tmux_id) is None
 
 
 def test_same_session_handles_a_directory_with_no_session() -> None:
-    assert _same_session(None, 1000) is None
+    assert _same_session(None, "$1") is None
 
 
 def test_pull_line_reports_what_the_pull_did() -> None:

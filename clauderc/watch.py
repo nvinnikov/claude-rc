@@ -25,17 +25,6 @@ POLL_S = 15.0
 
 OnDied = Callable[["Died"], Awaitable[None]]
 
-# Метка ожидаемой смерти: каталог сессии и время её создания. Каталог — потому
-# что имя меняется у сессии под ногами (`await_url` даёт ей id Claude), и
-# снятая поллером под прежним именем сессия не совпала бы с меткой,
-# поставленной под новым. Время создания — потому что каталога мало: `restart`
-# поднимает в том же каталоге новую сессию через миллисекунды, и метка «по
-# каталогу» пережила бы её и проглотила первое настоящее падение уже
-# перезапущенной. `None` вместо времени — «экземпляр неизвестен» (сессия не
-# дожила до ссылки, спросить её `created_at` не у кого): такая метка работает
-# по каталогу, как раньше.
-Mark = tuple[str, int | None]
-
 
 @dataclass(frozen=True)
 class Died:
@@ -51,92 +40,94 @@ class Watcher:
         self._poll_s = poll_s
         self._known: dict[str, RemoteSession] | None = None
         self._expected: set[str] = set()
-        self._marks: set[Mark] = set()
+
+    def _forget(self, cwd: str | None, tmux_id: str | None) -> None:
+        """Вычёркивает погашенную сессию из базового снимка.
+
+        Поллер считает смертью исчезновение из снимка — значит убрать сессию из
+        снимка и есть точный способ сказать «эта смерть ожидаемая». Метка рядом
+        со снимком (по имени, по каталогу, по id) всегда хуже: она переживает
+        сессию, а сессия на её месте появляется мгновенно. `restart` гасит и
+        поднимает в одном каталоге, и различить их нечем — `#{session_created}`
+        идёт целыми секундами, а `#{session_id}` начинает нумерацию заново, если
+        гасимая была на сервере единственной и сервер ушёл вместе с ней. Из
+        снимка же вычеркнута именно погашенная: поднятой в нём ещё нет, и её
+        собственная смерть дойдёт до человека как положено.
+
+        Ключ — tmux-id, когда он известен, иначе каталог (сессия в нём одна).
+        """
+        if self._known is None or (cwd is None and tmux_id is None):
+            return
+        self._known = {
+            name: s
+            for name, s in self._known.items()
+            if not (s.tmux_id == tmux_id if tmux_id else same_path(s.cwd, cwd or ""))
+        }
 
     def expect_death(
-        self, tmux_name: str, cwd: str | None = None, created_at: int | None = None
+        self, tmux_name: str, cwd: str | None = None, tmux_id: str | None = None
     ) -> None:
         """Помечает смерть ожидаемой, не гася сессию: её уже погасил кто-то другой."""
         self._expected.add(tmux_name)
-        if cwd is not None:
-            self._marks.add((cwd, created_at))
+        self._forget(cwd, tmux_id or None)
 
     async def kill(
-        self, tmux_name: str, cwd: str | None = None, created_at: int | None = None
+        self, tmux_name: str, cwd: str | None = None, tmux_id: str | None = None
     ) -> bool:
         """Гасит сессию, пометив смерть ожидаемой.
 
-        `cwd` и `created_at` стоит передавать всегда, когда они известны: имя
-        сессии меняется под ногами, а один каталог не отличает погашенную
-        сессию от поднятой на её месте (см. `Mark`). Все вызывающие сессию уже
-        держат — спрашивать tmux второй раз незачем.
+        `cwd` и `tmux_id` стоит передавать всегда, когда они известны: имя
+        сессии меняется под ногами, и метка по имени не совпадёт с тем, что
+        поллер снял под прежним. Все вызывающие сессию уже держат — спрашивать
+        tmux второй раз незачем.
+
+        Из снимка вычёркиваем только после удачного гашения: `_forget` на живой
+        сессии стёр бы из базы то, чему ещё предстоит умереть, и настоящее
+        падение прошло бы молча. Метка по имени остаётся страховкой на гонку —
+        `poll` мог запросить `list-sessions` до гашения, а разложить ответ по
+        снимку уже после, и тогда погашенная сессия попадёт в снимок живой.
         """
-        self.expect_death(tmux_name, cwd, created_at)
+        self._expected.add(tmux_name)
         killed = await kill_tmux(tmux_name)
         if not killed:
             # Гашение не удалось — сессия жива, а метка на живой сессии переживёт
             # её и проглотит настоящее падение. Одноразовость важнее лишней карточки.
             self._expected.discard(tmux_name)
-            if cwd is not None:
-                self._marks.discard((cwd, created_at))
-        return killed
+            return False
+        self._forget(cwd, tmux_id or None)
+        return True
 
     async def kill_all(self) -> int:
         killed = 0
         for session in await list_sessions():
-            killed += await self.kill(session.tmux_name, session.cwd, session.created_at)
+            killed += await self.kill(session.tmux_name, session.cwd, session.tmux_id)
         return killed
-
-    @staticmethod
-    def _matches(mark: Mark, session: RemoteSession) -> bool:
-        path, instance = mark
-        return same_path(path, session.cwd) and instance in (None, session.created_at)
-
-    def _take_mark(self, session: RemoteSession) -> bool:
-        """Снимает метку, если она про эту сессию. Метка одноразовая."""
-        found = next((m for m in self._marks if self._matches(m, session)), None)
-        if found is None:
-            return False
-        self._marks.discard(found)
-        return True
 
     async def poll(self, on_died: OnDied) -> None:
         current = {s.tmux_name: s for s in await list_sessions()}
         previous, self._known = self._known, current
 
-        # Метки живут только пока жива сессия: иначе неудавшееся гашение оставило бы
-        # вечное «не сообщать», и настоящее падение прошло бы молча.
+        # Метка по имени живёт, только пока жива сессия: иначе неудавшееся гашение
+        # оставило бы вечное «не сообщать», и настоящее падение прошло бы молча.
         expected_gone = self._expected - set(current)
         self._expected &= set(current)
 
         # previous is None — первый снимок базовый: что бы в нём ни было,
         # падений ещё не видели.
         for tmux_name, session in (previous or {}).items():
-            if tmux_name in current:
+            if tmux_name in current or tmux_name in expected_gone:
                 continue
-            # Имя пропало, но сессия в том же каталоге и той же давности жива —
-            # значит её переименовали, а не потеряли: `await_url` даёт ей id
-            # сессии Claude, как только тот появится. Одного каталога мало:
-            # упавшую сессию могли тут же поднять заново, и настоящая смерть
-            # прошла бы молча. `session_created` переименование сохраняет,
-            # а перезапуск — нет.
-            if any(
-                same_path(alive.cwd, session.cwd) and alive.created_at == session.created_at
-                for alive in current.values()
+            # Имя пропало, но тот же экземпляр жив — значит сессию
+            # переименовали, а не потеряли: `await_url` даёт ей id сессии
+            # Claude, как только тот появится. Сверяем tmux-id, а не время
+            # создания: `#{session_created}` — целые секунды, и перезапуск в ту
+            # же секунду выглядел бы переименованием, то есть настоящая смерть
+            # прошла бы молча. Переименование `$N` сохраняет, перезапуск — нет.
+            if session.tmux_id and any(
+                alive.tmux_id == session.tmux_id for alive in current.values()
             ):
                 continue
-            if tmux_name in expected_gone or self._take_mark(session):
-                continue  # погасили намеренно, пусть и под другим именем
             await on_died(Died(name=session.name, tmux_name=tmux_name, cwd=session.cwd))
-
-        # Тот же расчёт одноразовости, что у меток по имени, но после разбора
-        # снимка: метка, погасившая отчёт, уже снята выше, а из оставшихся
-        # выживают только те, чей экземпляр ещё жив.
-        self._marks = {
-            mark
-            for mark in self._marks
-            if any(self._matches(mark, alive) for alive in current.values())
-        }
 
     async def run(self, on_died: OnDied) -> None:
         while True:
