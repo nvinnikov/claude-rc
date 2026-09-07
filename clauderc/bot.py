@@ -784,8 +784,12 @@ async def main() -> None:
             # меняется у неё под ногами — `await_url` переименовывает её в id, как
             # только появится ссылка, и запомненное имя перестало бы существовать.
             card_pending[token] = (real, session.tmux_id)
+            # Без внешнего отреза: карточка ограничена по построению — строки
+            # паспорта плюс хвост панели, который `pre_block` держит в 1500
+            # экранированных символов. А срез готовой строки уносил бы
+            # закрывающий тег и Telegram отвечал бы 400 на весь листинг.
             await message.answer(
-                _session_card(p)[:3800],
+                _session_card(p),
                 parse_mode="HTML",
                 reply_markup=_session_keyboard(token, session.url),
             )

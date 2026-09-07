@@ -187,9 +187,32 @@ def test_pre_block_cuts_before_escaping() -> None:
     inner = out.removeprefix("<pre>").removesuffix("</pre>")
     assert "<" not in inner
     assert "&lt" in inner and "&l;" not in inner
-    # В блок ушло не больше лимита сырых символов (плюс многоточие).
-    assert len(html.unescape(inner)) == 101
+    assert html.unescape(inner).endswith(raw[-10:])
+
+
+def test_pre_block_bounds_the_escaped_length() -> None:
+    # `html.escape` раздувает кавычки и скобки впятеро: текст, влезавший в
+    # лимит сырым, за него выходил, и карточку резали уже снаружи — ровно тем
+    # срезом, от которого pre_block и заведён.
+    raw = '"<' * 750
+    out = passport.pre_block(raw, 1500)
+
+    assert len(out) <= 1500 + len("<pre></pre>") + 1
+    assert out.endswith("</pre>")
+    inner = out.removeprefix("<pre>").removesuffix("</pre>")
+    assert "<" not in inner
+    assert inner.startswith("…")
 
 
 def test_pre_block_keeps_short_text_whole() -> None:
     assert passport.pre_block("short tail", 100) == "<pre>short tail</pre>"
+
+
+def test_as_html_stays_under_the_telegram_limit_on_a_quoted_tail() -> None:
+    # Карточка уходит без внешнего отреза (`show_chats`), значит её длина
+    # должна быть ограничена по построению, а не срезом на месте отправки.
+    base = passport.build(_session(), host="m1", tree=None)
+    html_text = passport.as_html(dataclasses.replace(base, last_lines=('"<' * 2000,)))
+
+    assert len(html_text) < 3800
+    assert html_text.endswith("</pre>")
