@@ -102,3 +102,16 @@ def test_run_remote_handles_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     assert code == 1
     assert "m1" in out
     assert "5" in out
+
+
+def test_strip_host_stops_at_the_double_dash() -> None:
+    # После «--» идут аргументы команды: `send oms -- --host` посылает в сессию
+    # текст «--host», а не требует имя машины, которого там нет.
+    assert proxy.strip_host(["send", "oms", "--", "--host"]) == (
+        None,
+        ["send", "oms", "--", "--host"],
+    )
+    assert proxy.strip_host(["--host", "m1", "send", "oms", "--", "--host=x"]) == (
+        "m1",
+        ["send", "oms", "--", "--host=x"],
+    )

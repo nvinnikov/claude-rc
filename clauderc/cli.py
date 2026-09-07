@@ -399,12 +399,23 @@ class _Commands:
             return EXIT_FAILED
 
         async def kill(tmux_name: str, cwd: str) -> bool:
+            # Watcher живёт только в боте: там гашение мимо него доехало бы до
+            # человека карточкой «сессия упала». В CLI отчитываться не перед
+            # кем, и kill_tmux напрямую здесь — правильный путь, а не обход.
             return await kill_tmux(tmux_name)
 
         try:
             fresh = asyncio.run(actions.restart(session, kill=kill, mode=args.mode))
-        except (actions.ActionError, LaunchError) as exc:
+        except actions.ActionError as exc:
+            # ActionError идёт только из проверки kill — сессия ещё жива,
+            # к перезапуску не приступали.
             print(str(exc), file=sys.stderr)
+            return EXIT_FAILED
+        except LaunchError as exc:
+            # LaunchError — уже из launch: прежней сессии к этому моменту нет,
+            # и молчать об этом нельзя (тот же расчёт, что у бота в on_bypass).
+            print(str(exc), file=sys.stderr)
+            print("Прежняя сессия погашена, заново не поднялась.", file=sys.stderr)
             return EXIT_FAILED
         except TrustRequired as need:
             print(f"Каталог снова ждёт доверия: {attach_command(need.tmux_name)}", file=sys.stderr)

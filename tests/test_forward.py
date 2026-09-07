@@ -126,3 +126,29 @@ def test_active_lists_pid_files(pid_dir: Path) -> None:
         forward.Forward(host="m1", port=3000, pid=1),
         forward.Forward(host="m3", port=80, pid=2),
     ]
+
+
+def test_start_accepts_user_at_host(monkeypatch: pytest.MonkeyPatch, pid_dir: Path) -> None:
+    # В ~/.ssh/config запись есть не всегда; `@` в имени pid-файла безопасен.
+    spawned: list[list[str]] = []
+
+    def fake_popen(argv: list[str], **kw: object) -> _FakeProc:
+        spawned.append(argv)
+        return _FakeProc(argv)
+
+    monkeypatch.setattr(forward.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(forward, "port_busy", lambda port: False)
+    (f,) = forward.start("user@m1", [3000])
+
+    assert spawned == [["ssh", "-N", "-L", "3000:localhost:3000", "user@m1"]]
+    assert f.host == "user@m1"
+    assert (pid_dir / "user@m1-3000.pid").is_file()
+    # Обратный разбор pid-файла не должен терять часть до «@».
+    assert forward.active() == [f]
+
+
+def test_start_still_refuses_a_host_that_looks_like_an_ssh_option(pid_dir: Path) -> None:
+    # Часть до «@» тоже обязана начинаться с буквы или цифры, иначе аргумент
+    # уедет в argv ssh как опция.
+    with pytest.raises(forward.ForwardError, match="хоста"):
+        forward.start("-oProxyCommand=x@m1", [3000])

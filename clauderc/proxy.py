@@ -36,6 +36,13 @@ def strip_host(argv: list[str]) -> tuple[str | None, list[str]]:
     rest: list[str] = []
     it = iter(argv)
     for arg in it:
+        if arg == "--":
+            # Всё после одиночного «--» — аргументы самой команды, а не наши
+            # опции: `send oms -- --host` посылает в сессию текст «--host»,
+            # а не требует имя машины, которого там нет.
+            rest.append(arg)
+            rest.extend(it)
+            break
         if arg == "--host":
             value = next(it, None)
             if not value or value.startswith("-"):

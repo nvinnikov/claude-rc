@@ -517,7 +517,7 @@ uv tool install .
 
 One machine is the whole product; add `host = "m1"` to its config when you have a second
 one — the session passport then prints `ssh m1 -t 'tmux attach …'` and
-`claude-rc --host m1 …` forms. A Claude session that manages other sessions (on the same
+`claude-rc --host m1 …` forms. The host is whatever ssh takes, `user@m1` included. A Claude session that manages other sessions (on the same
 machine or another) needs exactly one call to see everything:
 
 ```bash
@@ -660,7 +660,9 @@ and shaped the code:
 - **State is an observation, and `unknown` is the honest fallback.** There's no event stream
   from tmux and no status API from claude; `state_probe.probe` gets everything from
   pattern-matching one `capture-pane`. `idle` and `needs_input` come from known pane shapes —
-  an empty input frame, a numbered dialog, a trust prompt — and whatever matches none of them
+  an empty input frame, a numbered dialog with its highlighted item (the caret is required:
+  without it any answer containing a numbered list read as a question), a trust prompt — and
+  whatever matches none of them
   is `unknown`, never a guess: a claude update that changes the TUI has to surface as
   "we don't know," not as a wrong `idle`.
 - **`@rc_mode` and the `auto` default.** `launch` records the permission mode a session

@@ -22,7 +22,10 @@ _DEFAULT_DIR = "~/.claude-rc/forwards"
 _SETTLE_S = 0.5
 # Имя хоста для ssh: без "/" и без ведущего "-" — иначе оно попадёт прямо в
 # путь pid-файла (../../etc/x сбежал бы из pid_dir()) или сойдёт за опцию ssh.
-_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# `user@host` разрешён: в ~/.ssh/config запись есть не всегда, а `@` в имени
+# файла безопасен. Часть до `@` тоже обязана начинаться с буквы или цифры —
+# иначе `-oProxyCommand=…@m1` уехал бы в argv ssh именно как опция.
+_HOST_RE = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class ForwardError(RuntimeError):

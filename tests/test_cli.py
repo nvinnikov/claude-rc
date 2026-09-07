@@ -2730,3 +2730,24 @@ def test_forward_accepts_a_bare_repo_name(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(cli.forward, "start", fake_start)
     assert cli.main(["--host", "m1", "forward", "oms"]) == 0
     assert seen["ports"] == [3000]
+
+
+def test_restart_says_the_old_session_is_already_gone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # LaunchError идёт уже после kill: прежней сессии нет, и человек должен
+    # узнать об этом, а не гадать по одному тексту ошибки запуска.
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [_session()]
+
+    async def fake_restart(
+        session: RemoteSession, *, kill: Any, mode: str | None = None, timeout_s: float = 90.0
+    ) -> RemoteSession:
+        raise LaunchError("ссылка не появилась за 90с")
+
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "restart", fake_restart)
+    assert cli.main(["restart", "oms"]) == 1
+    err = capsys.readouterr().err
+    assert "ссылка не появилась" in err
+    assert "Прежняя сессия погашена, заново не поднялась." in err

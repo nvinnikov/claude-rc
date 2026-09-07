@@ -607,11 +607,15 @@ async def main() -> None:
         # отменяет (worktree будет свой), но тянуть репозиторий под ней нельзя.
         alive_here = await find(str(target))
         if alive_here is not None and branch is None:
+            # Полный пульт, а не одна ссылка: сессия та же самая, и Bypass,
+            # Tail и Rename нужны здесь ровно так же, как на карточке запуска.
+            token = uuid.uuid4().hex[:8]
+            card_pending[token] = (os.path.realpath(alive_here.cwd), alive_here.created_at)
             await notice.edit_text(
                 f"Уже поднята.\n"
                 f"{_session_card(passport.build(alive_here, host=config.host, tree=None))}",
                 parse_mode="HTML",
-                reply_markup=_open_keyboard(alive_here.url),
+                reply_markup=_session_keyboard(token, alive_here.url),
             )
             return
 
@@ -646,13 +650,15 @@ async def main() -> None:
 
         alive = await find(str(cwd))
         if alive is not None:
+            token = uuid.uuid4().hex[:8]
+            card_pending[token] = (os.path.realpath(alive.cwd), alive.created_at)
             await notice.edit_text(
                 told(
                     f"Уже поднята.\n"
                     f"{_session_card(passport.build(alive, host=config.host, tree=None))}"
                 ),
                 parse_mode="HTML",
-                reply_markup=_open_keyboard(alive.url),
+                reply_markup=_session_keyboard(token, alive.url),
             )
             return
 
