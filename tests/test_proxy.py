@@ -115,3 +115,20 @@ def test_strip_host_stops_at_the_double_dash() -> None:
         "m1",
         ["send", "oms", "--", "--host=x"],
     )
+
+
+def test_relative_paths_covers_connect() -> None:
+    # `connect --start` поднимает сессию в каталоге, и пустая цель на той стороне
+    # означала бы домашний каталог удалённой машины, а не текущий здесь.
+    assert proxy.relative_paths(["connect", "--start"]) == ["."]
+    assert proxy.relative_paths(["connect", ".", "--start"]) == ["."]
+    assert proxy.relative_paths(["connect", "../x", "--start"]) == ["../x"]
+    assert proxy.relative_paths(["connect", "--start", "--branch", "feat/x", "/abs"]) == []
+
+
+def test_relative_paths_lets_a_connect_label_through() -> None:
+    # Цель `connect` — не обязательно путь: ярлык и session_… резолвит та сторона.
+    assert proxy.relative_paths(["connect", "oms@x"]) == []
+    assert proxy.relative_paths(["connect", "session_01A", "--read-only"]) == []
+    # Без --start пустая цель — «единственная живая сессия», а не каталог.
+    assert proxy.relative_paths(["connect"]) == []

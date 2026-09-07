@@ -20,7 +20,7 @@ LOCAL_ONLY = frozenset({"bot", "forward", "update"})
 TTY_COMMANDS = frozenset({"connect", "start", "setup"})
 # Команды с путём в позиционном аргументе: относительный путь означал бы
 # каталог этой машины, а исполняется команда на той.
-PATH_COMMANDS = frozenset({"start", "whoami", "sync"})
+PATH_COMMANDS = frozenset({"start", "whoami", "sync", "connect"})
 # Опции этих команд, у которых есть значение — чтобы не принять его за путь.
 _VALUED_OPTIONS = frozenset({"--branch", "--resume", "--permission-mode", "--name", "--mode"})
 # Неинтерактивный ssh не читает .zshrc; uv tool кладёт бинарь в ~/.local/bin.
@@ -62,11 +62,23 @@ def command_of(argv: list[str]) -> str | None:
     return next((a for a in argv if not a.startswith("-")), None)
 
 
+def _looks_like_path(arg: str) -> bool:
+    """Похоже ли на путь то, что может быть и ярлыком, и id сессии.
+
+    У `connect` позиционный аргумент — цель в широком смысле: `oms@x`,
+    `session_01A` или каталог. Отличаем каталог по разделителю или по явным
+    `.`/`..`: ярлык и id сессии их не содержат, а «./x» и «../x» человек пишет
+    именно как путь.
+    """
+    return os.sep in arg or arg in (".", "..")
+
+
 def relative_paths(argv: list[str]) -> list[str]:
     command = command_of(argv)
     if command not in PATH_COMMANDS:
         return []
     positionals: list[str] = []
+    options: list[str] = []
     skip = False
     for arg in argv[argv.index(command) + 1 :]:
         if skip:
@@ -76,9 +88,17 @@ def relative_paths(argv: list[str]) -> list[str]:
             skip = True
             continue
         if arg.startswith("-"):
+            options.append(arg)
             continue
         positionals.append(arg)
-    if not positionals and command != "sync":
+    if command == "connect":
+        # Цель, не похожая на путь, — ярлык или session_…: её резолвит та
+        # сторона, и относительной она не бывает. Пустая цель означает каталог
+        # только вместе с `--start`; иначе это «единственная живая сессия».
+        positionals = [p for p in positionals if _looks_like_path(p)]
+        if not positionals and "--start" in options:
+            positionals = ["."]
+    elif not positionals and command != "sync":
         positionals = ["."]
     return [p for p in positionals if not (os.path.isabs(p) or p.startswith("~"))]
 
