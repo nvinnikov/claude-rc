@@ -17,6 +17,21 @@ def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(proxy.HOST_ENV, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """То же самое, но про конфиг: на машине с боевым `config.toml` тесты читали его.
+
+    В CI конфига нет и всё зелено, а у того, кто им пользуется, `host = "m3"`
+    доезжал до паспорта сессии, и `test_whoami_json_…` падал на чужих данных.
+    Тесты, которым конфиг нужен, подменяют `paths.config_file` сами — их
+    подмена выполняется позже этой и остаётся в силе.
+    """
+    absent = tmp_path_factory.mktemp("no-config") / "config.toml"
+    monkeypatch.setenv("CLAUDE_RC_CONFIG", str(absent))
+
+
 async def _fake_no_worktree(path: Path) -> Worktree | None:
     """Заглушка `worktrees.inspect` — юнит-тест не должен ходить в git по /repos/…"""
     return None
