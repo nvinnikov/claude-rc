@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from clauderc.remote import PERMISSION_MODES
+from clauderc.sync import DEFAULT_CONCURRENCY
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,8 @@ class Config:
     worktree_root: Path
     state_path: Path
     scan_depth: int
+    # Сколько репозиториев `sync` обходит одновременно (см. sync.DEFAULT_CONCURRENCY).
+    sync_concurrency: int
     launch_timeout_s: float
     permission_mode: str | None
     pull_before_start: bool
@@ -44,6 +47,7 @@ def load_config(path: Path) -> Config:
     worktree_root = _require_path(raw, "worktree_root", "~/.claude-rc/worktrees")
     state_path = _require_path(raw, "state_path", "~/.claude-rc/state.json")
     scan_depth = _require_int(raw, "scan_depth", default=3)
+    sync_concurrency = _require_positive_int(raw, "sync_concurrency", default=DEFAULT_CONCURRENCY)
     launch_timeout_s = _require_number(raw, "launch_timeout_s", default=90)
     permission_mode = _require_permission_mode(raw)
     pull_before_start = _require_bool(raw, "pull_before_start", default=False)
@@ -61,6 +65,7 @@ def load_config(path: Path) -> Config:
         worktree_root=worktree_root,
         state_path=state_path,
         scan_depth=scan_depth,
+        sync_concurrency=sync_concurrency,
         launch_timeout_s=launch_timeout_s,
         permission_mode=permission_mode,
         pull_before_start=pull_before_start,
@@ -116,6 +121,16 @@ def _require_int(raw: dict[str, Any], key: str, *, default: int | None = None) -
     # bool — подкласс int в Python: allowed_user_id = true иначе тихо стал бы 1.
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{key}: ожидалось целое число")
+    return value
+
+
+def _require_positive_int(raw: dict[str, Any], key: str, *, default: int) -> int:
+    """Целое больше нуля. Ноль здесь — не «без ограничения», а обход, который
+    никогда не начнётся: семафор на нулевой ёмкости просто повис бы навсегда.
+    """
+    value = _require_int(raw, key, default=default)
+    if value < 1:
+        raise ValueError(f"{key}: ожидалось целое число больше нуля")
     return value
 
 

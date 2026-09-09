@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 from pathlib import Path
 
@@ -532,6 +533,121 @@ async def test_sync_all_keeps_other_results_when_one_repo_raises(
     assert outcomes["alpha"] is sync.Outcome.already
     assert outcomes["beta"] is sync.Outcome.failed
     assert outcomes["gamma"] is sync.Outcome.already
+
+
+async def test_sync_all_runs_no_more_repos_at_once_than_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Регрессия: обход запускал все репозитории разом, и два десятка fetch'ей
+    # упирались в лимит одновременных ssh-подключений сервера.
+    running = 0
+    peak = 0
+
+    async def slow(repo: Path, **kwargs: object) -> sync.SyncResult:
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        # Отдаём управление циклу: без этого каждый вызов успевал бы завершиться
+        # до старта следующего, и одновременных не было бы вовсе даже без семафора.
+        await asyncio.sleep(0)
+        running -= 1
+        return sync.SyncResult(repo, sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(sync, "sync", slow)
+    targets = [Path(f"/repos/{i}") for i in range(12)]
+
+    results = await sync.sync_all(targets, concurrency=3)
+
+    assert len(results) == len(targets)
+    assert peak == 3
+
+
+async def test_sync_all_limits_concurrency_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    running = 0
+    peak = 0
+
+    async def slow(repo: Path, **kwargs: object) -> sync.SyncResult:
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0)
+        running -= 1
+        return sync.SyncResult(repo, sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(sync, "sync", slow)
+    targets = [Path(f"/repos/{i}") for i in range(12)]
+
+    await sync.sync_all(targets)
+
+    assert peak == sync.DEFAULT_CONCURRENCY
+
+
+async def test_sync_all_never_stalls_on_non_positive_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Семафор нулевой ёмкости повис бы навсегда, а вместе с ним и отчёт.
+    async def ok(repo: Path, **kwargs: object) -> sync.SyncResult:
+        return sync.SyncResult(repo, sync.Outcome.already, "ok", "main")
+
+    monkeypatch.setattr(sync, "sync", ok)
+
+    results = await sync.sync_all([Path("/repos/alpha")], concurrency=0)
+
+    assert [r.outcome for r in results] == [sync.Outcome.already]
+
+
+async def test_failed_fetch_hints_retry_when_ssh_dropped_before_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Отказ по лимиту подключений и отказ доступа дают один и тот же `fatal:`;
+    # различает их только строка ssh выше по выводу.
+    _, clone = _make_origin_and_clone(tmp_path)
+    real_git = worktrees._git
+
+    async def dropped_fetch(
+        cwd: Path, *args: str, timeout_s: float | None = None
+    ) -> tuple[int, str]:
+        if args[:1] == ("fetch",):
+            return 128, (
+                "kex_exchange_identification: Connection closed by remote host\n"
+                "Connection closed by 10.0.0.1 port 22\n"
+                "fatal: Could not read from remote repository.\n"
+            )
+        return await real_git(cwd, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(sync, "_git", dropped_fetch)
+
+    result = await sync.sync(clone)
+
+    assert result.outcome is sync.Outcome.failed
+    assert result.detail.startswith("fatal: Could not read from remote repository.")
+    assert "повторить" in result.detail
+
+
+async def test_failed_fetch_keeps_silent_about_retry_when_access_denied(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, clone = _make_origin_and_clone(tmp_path)
+    real_git = worktrees._git
+
+    async def denied_fetch(
+        cwd: Path, *args: str, timeout_s: float | None = None
+    ) -> tuple[int, str]:
+        if args[:1] == ("fetch",):
+            return 128, (
+                "git@example.com: Permission denied (publickey).\n"
+                "fatal: Could not read from remote repository.\n"
+            )
+        return await real_git(cwd, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(sync, "_git", denied_fetch)
+
+    result = await sync.sync(clone)
+
+    assert result.outcome is sync.Outcome.failed
+    assert result.detail == "fatal: Could not read from remote repository."
 
 
 def test_resolve_targets_expands_tilde_before_checking_is_repo(

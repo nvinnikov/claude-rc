@@ -436,9 +436,9 @@ It asks three things:
 It writes `~/.config/claude-rc/config.toml` with mode `600` (and the directory `700`) —
 that file holds a live token; a repeat run narrows the permissions even if the file used to
 be wider. A repeat `claude-rc setup` pre-fills the previous values as hints and changes only
-what you answer — an empty answer keeps the old value. Seven technical fields the wizard
-never asks about (`worktree_root`, `state_path`, `scan_depth`, `launch_timeout_s`,
-`permission_mode`, `pull_before_start`, `host`) are carried over verbatim on rewrite; anything else outside that list (including human
+what you answer — an empty answer keeps the old value. Eight technical fields the wizard
+never asks about (`worktree_root`, `state_path`, `scan_depth`, `sync_concurrency`,
+`launch_timeout_s`, `permission_mode`, `pull_before_start`, `host`) are carried over verbatim on rewrite; anything else outside that list (including human
 comments) is not preserved.
 
 Then open the ClaudeRC app or run `claude-rc bot`.
@@ -459,6 +459,10 @@ Then open the ClaudeRC app or run `claude-rc bot`.
    - `permission_mode` — optional: what a session starts with, so it doesn't stop and
      ask at every step while you're holding a phone
    - `pull_before_start` — optional: fetch origin before a session starts
+   - `sync_concurrency` — optional: how many repositories Sync walks at once
+     (default 4). Every fetch is a separate ssh connection, and a couple of dozen
+     at once hit the server's `MaxStartups`: it drops some of them, and those
+     repositories fail with `Could not read from remote repository`
    - `host` — optional: how this machine is reached over ssh from your other ones (an
      alias from `~/.ssh/config`). Only needed once there's a second machine: with it the
      session passport prints a ready `ssh <host> -t 'tmux attach …'` and the
@@ -470,7 +474,8 @@ The config is looked up in order: the path in `$CLAUDE_RC_CONFIG` if set; otherw
 first file that exists wins.
 
 **Field types are strict.** `bot_token`, `worktree_root`, `state_path` are strings;
-`allowed_user_id`, `scan_depth` are integers; `launch_timeout_s` is a number; `rc_roots` is
+`allowed_user_id`, `scan_depth`, `sync_concurrency` are integers
+(`sync_concurrency` must be positive); `launch_timeout_s` is a number; `rc_roots` is
 a string or a list of strings. A wrongly typed value used to slip silently through
 `int()`/`float()` (a quoted number like `allowed_user_id = "123"` — a common way to write
 numbers in many formats — would read as a string and blow up at the bot's first start).
@@ -571,7 +576,11 @@ paying for a fetch across all of them.
 Each report line is one repository: `⤵` pulled, `=` already current, `·` skipped, `✗`
 failed; a tally per outcome at the end. With no arguments it syncs the repositories directly
 inside the current directory (not recursively); explicit paths sync only those. Repositories
-are walked in parallel.
+are walked in parallel, but no more than `sync_concurrency` at a time (4 by default):
+every fetch opens its own ssh connection, and a couple of dozen at once run into the
+server's `MaxStartups` limit, which drops a random part of them. When git's output shows
+the connection was cut before authentication, the report line says so — that failure just
+needs a retry, unlike a genuine `Permission denied`.
 
 ## Design notes
 
@@ -668,6 +677,17 @@ and shaped the code:
   honestly zero, so `wtrm` without `force` would stop refusing. `sync.py` therefore refuses
   to switch branches in **any** worktree, independently of whether a live RC session is
   there — two separate checks, either one is enough.
+- **Walking repositories is parallel, but bounded.** A `git fetch` over ssh is one
+  connection per repository, and sshd drops the extras before authentication
+  (`MaxStartups`, `10:30:100` by default). A directory of two dozen repositories failed
+  exactly that way: 4-6 of them died with `fatal: Could not read from remote repository`,
+  a different set every run, though every one of them was reachable on its own. `sync_all`
+  holds a semaphore (`sync_concurrency`, 4 by default) created per call rather than per
+  module — asyncio primitives bind to the first loop that awaited them, and a
+  process-wide one would break in the second `asyncio.run`. A connection-limit refusal
+  differs from a real access refusal only in the ssh line *above* the `fatal:`
+  (`kex_exchange_identification` and friends), so the "just retry" hint is looked up
+  across the whole output, not in the line the report shows.
 - **`.requiresApproval` from `SMAppService.mainApp.register()` is not an error.** It's
   success pending a human's confirmation in System Settings. Mistaking it for a failure and
   adding a hand-rolled LaunchAgent on top gives you two autostart mechanisms and a doubled

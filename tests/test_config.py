@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 from clauderc.config import Config, load_config
+from clauderc.sync import DEFAULT_CONCURRENCY
 
 
 def _write(tmp_path: Path, body: str) -> Path:
@@ -21,6 +22,7 @@ def test_load_config_reads_all_fields(tmp_path: Path) -> None:
         f'worktree_root = "{tmp_path / "wt"}"\n'
         f'state_path = "{tmp_path / "state.json"}"\n'
         "scan_depth = 2\n"
+        "sync_concurrency = 6\n"
         "launch_timeout_s = 30\n"
         'permission_mode = "acceptEdits"\n'
         "pull_before_start = true\n",
@@ -33,6 +35,7 @@ def test_load_config_reads_all_fields(tmp_path: Path) -> None:
         worktree_root=tmp_path / "wt",
         state_path=tmp_path / "state.json",
         scan_depth=2,
+        sync_concurrency=6,
         launch_timeout_s=30.0,
         permission_mode="acceptEdits",
         pull_before_start=True,
@@ -56,6 +59,7 @@ def test_defaults_are_applied(tmp_path: Path) -> None:
     loaded = load_config(cfg)
 
     assert loaded.scan_depth == 3
+    assert loaded.sync_concurrency == DEFAULT_CONCURRENCY
     assert loaded.launch_timeout_s == 90.0
 
 
@@ -146,6 +150,29 @@ def test_wrong_typed_scan_depth_raises_value_error(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="scan_depth"):
+        load_config(cfg)
+
+
+def test_wrong_typed_sync_concurrency_raises_value_error(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path,
+        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n'
+        'sync_concurrency = "4"\n',
+    )
+
+    with pytest.raises(ValueError, match="sync_concurrency"):
+        load_config(cfg)
+
+
+def test_non_positive_sync_concurrency_raises_value_error(tmp_path: Path) -> None:
+    # Ноль — не «без ограничения», а обход, который никогда не начнётся.
+    cfg = _write(
+        tmp_path,
+        f'bot_token = "abc"\nallowed_user_id = 1\nrc_roots = ["{tmp_path}"]\n'
+        "sync_concurrency = 0\n",
+    )
+
+    with pytest.raises(ValueError, match="sync_concurrency"):
         load_config(cfg)
 
 

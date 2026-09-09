@@ -25,6 +25,25 @@ from clauderc.worktrees import _git
 # сетевых операций sync.
 _NETWORK_TIMEOUT_S = 120.0
 
+# Сколько репозиториев обходим одновременно (см. `sync_all`). Четыре заметно
+# быстрее последовательного обхода и с запасом ниже порога `MaxStartups` у sshd,
+# после которого сервер начинает отбрасывать подключения. Настраивается ключом
+# `sync_concurrency` в config.toml — у кого-то в корне три репозитория, у кого-то
+# двадцать два.
+DEFAULT_CONCURRENCY = 4
+
+# Подписи ssh-подключения, оборванного до аутентификации: так выглядит отказ по
+# лимиту одновременных подключений (`MaxStartups` у sshd), а не отсутствие
+# доступа. Отказ в доступе печатает `Permission denied (publickey)` и ни одной
+# из этих строк не даёт — подсказку «повтори» он не получит.
+_PRE_AUTH_DROP = (
+    "kex_exchange_identification",
+    "ssh_exchange_identification",
+    "banner exchange",
+)
+
+_RETRY_HINT = "сервер оборвал подключение до входа, можно повторить"
+
 
 @dataclass(frozen=True)
 class RepoStatus:
@@ -214,11 +233,30 @@ async def sync_one(repo: Path, *, branch: str | None = None, fetch: bool = True)
 
 
 async def sync_all(
-    targets: list[Path], *, branch: str | None = None, fetch: bool = True
+    targets: list[Path],
+    *,
+    branch: str | None = None,
+    fetch: bool = True,
+    concurrency: int = DEFAULT_CONCURRENCY,
 ) -> list[SyncResult]:
     # Параллельно: каждый репозиторий — несколько вызовов git, последовательно
-    # десяток штук ждать заметно дольше.
-    return list(await asyncio.gather(*(sync_one(t, branch=branch, fetch=fetch) for t in targets)))
+    # десяток штук ждать заметно дольше. Но не все разом: `fetch` по ssh — это
+    # отдельное подключение на репозиторий, а sshd отбрасывает лишние ещё до
+    # аутентификации (`MaxStartups`, по умолчанию `10:30:100`). На каталоге в
+    # два десятка репозиториев часть fetch'ей падала с «Could not read from
+    # remote repository», причём каждый раз другая. Семафор держит середину:
+    # быстрее последовательного обхода и ниже порога сервера.
+    #
+    # Семафор создаётся на вызов, а не на модуль: примитивы asyncio привязываются
+    # к первому циклу, в котором их ждали, и общий на весь процесс ломался бы во
+    # втором `asyncio.run` (CLI и тесты запускают их по нескольку).
+    limit = asyncio.Semaphore(max(1, concurrency))
+
+    async def guarded(target: Path) -> SyncResult:
+        async with limit:
+            return await sync_one(target, branch=branch, fetch=fetch)
+
+    return list(await asyncio.gather(*(guarded(t) for t in targets)))
 
 
 def _dedupe(paths: list[Path]) -> list[Path]:
@@ -292,9 +330,25 @@ def _short(output: str) -> str:
 
     Перед перемоткой git часто печатает несколько строк `hint:` и только потом
     `fatal:`/`error:` — в отчёт должна попасть причина, а не подсказка.
+
+    К `fatal: Could not read from remote repository` добавляется подсказка, если
+    выше по выводу видно, что ssh оборвали до аутентификации: сам `fatal:` в
+    обоих случаях один и тот же, и без подсказки лимит подключений неотличим от
+    отсутствия доступа (см. `_PRE_AUTH_DROP`).
     """
     lines = [line.strip() for line in output.splitlines() if line.strip()]
+    hint = f" — {_RETRY_HINT}" if _dropped_before_auth(lines) else ""
     for line in lines:
         if line.startswith(("fatal:", "error:")):
-            return line[:120]
-    return lines[0][:120] if lines else "git завершился с ошибкой"
+            return line[:120] + hint
+    return lines[0][:120] + hint if lines else "git завершился с ошибкой"
+
+
+def _dropped_before_auth(lines: list[str]) -> bool:
+    """Признак обрыва ssh до аутентификации в выводе git.
+
+    Строку печатает сам ssh, и до `fatal:` она не доходит: `_short` берёт первую
+    `fatal:`/`error:`, а подпись обрыва лежит выше неё.
+    """
+    lowered = [line.lower() for line in lines]
+    return any(mark in line for line in lowered for mark in _PRE_AUTH_DROP)

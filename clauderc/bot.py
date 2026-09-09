@@ -1034,11 +1034,14 @@ async def main() -> None:
             notice = await message.answer(f"⏳ Подтягиваю: {len(targets)}…")
 
             try:
-                # sync_one, а не sync: одно исключение не должно уронить весь
-                # gather и оставить «⏳ Подтягиваю…» висеть навсегда без отчёта
-                # по остальным.
-                results = await asyncio.gather(
-                    *(sync_mod.sync_one(path, branch=branch) for path in targets)
+                # sync_all, а не свой gather по sync_one: там же и ограничение
+                # одновременных репозиториев — без него два десятка fetch'ей
+                # разом упираются в лимит подключений сервера, и часть репо
+                # падает случайным образом (см. sync.sync_all). Исключение
+                # одного репозитория там тоже не роняет обход целиком, иначе
+                # «⏳ Подтягиваю…» висело бы навсегда без отчёта по остальным.
+                results = await sync_mod.sync_all(
+                    targets, branch=branch, concurrency=config.sync_concurrency
                 )
                 labels = sync_mod.display_names(targets)
                 lines = [_sync_report_line(r, label=labels[r.path]) for r in results]

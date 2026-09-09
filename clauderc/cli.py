@@ -620,7 +620,14 @@ class _Commands:
         if not targets:
             print("Репозиториев не нашлось.", file=sys.stderr)
             return EXIT_ENVIRONMENT
-        results = asyncio.run(clauderc_sync.sync_all(targets, branch=args.branch, fetch=args.fetch))
+        results = asyncio.run(
+            clauderc_sync.sync_all(
+                targets,
+                branch=args.branch,
+                fetch=args.fetch,
+                concurrency=_sync_concurrency(),
+            )
+        )
         labels = clauderc_sync.display_names([r.path for r in results])
         for result in results:
             print(
@@ -750,6 +757,22 @@ _OUTCOME_LABEL = {
     clauderc_sync.Outcome.skipped: "пропущено",
     clauderc_sync.Outcome.failed: "не получилось",
 }
+
+
+def _sync_concurrency() -> int:
+    """`sync_concurrency` из конфига, если он есть и читается; иначе умолчание.
+
+    `sync` — единственная команда, которая работает и без конфига вовсе (ей
+    хватает путей в аргументах), поэтому нечитаемый файл здесь не ошибка: обход
+    просто идёт с настройкой по умолчанию, а на битый конфиг пожалуется `doctor`.
+    """
+    config_path = paths.config_file()
+    if not config_path.is_file():
+        return clauderc_sync.DEFAULT_CONCURRENCY
+    try:
+        return load_config(config_path).sync_concurrency
+    except (ValueError, KeyError, OSError):
+        return clauderc_sync.DEFAULT_CONCURRENCY
 
 
 def _host_name() -> str:
@@ -1052,6 +1075,7 @@ _EXTRA_KEYS = (
     "worktree_root",
     "state_path",
     "scan_depth",
+    "sync_concurrency",
     "launch_timeout_s",
     "permission_mode",
     "pull_before_start",
