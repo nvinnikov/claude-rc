@@ -83,13 +83,36 @@ enum LoginItem {
             .appendingPathComponent("Library/LaunchAgents/\(label).plist")
     }
 
-    private static func writeAgent() throws {
-        let bundlePath = Bundle.main.bundlePath
-        let plist: [String: Any] = [
+    /// Содержимое запасного плиста — отдельной функцией, чтобы его можно было
+    /// проверить тестом, не трогая настоящий `~/Library/LaunchAgents`.
+    ///
+    /// `StandardOutPath`/`StandardErrorPath` обязательны. Без них launchd
+    /// отправляет вывод `open` в /dev/null, и когда автозапуск не срабатывает —
+    /// бандла нет на месте, карантин, отозванная подпись, — узнать причину
+    /// негде: приложение не стартовало, значит и в `Log.app` о себе ничего не
+    /// написало. Файл тот же самый, что у всех остальных писателей (`Log.fileURL`):
+    /// второй лог рядом завёл бы второе место, куда надо не забыть посмотреть.
+    static func agentPlist(bundlePath: String, logPath: String) -> [String: Any] {
+        [
             "Label": label,
             "ProgramArguments": ["/usr/bin/open", "-a", bundlePath],
             "RunAtLoad": true,
+            "StandardOutPath": logPath,
+            "StandardErrorPath": logPath,
         ]
+    }
+
+    private static func writeAgent() throws {
+        // launchd не создаёт каталоги под `StandardOutPath` сам, а `~/.claude-rc`
+        // к моменту регистрации могло ещё не быть: перенаправление тогда не
+        // заведётся, и лог, ради которого оно и добавлено, останется пустым.
+        // `openAppending` заводит и каталог, и файл с теми же правами, что у
+        // остальных писателей.
+        try? Log.openAppending(at: Log.fileURL).close()
+
+        let plist = agentPlist(
+            bundlePath: Bundle.main.bundlePath, logPath: Log.fileURL.path
+        )
         let data = try PropertyListSerialization.data(
             fromPropertyList: plist, format: .xml, options: 0
         )

@@ -109,9 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         exit(0)
     }
 
-    private var logURL: URL {
-        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude-rc/claude-rc.log")
-    }
+    private var logURL: URL { Log.fileURL }
 
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()

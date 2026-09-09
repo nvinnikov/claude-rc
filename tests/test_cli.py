@@ -1,6 +1,8 @@
 import json
+from email.message import Message
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 
 import pytest
 from clauderc import actions, cli, proxy, remote, state_probe
@@ -470,6 +472,283 @@ def test_doctor_reports_wrong_typed_field_instead_of_crashing(
     payload: dict[str, Any] = json.loads(capsys.readouterr().out)
     names = {check["name"]: check for check in payload["checks"]}
     assert names["config"]["ok"] is False
+
+
+_TOKEN = "123456:SECRET_VALUE"
+
+
+class _FakeWebhookResponse:
+    """Ответ `getWebhookInfo` — только то, что от него нужно `json.load`."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._body = json.dumps(payload).encode()
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeWebhookResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _configured(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Годный конфиг и найденные бинари — чтобы в тесте краснели только живые проверки."""
+    config = tmp_path / "config.toml"
+    root = tmp_path / "code"
+    root.mkdir()
+    config.write_text(f'bot_token = "{_TOKEN}"\nallowed_user_id = 1\nrc_roots = ["{root}"]\n')
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli.paths, "config_file", lambda: config)
+    return config
+
+
+def _fake_process(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pid: int | None,
+    checked: bool = True,
+    uptime: str | None = "2 ч 14 мин",
+) -> None:
+    monkeypatch.setattr(
+        cli, "_foreign_bot_pid", lambda: cli._ForeignBotCheck(pid=pid, checked=checked)
+    )
+    monkeypatch.setattr(cli, "_process_uptime", lambda pid: uptime)
+
+
+def _fake_webhook(
+    monkeypatch: pytest.MonkeyPatch,
+    result: dict[str, Any],
+    *,
+    seen: list[str] | None = None,
+) -> None:
+    def urlopen(url: str, timeout: float | None = None) -> _FakeWebhookResponse:
+        if seen is not None:
+            seen.append(url)
+        return _FakeWebhookResponse({"ok": True, "result": result})
+
+    monkeypatch.setattr(cli.request, "urlopen", urlopen)
+
+
+def _rows(output: str) -> dict[str, str]:
+    """Строки текстового doctor: имя проверки → «✓/✗ …»."""
+    rows = {}
+    for line in output.splitlines():
+        _, _, rest = line.partition(" ")
+        name, _, _detail = rest.partition(":")
+        rows[name] = line
+    return rows
+
+
+def test_doctor_reports_live_bot_process_and_empty_queue(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _configured(monkeypatch, tmp_path)
+    _fake_process(monkeypatch, pid=96349)
+    _fake_webhook(monkeypatch, {"url": "", "pending_update_count": 0})
+
+    assert cli.main(["doctor"]) == 0
+    rows = _rows(capsys.readouterr().out)
+    assert rows["process"] == "✓ process: claude-rc bot (pid 96349, работает 2 ч 14 мин)"
+    assert rows["queue"] == "✓ queue: пусто"
+
+
+def test_doctor_is_red_when_bot_process_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Ровно та поломка, ради которой проверка и заведена: конфиг цел, зависимости
+    # на месте, бот мёртв — и раньше doctor рапортовал «всё хорошо» двое суток.
+    _configured(monkeypatch, tmp_path)
+    _fake_process(monkeypatch, pid=None)
+    _fake_webhook(monkeypatch, {"url": "", "pending_update_count": 0})
+
+    assert cli.main(["doctor"]) == 2
+    rows = _rows(capsys.readouterr().out)
+    assert rows["process"].startswith("✗ process: не запущен")
+    assert "open -a ClaudeRC" in rows["process"]
+
+
+def test_doctor_distinguishes_unchecked_process_from_missing_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `checked=False` — «не смогли проверить», а не «бота нет»: назвать это
+    # «не запущен» значит отправить человека поднимать уже работающего бота.
+    _configured(monkeypatch, tmp_path)
+    _fake_process(monkeypatch, pid=None, checked=False)
+    _fake_webhook(monkeypatch, {"url": "", "pending_update_count": 0})
+
+    assert cli.main(["doctor"]) == 2
+    rows = _rows(capsys.readouterr().out)
+    assert rows["process"].startswith("✗ process: проверить не вышло")
+
+
+def test_doctor_reports_pending_updates_even_with_live_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Старый экземпляр пережил `pkill`, держит соединение и апдейты не разбирает.
+    # Процесс живой, и отличить это от рабочего бота можно только по очереди.
+    _configured(monkeypatch, tmp_path)
+    _fake_process(monkeypatch, pid=96349)
+    _fake_webhook(monkeypatch, {"url": "", "pending_update_count": 12})
+
+    assert cli.main(["doctor"]) == 2
+    rows = _rows(capsys.readouterr().out)
+    assert rows["process"].startswith("✓ process:")
+    assert rows["queue"] == "✗ queue: 12 необработанных — бот не забирает апдейты"
+
+
+def test_doctor_reports_webhook_that_starves_long_polling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _configured(monkeypatch, tmp_path)
+    _fake_process(monkeypatch, pid=96349)
+    _fake_webhook(monkeypatch, {"url": "https://example.com/hook", "pending_update_count": 0})
+
+    assert cli.main(["doctor"]) == 2
+    rows = _rows(capsys.readouterr().out)
+    assert rows["queue"].startswith("✗ queue: задан вебхук")
+
+
+def test_doctor_shows_last_error_without_reddening_an_empty_queue(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Telegram оставляет это поле и от давно снятого вебхука: красная строка на
+    # здоровом боте обесценила бы проверку, а показать её всё равно надо.
+    _configured(monkeypatch, tmp_path)
+    _fake_process(monkeypatch, pid=96349)
+    _fake_webhook(
+        monkeypatch,
+        {"url": "", "pending_update_count": 0, "last_error_message": "Connection\n  refused"},
+    )
+
+    assert cli.main(["doctor"]) == 0
+    rows = _rows(capsys.readouterr().out)
+    # Переносы из чужого текста схлопнуты — иначе одна проверка ломает формат.
+    assert rows["queue"] == "✓ queue: пусто; последняя ошибка Telegram: Connection refused"
+
+
+def test_doctor_queue_says_it_could_not_ask_when_telegram_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _configured(monkeypatch, tmp_path)
+    _fake_process(monkeypatch, pid=96349)
+
+    def urlopen(url: str, timeout: float | None = None) -> _FakeWebhookResponse:
+        raise OSError("nodename nor servname provided")
+
+    monkeypatch.setattr(cli.request, "urlopen", urlopen)
+
+    assert cli.main(["doctor"]) == 2
+    rows = _rows(capsys.readouterr().out)
+    assert rows["queue"] == "✗ queue: нет связи с Telegram — очередь не проверить"
+
+
+def test_doctor_queue_never_prints_the_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Токен лежит в пути URL, а urllib охотно кладёт URL в текст исключения —
+    # ни URL, ни исключение наружу уходить не должны ни при каком исходе.
+    _configured(monkeypatch, tmp_path)
+    _fake_process(monkeypatch, pid=96349)
+    url = cli._WEBHOOK_INFO_URL.format(token=_TOKEN)
+
+    def urlopen(request_url: str, timeout: float | None = None) -> _FakeWebhookResponse:
+        raise HTTPError(url, 401, f"Unauthorized for {url}", Message(), None)
+
+    monkeypatch.setattr(cli.request, "urlopen", urlopen)
+
+    assert cli.main(["doctor"]) == 2
+    captured = capsys.readouterr()
+    assert "SECRET_VALUE" not in captured.out
+    assert "SECRET_VALUE" not in captured.err
+    assert "Telegram отверг токен" in _rows(captured.out)["queue"]
+
+
+def test_doctor_asks_telegram_with_the_configured_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _configured(monkeypatch, tmp_path)
+    _fake_process(monkeypatch, pid=96349)
+    seen: list[str] = []
+    _fake_webhook(monkeypatch, {"url": "", "pending_update_count": 0}, seen=seen)
+
+    assert cli.main(["doctor"]) == 0
+    capsys.readouterr()
+    assert seen == [f"https://api.telegram.org/bot{_TOKEN}/getWebhookInfo"]
+
+
+def test_doctor_json_stays_offline_for_the_app(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `doctor --json` — опрос из приложения под таймаутом 5с, и зовётся он ровно
+    # перед запуском бота: поход в Telegram съел бы весь запас (сорванный таймаут
+    # значит «не стартуем»), а «процесс не запущен» в этот момент — норма. Плюс
+    # уже установленное приложение зовёт doctor без новых флагов.
+    _configured(monkeypatch, tmp_path)
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("--json не должен ходить в сеть и искать процесс")
+
+    monkeypatch.setattr(cli.request, "urlopen", refuse)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", refuse)
+
+    assert cli.main(["doctor", "--json"]) == 0
+    payload: dict[str, Any] = json.loads(capsys.readouterr().out)
+    names = {check["name"] for check in payload["checks"]}
+    assert "process" not in names
+    assert "queue" not in names
+
+
+def test_doctor_json_live_returns_live_checks_on_demand(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _configured(monkeypatch, tmp_path)
+    _fake_process(monkeypatch, pid=96349)
+    _fake_webhook(monkeypatch, {"url": "", "pending_update_count": 3})
+
+    assert cli.main(["doctor", "--json", "--live"]) == 2
+    payload: dict[str, Any] = json.loads(capsys.readouterr().out)
+    names = {check["name"]: check for check in payload["checks"]}
+    assert names["process"]["ok"] is True
+    assert names["queue"]["ok"] is False
+
+
+def test_doctor_live_checks_skipped_without_a_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Без конфига бот не стартует вовсе: «процесс не запущен» здесь следствие, а
+    # не новость, и спрашивать Telegram нечем — токена нет.
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli.paths, "config_file", lambda: tmp_path / "config.toml")
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("без конфига живые проверки не нужны")
+
+    monkeypatch.setattr(cli.request, "urlopen", refuse)
+    monkeypatch.setattr(cli, "_foreign_bot_pid", refuse)
+
+    assert cli.main(["doctor"]) == 2
+    assert "process" not in _rows(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize(
+    ("etime", "expected"),
+    [
+        ("      00:42", "меньше минуты"),
+        ("02:14", "2 мин"),
+        ("2:14:03", "2 ч 14 мин"),
+        ("1-03:20:00", "1 д 3 ч"),
+        ("10-00:00:00", "10 д 0 ч"),
+        ("", None),
+        ("что-то не то", None),
+        ("1--02:03", None),
+    ],
+)
+def test_humanize_etime(etime: str, expected: str | None) -> None:
+    # Все четыре вида формата `ps -o etime=` разом: на машине разработчика
+    # встречается один, а разбор должен переживать все.
+    assert cli._humanize_etime(etime) == expected
 
 
 def test_agrees_default_true_accepts_empty_answer(monkeypatch: pytest.MonkeyPatch) -> None:

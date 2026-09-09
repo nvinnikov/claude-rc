@@ -8,7 +8,11 @@ import Foundation
 /// в коде насовсем: без него у приложения нет способа рассказать о своей проблеме
 /// тому, кто не смотрит в меню.
 enum Log {
-    private static let url = URL(fileURLWithPath: NSHomeDirectory())
+    /// Единственный адрес лога на всё приложение: его же открывает `Open Log`,
+    /// в него же уходит stdout/stderr бота и вывод `open` из запасного
+    /// LaunchAgent. Второй файл рядом — это второе место, куда надо не забыть
+    /// посмотреть, когда что-то не работает.
+    static let fileURL = URL(fileURLWithPath: NSHomeDirectory())
         .appendingPathComponent(".claude-rc/claude-rc.log")
 
     static func app(_ message: String) {
@@ -18,7 +22,7 @@ enum Log {
 
     private static func write(_ line: String) {
         guard let data = line.data(using: .utf8) else { return }
-        guard let handle = try? openAppending(at: url) else { return }
+        guard let handle = try? openAppending(at: fileURL) else { return }
         defer { try? handle.close() }
         try? handle.write(contentsOf: data)
     }

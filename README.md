@@ -510,13 +510,42 @@ uv tool install .
 | `claude-rc restart <target> [--mode m]` | kill and relaunch with `--resume`, optionally with another permission mode |
 | `claude-rc connect [target] [--read-only] [--cc] [--url] [--start] [--branch b]` | attach a terminal to the session's tmux pane |
 | `claude-rc stop <name\|path>` / `claude-rc stop --all` | kill a session |
-| `claude-rc doctor [--json]` | check tmux, claude and the config |
+| `claude-rc doctor [--json] [--live]` | check tmux, claude, the config, the bot process and the Telegram queue |
 | `claude-rc setup` | first-run wizard — token, user_id, directories |
 | `claude-rc update [--check] [--json]` | update the tool the same way it was installed |
 | `claude-rc sync [paths…] [--branch b] [--no-fetch]` | fast-forward repositories from origin |
 | `claude-rc bot` | run the Telegram bot in the foreground — same as `make run` |
 | `claude-rc --host m1 forward <target> [ports…] [--stop]` | ssh tunnels to the ports the session listens on |
 | `claude-rc --host m1 <command>` | run the same command on another machine over ssh (`bot`, `update`, `forward` excluded; paths must be absolute) |
+
+### `doctor`
+
+`doctor` is where you go when the bot doesn't answer, so it answers that question rather
+than only the "is this installed correctly" one:
+
+```
+✓ tmux: /opt/homebrew/bin/tmux
+✓ claude: /Users/nikita/.local/bin/claude
+✓ config: /Users/nikita/.config/claude-rc/config.toml
+✓ bot_token: задан
+✓ allowed_user_id: задан
+✓ rc_roots: /Users/nikita/Documents
+✗ process: не запущен — открой приложение (open -a ClaudeRC) или подними руками: claude-rc bot
+✗ queue: 12 необработанных — бот не забирает апдейты
+```
+
+The queue row matters more than the process one. A live process proves nothing on its own:
+an old instance that survived a `pkill` keeps the connection and stops taking updates, which
+from the outside looks exactly like a running bot with nothing to say — `pending_update_count`
+from `getWebhookInfo` is the only thing that tells them apart. `last_error_message` comes from
+the same single request and is printed next to the count (it doesn't turn the row red on its
+own: Telegram keeps that field around from a webhook removed long ago).
+
+The last two rows cost a `pgrep` and one HTTP request, so they're left out of `--json` — that
+one is the app polling with a 5-second budget right before it starts the bot itself, where a
+network round trip could blow the timeout ("didn't answer" means "don't start") and "process
+not running" is the expected answer rather than a fault. `--live` puts them back for scripts
+that want the JSON envelope.
 
 ### For a steering agent
 
@@ -663,6 +692,17 @@ and shaped the code:
 - **Two pollers on one token break the bot silently.** Telegram returns a conflict and both
   instances work every other time. Before starting its own process, the app looks for a
   foreign one and shows its pid instead of launching.
+- **A green `doctor` has to mean "the bot works", not "the install is correct".** While it
+  only checked dependencies and config completeness, a dead bot still reported all green and
+  the breakage lived for two days. Two checks answer that now, and the queue matters more
+  than the process: a live process proves nothing — an old instance that survived a `pkill`
+  keeps the connection and stops taking updates, which looks from the outside exactly like a
+  running bot with nothing to say. Only `pending_update_count` tells them apart. The live
+  checks stay out of `--json` unless `--live` asks for them: that envelope is the app polling
+  with a 5-second budget right before it starts the bot, where a network round trip can blow
+  the timeout and "process not running" is the expected answer. The token sits in the
+  `getWebhookInfo` URL path, so neither the URL nor the text of a `urllib` exception ever
+  reaches the output — the same rule `setup.verify_token` follows.
 - **Whatever kills the app to install over it has to open it again.** The bot lives inside
   `ClaudeRC.app`, and a bot that isn't running looks exactly like a bot with nothing to say —
   one such gap went unnoticed for two days. `make install` remembers whether the app was

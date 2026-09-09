@@ -21,6 +21,8 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any, NamedTuple
+from urllib import error as urllib_error
+from urllib import request as request  # реэкспорт для mypy --strict: тесты подменяют urlopen
 
 from clauderc import actions as actions  # тесты подменяют cli.actions.rename
 from clauderc import forward as forward  # тесты подменяют cli.forward.start/stop
@@ -204,6 +206,11 @@ def _parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="проверить окружение")
     doctor.add_argument("--json", action="store_true", dest="as_json")
+    doctor.add_argument(
+        "--live",
+        action="store_true",
+        help="вернуть живые проверки под --json (по умолчанию их там нет)",
+    )
 
     sub.add_parser("setup", help="заполнить config.toml: токен, user_id, каталоги")
 
@@ -497,7 +504,14 @@ class _Commands:
 
     @staticmethod
     def doctor(args: argparse.Namespace) -> int:
-        checks = _diagnose()
+        # Живые проверки идут человеку всегда, а в `--json` — только по явному
+        # `--live`. `--json` — это опрос из приложения (`BotSupervisor.checkConfigured`,
+        # `AppDelegate.revealConfig`) под таймаутом 5с, и зовётся он ровно перед
+        # запуском бота: поход в Telegram съел бы весь запас (сорванный таймаут
+        # значит «не стартуем»), а «процесс не запущен» в этот момент — норма, а
+        # не поломка. Плюс совместимость: уже установленное приложение зовёт
+        # `doctor --json` без новых флагов, и набор проверок для него не меняется.
+        checks = _diagnose(live=args.live or not args.as_json)
         if args.as_json:
             print(json.dumps({"checks": checks}, ensure_ascii=False))
         else:
@@ -1282,7 +1296,181 @@ def _allowed_user_id_detail(value: int) -> str:
     return "должен быть положительным числом"
 
 
-def _diagnose() -> list[dict[str, Any]]:
+# Один GET вместо aiogram: его импорт стоит ~1.5с (довод целиком — в
+# setup.verify_token), а `doctor` зовут именно тогда, когда уже что-то не так, и
+# ждать его лишнюю секунду незачем. Тот же размен уже сделан в
+# `update.latest_release` ради версии релиза.
+_WEBHOOK_INFO_URL = "https://api.telegram.org/bot{token}/getWebhookInfo"
+# Внешний вызов без таймаута подвесил бы doctor молча (см. Code Review Guidelines).
+_WEBHOOK_INFO_TIMEOUT_S = 5.0
+# `last_error_message` пишет Telegram, а не мы: в строку doctor он попадает
+# обрезанным и без переносов, иначе одна проверка разъезжается на пол-экрана.
+_FOREIGN_TEXT_LIMIT = 120
+
+
+class _QueueProbe(NamedTuple):
+    """Ответ `getWebhookInfo` или причина, по которой его нет.
+
+    `info is None` — не «очередь пуста», а «спросить не вышло»: разница ровно
+    та же, что у `_ForeignBotCheck.checked`.
+    """
+
+    info: dict[str, Any] | None
+    error: str | None
+
+
+def _webhook_info(token: str, *, timeout_s: float = _WEBHOOK_INFO_TIMEOUT_S) -> _QueueProbe:
+    """Спрашивает Telegram про очередь апдейтов.
+
+    Ни URL, ни текст исключения наружу не отдаём ни при каком исходе: токен
+    лежит в пути URL, а `urllib` охотно кладёт URL в сообщение об ошибке — то
+    же правило, по которому `setup.verify_token` не показывает свои исключения.
+    """
+    try:
+        with request.urlopen(_WEBHOOK_INFO_URL.format(token=token), timeout=timeout_s) as response:
+            payload = json.load(response)
+    except urllib_error.HTTPError as exc:
+        # Ловится раньше OSError: HTTPError — его подкласс через URLError. 401 —
+        # единственный код, который однозначно про токен; остальное (5xx, 429)
+        # к нему отношения не имеет, и путать их — та же ошибка, что уже
+        # разбиралась в verify_token.
+        if exc.code == 401:
+            return _QueueProbe(None, "Telegram отверг токен")
+        return _QueueProbe(None, f"Telegram ответил HTTP {exc.code}")
+    except (TimeoutError, ValueError, OSError):
+        # URLError — подкласс OSError, отдельно его называть незачем (как в
+        # update.latest_release). ValueError — ответ пришёл, но это не JSON:
+        # captive portal или прокси, отдающий HTML вместо ответа Telegram.
+        return _QueueProbe(None, "нет связи с Telegram")
+
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return _QueueProbe(None, "Telegram ответил отказом")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return _QueueProbe(None, "ответ Telegram не разобрать")
+    return _QueueProbe(result, None)
+
+
+def _clip(text: str) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= _FOREIGN_TEXT_LIMIT else flat[:_FOREIGN_TEXT_LIMIT] + "…"
+
+
+def _queue_check(token: str) -> dict[str, Any]:
+    """Очередь Telegram — та проверка, которая отличает живого бота от мёртвого.
+
+    Живой процесс сам по себе ничего не доказывает: был случай, когда старый
+    экземпляр пережил `pkill`, держал соединение и апдейты не разбирал. Снаружи
+    это выглядит как «бот запущен, но молчит», и различает эти два состояния
+    только `pending_update_count`.
+    """
+    probe = _webhook_info(token)
+    if probe.info is None:
+        return {"name": "queue", "ok": False, "detail": f"{probe.error} — очередь не проверить"}
+
+    pending = probe.info.get("pending_update_count")
+    pending = pending if isinstance(pending, int) else 0
+    webhook = probe.info.get("url")
+    last_error = probe.info.get("last_error_message")
+
+    parts: list[str] = []
+    ok = True
+    if isinstance(webhook, str) and webhook:
+        # Вебхук и long polling исключают друг друга: пока вебхук задан,
+        # `getUpdates` не отдаёт ничего, и бот молчит при живом процессе.
+        ok = False
+        parts.append("задан вебхук — long polling апдейтов не получит: сними его deleteWebhook")
+    if pending:
+        ok = False
+        parts.append(f"{pending} необработанных — бот не забирает апдейты")
+    if not parts:
+        parts.append("пусто")
+    if isinstance(last_error, str) and last_error:
+        # Сам по себе `ok` не роняет: Telegram оставляет это поле и от давно
+        # снятого вебхука, и красная строка на здоровом боте — худший вид
+        # диагностики. Но показать надо: тут видно и отказ сети, и отказ токена.
+        parts.append(f"последняя ошибка Telegram: {_clip(last_error)}")
+    return {"name": "queue", "ok": ok, "detail": "; ".join(parts)}
+
+
+def _humanize_etime(raw: str) -> str | None:
+    """`ps -o etime=` (`[[dd-]hh:]mm:ss`) человеческим текстом. None — не разобрали.
+
+    Разбор отдельно от вызова `ps`, чтобы формат можно было проверить тестом на
+    всех четырёх его видах, а не только на том, что выдаёт машина разработчика.
+    """
+    text = raw.strip()
+    if not text:
+        return None
+    days = 0
+    if "-" in text:
+        head, _, text = text.partition("-")
+        if not head.isdigit():
+            return None
+        days = int(head)
+    parts = text.split(":")
+    if not 2 <= len(parts) <= 3 or not all(part.isdigit() for part in parts):
+        return None
+    numbers = [int(part) for part in parts]
+    hours, minutes = (0, numbers[0]) if len(numbers) == 2 else (numbers[0], numbers[1])
+
+    total = (days * 24 + hours) * 60 + minutes
+    whole_days, rest = divmod(total, 24 * 60)
+    whole_hours, whole_minutes = divmod(rest, 60)
+    if whole_days:
+        return f"{whole_days} д {whole_hours} ч"
+    if whole_hours:
+        return f"{whole_hours} ч {whole_minutes} мин"
+    if whole_minutes:
+        return f"{whole_minutes} мин"
+    return "меньше минуты"
+
+
+def _process_uptime(pid: int) -> str | None:
+    """Сколько живёт процесс. None — не спросили: это подробность, а не проверка."""
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "etime=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return _humanize_etime(result.stdout)
+
+
+def _process_check() -> dict[str, Any]:
+    """Жив ли процесс бота. Ищем тем же шаблоном, что и защита от двух поллеров."""
+    check = _foreign_bot_pid()
+    if not check.checked:
+        return {
+            "name": "process",
+            "ok": False,
+            "detail": "проверить не вышло — pgrep не ответил вовремя или не найден в PATH",
+        }
+    if check.pid is None:
+        return {
+            "name": "process",
+            "ok": False,
+            "detail": "не запущен — открой приложение (open -a ClaudeRC) или подними руками: "
+            "claude-rc bot",
+        }
+    uptime = _process_uptime(check.pid)
+    tail = f", работает {uptime}" if uptime else ""
+    return {"name": "process", "ok": True, "detail": f"claude-rc bot (pid {check.pid}{tail})"}
+
+
+def _diagnose(*, live: bool = True) -> list[dict[str, Any]]:
+    """Проверки для `doctor`.
+
+    `live=False` оставляет только окружение и конфиг — без похода в сеть и без
+    вопроса «а работает ли бот прямо сейчас». Так спрашивает приложение
+    (`doctor --json`), у которого на ответ 5 секунд и которое зовёт doctor
+    ровно перед тем, как поднять бота самому.
+    """
     checks: list[dict[str, Any]] = []
     for binary in ("tmux", "claude"):
         found = shutil.which(binary)
@@ -1338,4 +1526,15 @@ def _diagnose() -> list[dict[str, Any]]:
             "detail": ", ".join(str(root) for root in config.rc_roots),
         }
     )
+    if not live:
+        return checks
+
+    # Порядок обратный важности: очередь важнее процесса (живой процесс, не
+    # разбирающий апдейты, снаружи неотличим от мёртвого), но читается список
+    # сверху вниз, и «процесс не запущен» объясняет непустую очередь ниже.
+    # Живые проверки идут последними: без годного конфига бот не стартует
+    # вовсе, и говорить о нём до того, как назван конфиг, нечего.
+    checks.append(_process_check())
+    if config.bot_token:
+        checks.append(_queue_check(config.bot_token))
     return checks

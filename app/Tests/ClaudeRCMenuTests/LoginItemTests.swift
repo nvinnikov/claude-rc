@@ -1,3 +1,4 @@
+import Foundation
 import ServiceManagement
 import Testing
 @testable import ClaudeRCMenu
@@ -33,5 +34,32 @@ import Testing
     @Test func isEnabledFallsBackToAgentFileWhenServiceNotRegistered() {
         #expect(LoginItem.isEnabled(status: .notRegistered, agentFileExists: true) == true)
         #expect(LoginItem.isEnabled(status: .notRegistered, agentFileExists: false) == false)
+    }
+
+    /// Без этих ключей launchd отправляет вывод `open` в /dev/null, и причину
+    /// несработавшего автозапуска узнать негде: приложение не стартовало, значит
+    /// и в свой лог о себе ничего не написало.
+    @Test func agentPlistRedirectsBothStreamsToTheLog() {
+        let plist = LoginItem.agentPlist(bundlePath: "/Applications/ClaudeRC.app", logPath: "/l.log")
+        #expect(plist["StandardOutPath"] as? String == "/l.log")
+        #expect(plist["StandardErrorPath"] as? String == "/l.log")
+    }
+
+    /// Лог добавлен рядом с запуском, а не вместо него.
+    @Test func agentPlistStillLaunchesTheBundleAtLogin() {
+        let plist = LoginItem.agentPlist(bundlePath: "/Applications/ClaudeRC.app", logPath: "/l.log")
+        let expected = ["/usr/bin/open", "-a", "/Applications/ClaudeRC.app"]
+        #expect(plist["ProgramArguments"] as? [String] == expected)
+        #expect(plist["RunAtLoad"] as? Bool == true)
+    }
+
+    /// Плист должен сериализоваться: неподдерживаемый тип в значении — это
+    /// `writeAgent`, падающий уже на машине, а не в тесте.
+    @Test func agentPlistSerializes() throws {
+        let plist = LoginItem.agentPlist(bundlePath: "/Applications/ClaudeRC.app", logPath: "/l.log")
+        let data = try PropertyListSerialization.data(
+            fromPropertyList: plist, format: .xml, options: 0
+        )
+        #expect(data.isEmpty == false)
     }
 }
