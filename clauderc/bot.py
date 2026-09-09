@@ -1368,6 +1368,14 @@ async def main() -> None:
             """
             return await watcher.kill(tmux_name, cwd, session.tmux_id)
 
+        if actions.conversation_id(session) is None:
+            # До гашения: после него беседу не вернуть, и «беседа потерялась»
+            # человек должен прочитать заранее, а не увидеть по пустой панели.
+            await message.answer(
+                "⚠️ Точный id беседы не найден: продолжу последнюю в этом каталоге, "
+                "а если её нет — сессия поднимется с чистого листа."
+            )
+
         try:
             fresh = await actions.restart(
                 session,

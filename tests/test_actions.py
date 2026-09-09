@@ -1,5 +1,8 @@
 import dataclasses
+import json
+import logging
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -16,15 +19,34 @@ def _stub(handler: Handler) -> Callable[..., Awaitable[tuple[int, str]]]:
     return run
 
 
-def _session(tmux_name: str = "session_01ABC", label: str = "oms@old") -> RemoteSession:
+def _session(
+    tmux_name: str = "session_01ABC",
+    label: str = "oms@old",
+    url: str = "https://claude.ai/code/session_01ABC",
+) -> RemoteSession:
     return RemoteSession(
         name=label,
         tmux_name=tmux_name,
         cwd="/repos/oms",
-        url="https://claude.ai/code/session_01ABC",
+        url=url,
         created_at=0,
         label=label,
     )
+
+
+@pytest.fixture
+def projects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Пустое хранилище диалогов: без него `restart` смотрел бы в настоящий ~/.claude."""
+    root = tmp_path / "projects"
+    monkeypatch.setattr(actions.history.paths, "claude_projects", lambda: root)
+    return root
+
+
+def _transcript(projects: Path, cwd: str, session_id: str) -> None:
+    directory = projects / actions.history.slug(cwd)
+    directory.mkdir(parents=True, exist_ok=True)
+    record = {"type": "user", "cwd": cwd, "message": {"role": "user", "content": "привет"}}
+    (directory / f"{session_id}.jsonl").write_text(json.dumps(record) + "\n")
 
 
 async def test_send_types_literally_then_enter(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -180,7 +202,9 @@ async def test_restart_overrides_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     assert seen["permission_mode"] == "bypassPermissions"
 
 
-async def test_restart_without_session_id_launches_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
+async def _resume_of(monkeypatch: pytest.MonkeyPatch, session: RemoteSession) -> Any:
+    """Что `restart` передал в `--resume`, погасив сессию."""
+
     async def kill(tmux_name: str, cwd: str) -> bool:
         return True
 
@@ -191,8 +215,59 @@ async def test_restart_without_session_id_launches_fresh(monkeypatch: pytest.Mon
         return _session()
 
     monkeypatch.setattr(actions.remote, "launch", fake_launch)
-    await actions.restart(_session(tmux_name="rc-oms"), kill=kill)
-    assert seen["resume"] is None
+    await actions.restart(session, kill=kill)
+    return seen["resume"]
+
+
+async def test_restart_of_a_session_with_an_old_name_still_resumes(
+    monkeypatch: pytest.MonkeyPatch, projects: Path
+) -> None:
+    # issue #17: имя `rc-…` — у всех сессий, поднятых до переименования, и
+    # выведенный из него id был пустым: беседа двухсуточной сессии уходила в
+    # архив по нажатию Bypass. Ссылка тот же id хранит и от имени не зависит.
+    resume = await _resume_of(monkeypatch, _session(tmux_name="rc-oms"))
+    assert resume == "session_01ABC"
+
+
+async def test_restart_without_a_url_takes_the_id_from_the_transcript(
+    monkeypatch: pytest.MonkeyPatch, projects: Path
+) -> None:
+    _transcript(projects, "/repos/oms", "9f0d1e2a")
+    resume = await _resume_of(monkeypatch, _session(tmux_name="rc-oms", url=""))
+    assert resume == "9f0d1e2a"
+
+
+async def test_restart_falls_back_to_the_last_conversation_of_the_directory(
+    monkeypatch: pytest.MonkeyPatch, projects: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Каталог хранилища есть, но `cwd` внутри файла не совпал (слаг каталога
+    # неоднозначен): беседы claude всё равно найдёт сам — пусть возьмёт последнюю.
+    directory = projects / actions.history.slug("/repos/oms")
+    directory.mkdir(parents=True)
+    (directory / "9f0d1e2a.jsonl").write_text(
+        json.dumps({"type": "user", "cwd": "/elsewhere", "message": {"content": "x"}}) + "\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="clauderc.actions"):
+        resume = await _resume_of(monkeypatch, _session(tmux_name="rc-oms", url=""))
+    assert resume == "last"
+    assert "точного id беседы нет" in caplog.text
+
+
+async def test_restart_without_any_stored_conversation_starts_fresh(
+    monkeypatch: pytest.MonkeyPatch, projects: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Хранилища для каталога нет вовсе — продолжать нечего, и `--continue` только
+    # уронил бы запуск. Чистый лист, но в логе.
+    with caplog.at_level(logging.WARNING, logger="clauderc.actions"):
+        resume = await _resume_of(monkeypatch, _session(tmux_name="rc-oms", url=""))
+    assert resume is None
+    assert "точного id беседы нет" in caplog.text
+
+
+def test_conversation_id_ignores_the_tmux_name(projects: Path) -> None:
+    # Имя источником не служит даже когда выглядит как id: ссылка первее.
+    session = _session(tmux_name="session_OLD", url="https://claude.ai/code/session_NEW")
+    assert actions.conversation_id(session) == "session_NEW"
 
 
 async def test_restart_refuses_when_kill_fails() -> None:

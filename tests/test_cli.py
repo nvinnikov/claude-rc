@@ -1964,6 +1964,31 @@ def test_restart_uses_kill_tmux_and_prints_passport(
     assert "session_A" in capsys.readouterr().out
 
 
+def test_restart_warns_before_killing_when_the_conversation_id_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Предупреждение должно выйти до гашения: после него беседу не вернуть.
+    order: list[str] = []
+    session = RemoteSession(name="oms", tmux_name="rc-oms", cwd="/repos/oms", url="", created_at=0)
+
+    async def fake_resolve(target: str) -> list[RemoteSession]:
+        return [session]
+
+    async def fake_restart(
+        session: RemoteSession, *, kill: Any, mode: str | None = None, timeout_s: float = 90.0
+    ) -> RemoteSession:
+        order.append("restart")
+        return _session()
+
+    monkeypatch.setattr(cli.actions.history.paths, "claude_projects", lambda: tmp_path / "none")
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    monkeypatch.setattr(cli.actions, "restart", fake_restart)
+    monkeypatch.setattr(cli.passport.worktrees, "inspect", _fake_no_worktree)
+    assert cli.main(["restart", "oms"]) == 0
+    assert "Точный id беседы не найден" in capsys.readouterr().err
+    assert order == ["restart"]
+
+
 def test_send_prints_tail_when_asked(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

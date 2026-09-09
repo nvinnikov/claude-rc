@@ -48,13 +48,13 @@ def slug(cwd: str) -> str:
 
 def conversations(cwd: str, *, limit: int = 5) -> list[Conversation]:
     """Диалоги Claude Code для каталога, свежие первыми."""
-    directory = _directory(cwd)
-    if directory is None:
+    folder = directory(cwd)
+    if folder is None:
         return []
 
     wanted = _real(cwd)
     found: list[Conversation] = []
-    for path in directory.glob("*.jsonl"):
+    for path in folder.glob("*.jsonl"):
         if not path.is_file():
             continue  # рядом с диалогами лежат каталоги, названные тем же uuid
         conversation = _read(path)
@@ -66,17 +66,22 @@ def conversations(cwd: str, *, limit: int = 5) -> list[Conversation]:
     return found[:limit]
 
 
-def _directory(cwd: str) -> Path | None:
+def directory(cwd: str) -> Path | None:
     """Каталог хранилища для пути. Пробуем и как есть, и через realpath.
 
     claude называет каталог по тому пути, из которого его запустили; наш
     вызывающий мог отдать симлинк.
+
+    Публичная: по одному лишь пустому списку `conversations` не отличить «бесед
+    тут не было вовсе» от «файлы есть, но `cwd` внутри них не совпал», а
+    `actions.restart` это различие нужно — от него зависит, есть ли смысл
+    в `--continue` (см. `actions.resume_target`).
     """
     root = paths.claude_projects()
     for candidate in (cwd, _real(cwd)):
-        directory = root / slug(candidate)
-        if directory.is_dir():
-            return directory
+        folder = root / slug(candidate)
+        if folder.is_dir():
+            return folder
     return None
 
 

@@ -404,6 +404,15 @@ class _Commands:
             # кем, и kill_tmux напрямую здесь — правильный путь, а не обход.
             return await kill_tmux(tmux_name)
 
+        if actions.conversation_id(session) is None:
+            # До гашения: после него беседу уже не вернуть, и человек должен
+            # узнать о риске заранее, а не по пустому экрану новой сессии.
+            print(
+                "Точный id беседы не найден: продолжу последнюю в каталоге, "
+                "а если её нет — сессия поднимется с чистого листа.",
+                file=sys.stderr,
+            )
+
         try:
             fresh = asyncio.run(actions.restart(session, kill=kill, mode=args.mode))
         except actions.ActionError as exc:
