@@ -662,6 +662,16 @@ and shaped the code:
 - **Two pollers on one token break the bot silently.** Telegram returns a conflict and both
   instances work every other time. Before starting its own process, the app looks for a
   foreign one and shows its pid instead of launching.
+- **A dead HTTP session is invisible from the outside, so the bot must not sit on one.** The
+  bot's aiohttp session is one per process; once its connector is closed
+  (`ClientConnectionError: Connector is closed`), long polling keeps taking updates —
+  Telegram marks them delivered and never sends them again — while every reply fails. From
+  the outside everything is green: the process is up, the queue is empty, Telegram reports
+  no errors, and the bot is mute until someone restarts it by hand. `SessionGuard` answers
+  such an error in two steps: first a fresh session in place of the closed one, because a
+  single network blip is no reason to drop the process; then, if the errors keep coming with
+  the new session too, it stops polling so the process exits non-zero and whoever owns it
+  (the menu-bar app, launchd's `KeepAlive`) starts it again.
 - **`sync --branch` inside a worktree could zero out the `wtrm` guard.** A worktree's
   `blockers` are computed against the current branch; switch it and the commits stay on the
   old branch (not lost — `git branch` sees them) while `unpushed` for the new branch is

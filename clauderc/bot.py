@@ -6,14 +6,17 @@ import os
 import time
 import uuid
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.filters import Command, ExceptionTypeFilter
 from aiogram.types import (
     CallbackQuery,
+    ErrorEvent,
     ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -60,6 +63,10 @@ MAX_PROJECT_BUTTONS = 60
 MAX_TREE_CARDS = 10
 MAX_SYNC_TARGETS = 20
 MAX_BRANCH_NAME_LEN = 100
+# Три неотвеченных действия человека за минуту — уже не разовый обрыв связи, а
+# сессия, которую не чинит и её пересоздание (см. SessionGuard).
+NETWORK_ERROR_LIMIT = 3
+NETWORK_ERROR_WINDOW_S = 60.0
 HELP = (
     "Поднимаю сессии Claude Code с Remote Control — дальше работа в приложении Claude.\n\n"
     "<b>Куда идём</b>\n"
@@ -540,6 +547,80 @@ def _sync_report_line(result: SyncResult, *, label: str) -> str:
     )
 
 
+class SessionGuard:
+    """Не даёт боту остаться живым процессом с мёртвой сессией Telegram.
+
+    aiohttp-сессия у бота одна на весь процесс, и её закрытый коннектор
+    (`ClientConnectionError: Connector is closed`) виден только изнутри: поллинг
+    продолжает забирать апдейты, Telegram считает их доставленными и больше не
+    отдаёт, а каждый ответ падает. Снаружи всё зелёное — процесс жив, очередь
+    пуста, ошибок у Telegram нет, — и бот молчит до ручного перезапуска.
+
+    Ответ на такую ошибку двухступенчатый. Первая ступень — новая сессия вместо
+    закрытой: разовый обрыв связи не повод ронять процесс. Вторая, если ошибки
+    продолжаются и с новой сессией, — остановка поллинга, чтобы процесс вышел с
+    ненулевым кодом: поднять его заново умеют и `BotSupervisor` в приложении, и
+    `KeepAlive` в launchd, а полумёртвым он не останется.
+    """
+
+    def __init__(
+        self,
+        bot: Bot,
+        stop: Callable[[], Awaitable[None]],
+        *,
+        limit: int = NETWORK_ERROR_LIMIT,
+        window_s: float = NETWORK_ERROR_WINDOW_S,
+    ) -> None:
+        self._bot = bot
+        self._stop = stop
+        self._limit = limit
+        self._window_s = window_s
+        self._seen: list[float] = []
+        self.gave_up = False
+
+    async def on_error(self, exc: Exception) -> None:
+        now = time.monotonic()
+        self._seen = [at for at in self._seen if now - at < self._window_s]
+        self._seen.append(now)
+        log.error("telegram network error: %s: %s", type(exc).__name__, exc)
+        if len(self._seen) >= self._limit:
+            # Пересоздание не помогло: дело не в сессии, и продолжать вслепую
+            # значит и дальше подтверждать апдейты, на которые нечем ответить.
+            self.gave_up = True
+            log.error(
+                "telegram unreachable: %d errors in %.0fs, stopping polling",
+                len(self._seen),
+                self._window_s,
+            )
+            await self._stop()
+            return
+        # Подменяем раньше, чем закрываем: запросы, начатые параллельно, должны
+        # уходить уже в новую сессию, а не в ту, которую мы сейчас закрываем.
+        stale = self._bot.session
+        self._bot.session = AiohttpSession()
+        log.warning("telegram session recreated")
+        try:
+            await stale.close()
+        except Exception:
+            # Закрыть сломанную сессию могло и не выйти — на работу с новой это
+            # не влияет, но молчать о втором сбое подряд нельзя.
+            log.warning("failed to close stale telegram session", exc_info=True)
+
+
+def install_session_guard(bot: Bot, dp: Dispatcher) -> SessionGuard:
+    """Вешает `SessionGuard` на сетевые ошибки диспетчера."""
+    guard = SessionGuard(bot, dp.stop_polling)
+
+    @dp.errors(ExceptionTypeFilter(TelegramNetworkError))
+    async def on_network_error(event: ErrorEvent) -> bool:
+        await guard.on_error(event.exception)
+        # True — «ошибку обработали»: причина уже в логе с нашим объяснением, а
+        # трейсбек aiogram про тот же обрыв связи ничего не добавляет.
+        return True
+
+    return guard
+
+
 class Discovery:
     """Кэш обхода файловой системы: скан на глубину 3 не бесплатный."""
 
@@ -572,6 +653,7 @@ async def main() -> None:
 
     bot = Bot(token=config.bot_token)
     dp = Dispatcher()
+    guard = install_session_guard(bot, dp)
     discovery = Discovery(config)
     state = State(config.state_path, config.rc_roots[0])
     watcher = Watcher()
@@ -1770,6 +1852,11 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         watch_task.cancel()
+    if guard.gave_up:
+        # Тихий выход с нулевым кодом читался бы как штатная остановка, а это
+        # отказ: тот, кто владеет процессом, должен поднять его заново, и в
+        # логе должно остаться, почему бот ушёл сам.
+        raise SystemExit("сессия Telegram не восстановилась — выхожу, чтобы подняться заново")
 
 
 if __name__ == "__main__":
