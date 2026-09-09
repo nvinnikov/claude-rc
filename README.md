@@ -399,11 +399,12 @@ Three ways, by increasing distance from the sources:
 `make install` does everything in one command: the `claude-rc` tool into `~/.local/bin`
 (via `uv tool install`) and `ClaudeRC.app` into `/Applications`. The app is killed before
 copying — otherwise `cp` writes files underneath a running process and you get a
-half-stale bundle. If the menu bar icon disappears after `make install`, that's why: just
-open the app again.
+half-stale bundle — and reopened afterwards **if it was running before the install**. On a
+machine where the app wasn't running, `make install` leaves it closed: it was asked to
+install, not to launch anything.
 
-The Telegram bot goes down with the app: until you reopen `ClaudeRC.app` by hand, Telegram
-commands aren't processed. Already-running tmux sessions (`rc-*`) survive the install — only
+The Telegram bot goes down with the app and comes back with it, so the gap is the few
+seconds the copy takes. Already-running tmux sessions (`rc-*`) survive the install — only
 the wrapper process is killed, and the session registry lives in tmux, not in the bot's
 memory.
 
@@ -662,6 +663,12 @@ and shaped the code:
 - **Two pollers on one token break the bot silently.** Telegram returns a conflict and both
   instances work every other time. Before starting its own process, the app looks for a
   foreign one and shows its pid instead of launching.
+- **Whatever kills the app to install over it has to open it again.** The bot lives inside
+  `ClaudeRC.app`, and a bot that isn't running looks exactly like a bot with nothing to say —
+  one such gap went unnoticed for two days. `make install` remembers whether the app was
+  running *before* the kill and only reopens it if it was: on a machine where the app was
+  closed, installing must not launch anything. The update script (`Updater.script`) does the
+  same, unconditionally, because it killed the app itself.
 - **`sync --branch` inside a worktree could zero out the `wtrm` guard.** A worktree's
   `blockers` are computed against the current branch; switch it and the commits stay on the
   old branch (not lost — `git branch` sees them) while `unpushed` for the new branch is

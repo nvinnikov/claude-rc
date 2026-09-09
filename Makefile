@@ -59,13 +59,31 @@ install-tool:
 # и у SMAppService, и у запасного LaunchAgent) — если когда-нибудь появится
 # аргумент запуска, этот `pgrep` перестанет находить процесс молча, и `cp`
 # ляжет под живой процесс.
+#
+# Приложение открывается заново только если работало до установки: вместе с ним
+# живёт и Telegram-бот, и без этого `make install` оставлял его мёртвым до тех
+# пор, пока человек не откроет приложение руками, — тишина в боте на поломку не
+# похожа, и один такой случай прожил двое суток. Поднимать его на машине, где
+# оно не работало, при этом нельзя: `make install` не просили ничего запускать.
+#
+# Отсюда весь рецепт одной командой shell: make выполняет каждую строку рецепта
+# в своём процессе, и `running` из первой строки до последней не дожил бы.
+# `set -e` вместо голой последовательности: без него неудачный `cp` уехал бы в
+# `open` и человек получил бы «Готово» поверх наполовину скопированного бандла.
 install-app: install-tool app
-	@if pgrep -f '/ClaudeRCMenu$$' >/dev/null; then \
+	@set -e; \
+	running=; \
+	if pgrep -f '/ClaudeRCMenu$$' >/dev/null; then \
+		running=1; \
 		echo "Гашу запущенное приложение: иначе cp положит файлы под работающим процессом."; \
 		pkill -f '/ClaudeRCMenu$$'; sleep 2; \
+	fi; \
+	rm -rf /Applications/ClaudeRC.app; \
+	cp -R app/build/ClaudeRC.app /Applications/ClaudeRC.app; \
+	echo "Готово: /Applications/ClaudeRC.app"; \
+	if [ -n "$$running" ]; then \
+		echo "Открываю приложение заново: до установки оно работало."; \
+		open -a /Applications/ClaudeRC.app; \
 	fi
-	rm -rf /Applications/ClaudeRC.app
-	cp -R app/build/ClaudeRC.app /Applications/ClaudeRC.app
-	@echo "Готово: /Applications/ClaudeRC.app"
 
 install: install-app
