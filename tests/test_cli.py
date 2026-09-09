@@ -10,9 +10,16 @@ from clauderc.worktrees import Worktree
 
 
 @pytest.fixture(autouse=True)
-def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Без этого случайный CLAUDE_RC_HOST в окружении проксировал бы чужие тесты."""
+def _no_ambient_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Без этого случайный CLAUDE_RC_HOST в окружении проксировал бы чужие тесты.
+
+    Настоящий конфиг разработчика — тот же ambient host, только с другой стороны:
+    с `host = "m3"` в `~/.config/claude-rc/config.toml` команда подсадки в
+    `whoami` приезжала через ssh, и тест падал на машине автора, но не в CI.
+    Тесты, которым конфиг нужен, кладут свой и патчат `config_file` сами.
+    """
     monkeypatch.delenv(proxy.HOST_ENV, raising=False)
+    monkeypatch.setattr(cli.paths, "config_file", lambda: tmp_path / "no-such-config.toml")
 
 
 async def _fake_no_worktree(path: Path) -> Worktree | None:
